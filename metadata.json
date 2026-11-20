@@ -1,0 +1,8 @@
+{
+  "name": "Maximus Barbecue ERP",
+  "description": "Complete Food Truck ERP Management System integrating POS, BOM recipes, FIFO inventory, procurement, accounting, food costing, payroll, and multi-truck operations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
