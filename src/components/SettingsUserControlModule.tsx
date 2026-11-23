@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Plus, Pencil, Upload, Trash2, Shield, Users, UserCheck, X } from 'lucide-react';
-import { apiFetch, formatPHP } from '../lib/api.ts';
+import { Plus, Pencil, Upload, Trash2, Shield, UserCheck, X } from 'lucide-react';
+import { apiFetch } from '../lib/api.ts';
 import { AuthUser } from '../types/erp.ts';
 
 interface Props {
@@ -8,7 +8,7 @@ interface Props {
   onProfileUpdated: () => Promise<void>;
 }
 
-function getInitials(name: string): string {
+export function getInitials(name: string): string {
   const parts = String(name || '')
     .replace(/\(.*?\)/g, '')
     .trim()
@@ -19,7 +19,7 @@ function getInitials(name: string): string {
   return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
 }
 
-function resizeImageToDataUrl(file: File, maxDim = 256): Promise<string> {
+export function resizeImageToDataUrl(file: File, maxDim = 256): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(new Error('Failed to read image file'));
@@ -69,8 +69,7 @@ export function AvatarBadge({ name, src, size = 'md' }: { name: string; src?: st
 }
 
 export function SettingsUserControlModule({ currentUser, onProfileUpdated }: Props) {
-  const [subTab, setSubTab] = useState<'users' | 'employees'>('users');
-  const [data, setData] = useState<{ users: any[]; employees: any[]; roles: any[]; locations: any[] } | null>(null);
+  const [data, setData] = useState<{ users: any[]; roles: any[]; locations: any[] } | null>(null);
   const [msg, setMsg] = useState('');
   const [err, setErr] = useState('');
 
@@ -86,23 +85,8 @@ export function SettingsUserControlModule({ currentUser, onProfileUpdated }: Pro
     isActive: true,
   });
 
-  // Employee Modal State
-  const [empModal, setEmpModal] = useState<{ mode: 'create' | 'edit'; id?: string } | null>(null);
-  const [empForm, setEmpForm] = useState({
-    employeeCode: '',
-    fullName: '',
-    department: 'Operations',
-    position: 'Food Truck Crew',
-    locationId: '',
-    payType: 'DAILY',
-    baseRate: '650',
-    avatarUrl: '',
-    isActive: true,
-  });
-
   const [saving, setSaving] = useState(false);
   const userFileRef = useRef<HTMLInputElement>(null);
-  const empFileRef = useRef<HTMLInputElement>(null);
 
   const load = async () => {
     try {
@@ -153,45 +137,12 @@ export function SettingsUserControlModule({ currentUser, onProfileUpdated }: Pro
     setUserModal({ mode: 'edit', id: u.id });
   };
 
-  const openCreateEmployee = () => {
-    setErr('');
-    setEmpForm({
-      employeeCode: `EMP-${String(data.employees.length + 1).padStart(3, '0')}`,
-      fullName: '',
-      department: 'Truck Crew',
-      position: 'Grill & Prep Staff',
-      locationId: data.locations[0]?.id || '',
-      payType: 'DAILY',
-      baseRate: '650',
-      avatarUrl: '',
-      isActive: true,
-    });
-    setEmpModal({ mode: 'create' });
-  };
-
-  const openEditEmployee = (emp: any) => {
-    setErr('');
-    setEmpForm({
-      employeeCode: emp.employee_code || '',
-      fullName: emp.full_name || '',
-      department: emp.department || '',
-      position: emp.position || '',
-      locationId: emp.location_id || '',
-      payType: emp.pay_type || 'DAILY',
-      baseRate: String(emp.base_rate ?? 650),
-      avatarUrl: emp.avatar_url || '',
-      isActive: emp.is_active === 1,
-    });
-    setEmpModal({ mode: 'edit', id: emp.id });
-  };
-
-  const handlePhotoUpload = async (file: File | undefined, target: 'user' | 'employee') => {
+  const handlePhotoUpload = async (file: File | undefined) => {
     if (!file) return;
     setErr('');
     try {
       const dataUrl = await resizeImageToDataUrl(file, 256);
-      if (target === 'user') setUserForm((f) => ({ ...f, avatarUrl: dataUrl }));
-      else setEmpForm((f) => ({ ...f, avatarUrl: dataUrl }));
+      setUserForm((f) => ({ ...f, avatarUrl: dataUrl }));
     } catch (e: any) {
       setErr(e.message || 'Unable to process uploaded image');
     }
@@ -231,43 +182,9 @@ export function SettingsUserControlModule({ currentUser, onProfileUpdated }: Pro
     }
   };
 
-  const submitEmployee = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!empModal) return;
-    setErr('');
-    setSaving(true);
-    try {
-      const payload = {
-        employeeCode: empForm.employeeCode,
-        fullName: empForm.fullName,
-        department: empForm.department,
-        position: empForm.position,
-        locationId: empForm.locationId || null,
-        payType: empForm.payType,
-        baseRate: Number(empForm.baseRate || 0),
-        avatarUrl: empForm.avatarUrl || null,
-        isActive: empForm.isActive,
-      };
-      if (empModal.mode === 'create') {
-        await apiFetch('/settings/employees', { method: 'POST', body: JSON.stringify(payload) });
-        setMsg(`Added employee "${empForm.fullName.trim()}"`);
-      } else {
-        await apiFetch(`/settings/employees/${empModal.id}`, { method: 'PUT', body: JSON.stringify(payload) });
-        setMsg(`Updated employee "${empForm.fullName.trim()}"`);
-      }
-      setEmpModal(null);
-      await load();
-    } catch (e: any) {
-      setErr(e.message || 'Unable to save employee');
-    } finally {
-      setSaving(false);
-    }
-  };
-
   const activeUsersCount = data.users.filter((u) => u.is_active === 1).length;
   const adminUsersCount = data.users.filter((u) => u.role_code === 'SUPER_ADMIN' || u.role_code === 'BUSINESS_OWNER').length;
-  const withPhotosCount =
-    data.users.filter((u) => Boolean(u.avatar_url)).length + data.employees.filter((e) => Boolean(e.avatar_url)).length;
+  const userPhotosCount = data.users.filter((u) => Boolean(u.avatar_url)).length;
 
   return (
     <div className="space-y-6">
@@ -275,36 +192,24 @@ export function SettingsUserControlModule({ currentUser, onProfileUpdated }: Pro
         <div>
           <h1 className="font-display text-2xl font-semibold text-slate-900 flex items-center gap-2">
             <Shield className="w-5 h-5 text-slate-700" />
-            User Control &amp; Profile Photos
+            User Control &amp; Role Permissions
           </h1>
           <p className="text-sm text-slate-500">
-            Exclusive to Company Owner &amp; Super Admin · Manage login accounts, role assignments, and avatars for users and employees
+            Exclusive to Company Owner &amp; Super Admin · Manage system login accounts, role assignments, and profile avatars
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
-          {subTab === 'users' ? (
-            <button
-              type="button"
-              onClick={openCreateUser}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 whitespace-nowrap shrink-0"
-            >
-              <Plus className="w-4 h-4" /> Add System User
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={openCreateEmployee}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 whitespace-nowrap shrink-0"
-            >
-              <Plus className="w-4 h-4" /> Add Employee
-            </button>
-          )}
-        </div>
+        <button
+          type="button"
+          onClick={openCreateUser}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 whitespace-nowrap shrink-0"
+        >
+          <Plus className="w-4 h-4" /> Add System User
+        </button>
       </div>
 
       {msg && <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 font-medium">{msg}</div>}
-      {err && !userModal && !empModal && (
+      {err && !userModal && (
         <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{err}</div>
       )}
 
@@ -321,143 +226,72 @@ export function SettingsUserControlModule({ currentUser, onProfileUpdated }: Pro
           <p className="mt-0.5 text-xs text-slate-500">Privileged control access</p>
         </div>
         <div className="rounded-xl border border-slate-200 bg-white p-4">
-          <p className="text-xs font-medium text-slate-500">Employee Directory</p>
-          <p className="mt-1 font-mono tabular-nums text-2xl font-semibold text-slate-900">{data.employees.length}</p>
-          <p className="mt-0.5 text-xs text-slate-500">Staff &amp; crew profiles</p>
+          <p className="text-xs font-medium text-slate-500">Active Accounts</p>
+          <p className="mt-1 font-mono tabular-nums text-2xl font-semibold text-slate-900">{activeUsersCount}</p>
+          <p className="mt-0.5 text-xs text-slate-500">Ready to sign in</p>
         </div>
         <div className="rounded-xl border border-slate-200 bg-white p-4">
-          <p className="text-xs font-medium text-slate-500">Uploaded Photos</p>
-          <p className="mt-1 font-mono tabular-nums text-2xl font-semibold text-slate-900">{withPhotosCount}</p>
-          <p className="mt-0.5 text-xs text-slate-500">Across users &amp; employees</p>
+          <p className="text-xs font-medium text-slate-500">Uploaded Avatars</p>
+          <p className="mt-1 font-mono tabular-nums text-2xl font-semibold text-slate-900">{userPhotosCount}</p>
+          <p className="mt-0.5 text-xs text-slate-500">Configured profile photos</p>
         </div>
-      </div>
-
-      {/* Sub-navigation Tabs */}
-      <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg border border-slate-200 w-fit">
-        <button
-          type="button"
-          onClick={() => setSubTab('users')}
-          className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium whitespace-nowrap ${
-            subTab === 'users' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
-          }`}
-        >
-          <UserCheck className="w-3.5 h-3.5" /> System Users ({data.users.length})
-        </button>
-        <button
-          type="button"
-          onClick={() => setSubTab('employees')}
-          className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium whitespace-nowrap ${
-            subTab === 'employees' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
-          }`}
-        >
-          <Users className="w-3.5 h-3.5" /> Employees &amp; Crew Photos ({data.employees.length})
-        </button>
       </div>
 
       {/* System Users Table */}
-      {subTab === 'users' && (
-        <div className="rounded-xl border border-slate-200 bg-white overflow-x-auto">
-          <table className="w-full text-left text-xs">
-            <thead className="border-b border-slate-200 bg-slate-50 text-slate-500">
-              <tr>
-                <th className="p-3 font-medium">User</th>
-                <th className="p-3 font-medium">Role</th>
-                <th className="p-3 font-medium">Assigned Location</th>
-                <th className="p-3 font-medium">Status</th>
-                <th className="p-3 font-medium text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100">
-              {data.users.map((u) => (
-                <tr key={u.id} className="hover:bg-slate-50">
-                  <td className="p-3">
-                    <div className="flex items-center gap-3">
-                      <AvatarBadge name={u.full_name} src={u.avatar_url} />
-                      <div>
-                        <p className="font-semibold text-slate-900">{u.full_name}</p>
-                        <p className="font-mono text-[11px] text-slate-500">{u.email}</p>
-                      </div>
-                    </div>
-                  </td>
-                  <td className="p-3">
-                    <p className="font-medium text-slate-800">{u.role_name}</p>
-                    <p className="font-mono text-[11px] text-slate-400">{u.role_code}</p>
-                  </td>
-                  <td className="p-3 text-slate-600">{u.location_name || 'All Locations'}</td>
-                  <td className="p-3">
-                    <span className={u.is_active === 1 ? 'font-semibold text-emerald-700' : 'font-semibold text-red-600'}>
-                      {u.is_active === 1 ? 'ACTIVE' : 'DISABLED'}
-                    </span>
-                  </td>
-                  <td className="p-3 text-right">
-                    <button
-                      type="button"
-                      onClick={() => openEditUser(u)}
-                      className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
-                    >
-                      <Pencil className="w-3.5 h-3.5" /> Edit / Photo
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+      <div className="rounded-xl border border-slate-200 bg-white overflow-x-auto">
+        <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <UserCheck className="w-4 h-4 text-slate-700" />
+            <span className="text-xs font-semibold text-slate-800">Configured System Users ({data.users.length})</span>
+          </div>
+          <span className="text-[11px] text-slate-500">Role-Based Access Control (RBAC) Accounts</span>
         </div>
-      )}
-
-      {/* Employees Table */}
-      {subTab === 'employees' && (
-        <div className="rounded-xl border border-slate-200 bg-white overflow-x-auto">
-          <table className="w-full text-left text-xs">
-            <thead className="border-b border-slate-200 bg-slate-50 text-slate-500">
-              <tr>
-                <th className="p-3 font-medium">Employee</th>
-                <th className="p-3 font-medium">Department · Position</th>
-                <th className="p-3 font-medium">Assigned Truck / Site</th>
-                <th className="p-3 font-medium text-right">Pay Rate</th>
-                <th className="p-3 font-medium">Status</th>
-                <th className="p-3 font-medium text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100">
-              {data.employees.map((emp) => (
-                <tr key={emp.id} className="hover:bg-slate-50">
-                  <td className="p-3">
-                    <div className="flex items-center gap-3">
-                      <AvatarBadge name={emp.full_name} src={emp.avatar_url} />
-                      <div>
-                        <p className="font-semibold text-slate-900">{emp.full_name}</p>
-                        <p className="font-mono text-[11px] text-slate-500">{emp.employee_code}</p>
-                      </div>
+        <table className="w-full text-left text-xs">
+          <thead className="border-b border-slate-200 bg-slate-50 text-slate-500">
+            <tr>
+              <th className="p-3 font-medium">User</th>
+              <th className="p-3 font-medium">Role</th>
+              <th className="p-3 font-medium">Assigned Location</th>
+              <th className="p-3 font-medium">Status</th>
+              <th className="p-3 font-medium text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {data.users.map((u) => (
+              <tr key={u.id} className="hover:bg-slate-50">
+                <td className="p-3">
+                  <div className="flex items-center gap-3">
+                    <AvatarBadge name={u.full_name} src={u.avatar_url} />
+                    <div>
+                      <p className="font-semibold text-slate-900">{u.full_name}</p>
+                      <p className="font-mono text-[11px] text-slate-500">{u.email}</p>
                     </div>
-                  </td>
-                  <td className="p-3 text-slate-700">
-                    {emp.department} · <span className="text-slate-500">{emp.position}</span>
-                  </td>
-                  <td className="p-3 text-slate-600">{emp.location_name || 'HQ / Unassigned'}</td>
-                  <td className="p-3 text-right font-mono tabular-nums">
-                    {formatPHP(emp.base_rate)} <span className="text-[11px] text-slate-400">/{emp.pay_type === 'MONTHLY' ? 'mo' : 'day'}</span>
-                  </td>
-                  <td className="p-3">
-                    <span className={emp.is_active === 1 ? 'font-semibold text-emerald-700' : 'font-semibold text-red-600'}>
-                      {emp.is_active === 1 ? 'ACTIVE' : 'INACTIVE'}
-                    </span>
-                  </td>
-                  <td className="p-3 text-right">
-                    <button
-                      type="button"
-                      onClick={() => openEditEmployee(emp)}
-                      className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
-                    >
-                      <Pencil className="w-3.5 h-3.5" /> Edit / Photo
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
+                  </div>
+                </td>
+                <td className="p-3">
+                  <p className="font-medium text-slate-800">{u.role_name}</p>
+                  <p className="font-mono text-[11px] text-slate-400">{u.role_code}</p>
+                </td>
+                <td className="p-3 text-slate-600">{u.location_name || 'All Locations'}</td>
+                <td className="p-3">
+                  <span className={u.is_active === 1 ? 'font-semibold text-emerald-700' : 'font-semibold text-red-600'}>
+                    {u.is_active === 1 ? 'ACTIVE' : 'DISABLED'}
+                  </span>
+                </td>
+                <td className="p-3 text-right">
+                  <button
+                    type="button"
+                    onClick={() => openEditUser(u)}
+                    className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
+                  >
+                    <Pencil className="w-3.5 h-3.5" /> Edit / Photo
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
 
       {/* User Create / Edit Modal */}
       {userModal && (
@@ -495,7 +329,7 @@ export function SettingsUserControlModule({ currentUser, onProfileUpdated }: Pro
                     accept="image/*"
                     className="hidden"
                     onChange={(e) => {
-                      handlePhotoUpload(e.target.files?.[0], 'user');
+                      handlePhotoUpload(e.target.files?.[0]);
                       e.target.value = '';
                     }}
                   />
@@ -516,12 +350,15 @@ export function SettingsUserControlModule({ currentUser, onProfileUpdated }: Pro
                     </button>
                   )}
                 </div>
-                <input
-                  placeholder="Or paste image URL..."
-                  value={userForm.avatarUrl.startsWith('data:') ? '' : userForm.avatarUrl}
-                  onChange={(e) => setUserForm((f) => ({ ...f, avatarUrl: e.target.value }))}
-                  className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs"
-                />
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-600 mb-1">Or Image URL</label>
+                  <input
+                    placeholder="Or paste image URL..."
+                    value={userForm.avatarUrl.startsWith('data:') ? '' : userForm.avatarUrl}
+                    onChange={(e) => setUserForm((f) => ({ ...f, avatarUrl: e.target.value }))}
+                    className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs"
+                  />
+                </div>
               </div>
             </div>
 
@@ -615,179 +452,6 @@ export function SettingsUserControlModule({ currentUser, onProfileUpdated }: Pro
                 className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-50"
               >
                 {saving ? 'Saving...' : userModal.mode === 'create' ? 'Create User' : 'Save User'}
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-
-      {/* Employee Create / Edit Modal */}
-      {empModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <form onSubmit={submitEmployee} className="w-full max-w-lg max-h-[90vh] overflow-y-auto rounded-xl bg-white p-5 space-y-4 border border-slate-200">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-              <div>
-                <h3 className="font-display text-base font-semibold text-slate-900">
-                  {empModal.mode === 'create' ? 'Add Employee Profile' : 'Edit Employee & Photo'}
-                </h3>
-                <p className="text-xs text-slate-500">Manage employee directory record, truck assignment, and avatar photo</p>
-              </div>
-              <button
-                type="button"
-                onClick={() => {
-                  setErr('');
-                  setEmpModal(null);
-                }}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            {err && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{err}</div>}
-
-            {/* Employee Photo Uploader */}
-            <div className="flex items-center gap-4 rounded-lg border border-slate-200 bg-slate-50 p-3.5">
-              <AvatarBadge name={empForm.fullName || 'Employee'} src={empForm.avatarUrl} size="lg" />
-              <div className="flex-1 min-w-0 space-y-2">
-                <div className="flex flex-wrap items-center gap-2">
-                  <input
-                    ref={empFileRef}
-                    type="file"
-                    accept="image/*"
-                    className="hidden"
-                    onChange={(e) => {
-                      handlePhotoUpload(e.target.files?.[0], 'employee');
-                      e.target.value = '';
-                    }}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => empFileRef.current?.click()}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
-                  >
-                    <Upload className="w-3.5 h-3.5" /> Upload Photo
-                  </button>
-                  {empForm.avatarUrl && (
-                    <button
-                      type="button"
-                      onClick={() => setEmpForm((f) => ({ ...f, avatarUrl: '' }))}
-                      className="inline-flex items-center gap-1 rounded-lg border border-red-200 bg-white px-2.5 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" /> Remove
-                    </button>
-                  )}
-                </div>
-                <input
-                  placeholder="Or paste image URL..."
-                  value={empForm.avatarUrl.startsWith('data:') ? '' : empForm.avatarUrl}
-                  onChange={(e) => setEmpForm((f) => ({ ...f, avatarUrl: e.target.value }))}
-                  className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs"
-                />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Employee Code</label>
-                <input
-                  required
-                  value={empForm.employeeCode}
-                  onChange={(e) => setEmpForm({ ...empForm, employeeCode: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Full Name</label>
-                <input
-                  required
-                  value={empForm.fullName}
-                  onChange={(e) => setEmpForm({ ...empForm, fullName: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Department</label>
-                <input
-                  required
-                  value={empForm.department}
-                  onChange={(e) => setEmpForm({ ...empForm, department: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Position</label>
-                <input
-                  required
-                  value={empForm.position}
-                  onChange={(e) => setEmpForm({ ...empForm, position: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Assigned Location</label>
-                <select
-                  value={empForm.locationId}
-                  onChange={(e) => setEmpForm({ ...empForm, locationId: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
-                >
-                  <option value="">HQ / Unassigned</option>
-                  {data.locations.map((l) => (
-                    <option key={l.id} value={l.id}>{l.name}</option>
-                  ))}
-                </select>
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label className="block text-xs font-medium text-slate-600 mb-1">Pay Type</label>
-                  <select
-                    value={empForm.payType}
-                    onChange={(e) => setEmpForm({ ...empForm, payType: e.target.value })}
-                    className="w-full rounded-lg border border-slate-200 px-2.5 py-2 text-xs"
-                  >
-                    <option value="DAILY">DAILY</option>
-                    <option value="MONTHLY">MONTHLY</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-slate-600 mb-1">Base Rate (PHP)</label>
-                  <input
-                    type="number"
-                    required
-                    value={empForm.baseRate}
-                    onChange={(e) => setEmpForm({ ...empForm, baseRate: e.target.value })}
-                    className="w-full rounded-lg border border-slate-200 px-2.5 py-2 text-xs font-mono"
-                  />
-                </div>
-              </div>
-            </div>
-
-            <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={empForm.isActive}
-                onChange={(e) => setEmpForm({ ...empForm, isActive: e.target.checked })}
-              />
-              Employee active in payroll &amp; roster
-            </label>
-
-            <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
-              <button
-                type="button"
-                onClick={() => {
-                  setErr('');
-                  setEmpModal(null);
-                }}
-                className="px-4 py-2 rounded-lg border text-xs"
-              >
-                Cancel
-              </button>
-              <button
-                type="submit"
-                disabled={saving}
-                className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-50"
-              >
-                {saving ? 'Saving...' : empModal.mode === 'create' ? 'Create Employee' : 'Save Employee'}
               </button>
             </div>
           </form>

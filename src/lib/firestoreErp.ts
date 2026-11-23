@@ -1,0 +1,5367 @@
+import { User } from 'firebase/auth';
+import {
+  collection,
+  deleteDoc,
+  doc,
+  getDoc,
+  getDocs,
+  query,
+  serverTimestamp,
+  setDoc,
+  Timestamp,
+  updateDoc,
+  where,
+  writeBatch,
+} from 'firebase/firestore';
+import { auth, db, handleFirestoreError, OperationType } from './firebase.ts';
+import { AuthUser, PERMISSIONS, RoleCode } from '../types/erp.ts';
+
+const ACTIVE_USER_SESSION_KEY = 'maximus_bbq_active_erp_user_id';
+const BOOTSTRAP_ADMIN_EMAIL = 'norielescobio@gmail.com';
+
+const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+const round4 = (n: number) => Math.round((n + Number.EPSILON) * 10000) / 10000;
+
+function prefixOf(uid: string): string {
+  return uid.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 10);
+}
+
+function toDocId(logicalId: string, uid: string): string {
+  const p = `${prefixOf(uid)}_`;
+  return logicalId.startsWith(p) ? logicalId : `${p}${logicalId}`;
+}
+
+function toLogicalId(docId: string, uid: string): string {
+  const p = `${prefixOf(uid)}_`;
+  return docId.startsWith(p) ? docId.slice(p.length) : docId;
+}
+
+function tsToIso(val: unknown): string {
+  if (!val) return new Date().toISOString();
+  if (typeof val === 'string') return val;
+  if (val instanceof Timestamp) return val.toDate().toISOString();
+  if (typeof (val as any)?.toDate === 'function') return (val as any).toDate().toISOString();
+  return new Date().toISOString();
+}
+
+async function hashPassword(password: string): Promise<string> {
+  const data = new TextEncoder().encode(`maximus_erp:${password}`);
+  const buf = await crypto.subtle.digest('SHA-256', data);
+  const hex = Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+  return `sha256:${hex}`;
+}
+
+async function verifyPassword(password: string, storedHash: string): Promise<boolean> {
+  if (!storedHash) return false;
+  if (storedHash.startsWith('sha256:')) {
+    const candidate = await hashPassword(password);
+    return candidate === storedHash;
+  }
+  return password === storedHash;
+}
+
+function formatDetailsText(details?: Record<string, unknown> | string | null): string | null {
+  if (!details) return null;
+  if (typeof details === 'string') return details.slice(0, 990);
+  const parts = Object.entries(details)
+    .filter(([, v]) => v !== undefined && v !== null && v !== '')
+    .map(([k, v]) => `${k}: ${typeof v === 'object' ? String(v) : String(v)}`);
+  return parts.length ? parts.join(' | ').slice(0, 990) : null;
+}
+
+// =====================================================
+// SNAPSHOT LOADER (WORKSPACE SCOPED BY ownerUid)
+// =====================================================
+interface WorkspaceSnapshot {
+  uid: string;
+  meta: any;
+  erpUsers: any[];
+  employees: any[];
+  categories: any[];
+  products: any[];
+  inventoryItems: any[];
+  stockBatches: any[];
+  inventoryTxns: any[];
+  stockTransfers: any[];
+  sales: any[];
+  suppliers: any[];
+  purchaseOrders: any[];
+  goodsReceipts: any[];
+  supplierInvoices: any[];
+  accounts: any[];
+  journalEntries: any[];
+  expenses: any[];
+  dailyClosings: any[];
+  taxConfigs: any[];
+  locations: any[];
+  foodTrucks: any[];
+  fleetLogs: any[];
+  attendanceLogs: any[];
+  payrollRuns: any[];
+  customers: any[];
+  notifications: any[];
+  auditLogs: any[];
+}
+
+let cachedSnapshot: WorkspaceSnapshot | null = null;
+const inflightSnapshotByUid = new Map<string, Promise<WorkspaceSnapshot>>();
+const activeSyncByUid = new Map<string, Promise<void>>();
+const syncedProfileByUid = new Map<string, string>();
+const seededWorkspaceUids = new Set<string>();
+
+export function invalidateWorkspaceCache() {
+  cachedSnapshot = null;
+  inflightSnapshotByUid.clear();
+}
+
+export function resetFirebaseSyncCache() {
+  cachedSnapshot = null;
+  inflightSnapshotByUid.clear();
+  syncedProfileByUid.clear();
+  seededWorkspaceUids.clear();
+}
+
+function isTransientReadError(err: unknown): boolean {
+  const code = String((err as any)?.code || '').toLowerCase();
+  const msg = (err instanceof Error ? err.message : String(err || '')).toLowerCase();
+  return (
+    code === 'unavailable' ||
+    code === 'already-exists' ||
+    code === 'aborted' ||
+    code === 'deadline-exceeded' ||
+    msg.includes('target id already exists') ||
+    msg.includes('the client is offline') ||
+    msg.includes('client is offline') ||
+    msg.includes('network error') ||
+    msg.includes('unavailable')
+  );
+}
+
+async function runFirestoreRead<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientReadError(err) || attempt === maxRetries) {
+        throw err;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+async function queryCollection(colName: string, uid: string): Promise<any[]> {
+  try {
+    const q = query(collection(db, colName), where('ownerUid', '==', uid));
+    const snap = await runFirestoreRead(() => getDocs(q));
+    return snap.docs.map((d) => ({ ...d.data(), _docId: d.id }));
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, colName);
+  }
+}
+
+async function getWorkspaceMeta(uid: string): Promise<any | null> {
+  const metaId = `ws_${uid}`;
+  const path = `workspace_meta/${metaId}`;
+  try {
+    const snap = await runFirestoreRead(() => getDoc(doc(db, 'workspace_meta', metaId)));
+    return snap.exists() ? { ...snap.data(), _docId: snap.id } : null;
+  } catch (err) {
+    handleFirestoreError(err, OperationType.GET, path);
+  }
+}
+
+export function syncFirebaseUserAndSeed(firebaseUser: User): Promise<void> {
+  const uid = firebaseUser.uid;
+  const inflight = activeSyncByUid.get(uid);
+  if (inflight) return inflight;
+
+  const task = (async () => {
+    await firebaseUser.getIdToken().catch(() => {});
+
+    const userPath = `users/${uid}`;
+    const isBootstrap = (firebaseUser.email || '').toLowerCase() === BOOTSTRAP_ADMIN_EMAIL;
+    const cleanEmail = (firebaseUser.email || `${uid}@users.maximusbbq.ph`).trim().slice(0, 200);
+    const cleanName = (firebaseUser.displayName?.trim() || cleanEmail.split('@')[0]?.trim() || 'Workspace User').slice(0, 150);
+    const rawPhoto = firebaseUser.photoURL ? String(firebaseUser.photoURL).trim() : '';
+    const cleanPhoto = rawPhoto && rawPhoto.length <= 250000 ? rawPhoto : null;
+    const profileKey = `${cleanEmail}|${cleanName}|${cleanPhoto ?? ''}`;
+
+    if (syncedProfileByUid.get(uid) !== profileKey) {
+      const userRef = doc(db, 'users', uid);
+      let userSnap;
+      try {
+        userSnap = await runFirestoreRead(() => getDoc(userRef));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.GET, userPath);
+      }
+
+      if (!userSnap.exists()) {
+        try {
+          await setDoc(userRef, {
+            uid,
+            email: cleanEmail,
+            displayName: cleanName,
+            photoURL: cleanPhoto,
+            role: isBootstrap ? 'admin' : 'member',
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        } catch (err) {
+          handleFirestoreError(err, OperationType.CREATE, userPath);
+        }
+      } else {
+        const existing = userSnap.data();
+        if (existing.displayName !== cleanName || (existing.photoURL ?? null) !== cleanPhoto) {
+          try {
+            await updateDoc(userRef, {
+              displayName: cleanName,
+              photoURL: cleanPhoto,
+              updatedAt: serverTimestamp(),
+            });
+          } catch (err) {
+            handleFirestoreError(err, OperationType.UPDATE, userPath);
+          }
+        }
+      }
+      syncedProfileByUid.set(uid, profileKey);
+    }
+
+    if (!seededWorkspaceUids.has(uid)) {
+      const meta = await getWorkspaceMeta(uid);
+      if (!meta?.seeded) {
+        await seedWorkspaceFirestore(firebaseUser);
+        invalidateWorkspaceCache();
+      }
+      seededWorkspaceUids.add(uid);
+    }
+  })().finally(() => {
+    activeSyncByUid.delete(uid);
+  });
+
+  activeSyncByUid.set(uid, task);
+  return task;
+}
+
+async function seedWorkspaceFirestore(firebaseUser: User): Promise<void> {
+  const uid = firebaseUser.uid;
+  const batch = writeBatch(db);
+  const daysFromNow = (d: number) => new Date(Date.now() + d * 86400000).toISOString();
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const demoPassHash = await hashPassword('erp2026!');
+
+  // 1. Roles, UOMs, Conversions, Petty Cash, Financial Periods, Payroll Rules -> workspace_meta
+  const allPerms = Object.values(PERMISSIONS);
+  const roles = [
+    { id: 'role_super_admin', code: 'SUPER_ADMIN', name: 'Super Administrator', description: 'Super Administrator role', permissions: allPerms },
+    { id: 'role_business_owner', code: 'BUSINESS_OWNER', name: 'Business Owner', description: 'Business Owner role', permissions: allPerms },
+    {
+      id: 'role_operations_manager',
+      code: 'OPERATIONS_MANAGER',
+      name: 'Operations Manager',
+      description: 'Operations Manager role',
+      permissions: [
+        PERMISSIONS.DASHBOARD_VIEW,
+        PERMISSIONS.POS_SELL,
+        PERMISSIONS.POS_REFUND,
+        PERMISSIONS.KDS_MANAGE,
+        PERMISSIONS.PRODUCT_MANAGE,
+        PERMISSIONS.INVENTORY_VIEW,
+        PERMISSIONS.INVENTORY_ADJUST,
+        PERMISSIONS.PO_CREATE,
+        PERMISSIONS.PO_APPROVE,
+        PERMISSIONS.GRN_RECEIVE,
+        PERMISSIONS.FLEET_MANAGE,
+        PERMISSIONS.REPORTS_VIEW,
+        PERMISSIONS.DAILY_CLOSE,
+      ],
+    },
+    {
+      id: 'role_finance_manager',
+      code: 'FINANCE_MANAGER',
+      name: 'Finance Manager',
+      description: 'Finance Manager role',
+      permissions: [
+        PERMISSIONS.DASHBOARD_VIEW,
+        PERMISSIONS.FINANCE_VIEW,
+        PERMISSIONS.JOURNAL_POST,
+        PERMISSIONS.DAILY_CLOSE,
+        PERMISSIONS.PO_APPROVE,
+        PERMISSIONS.REPORTS_VIEW,
+        PERMISSIONS.HR_MANAGE,
+        PERMISSIONS.PAYROLL_RUN,
+      ],
+    },
+    {
+      id: 'role_inventory_manager',
+      code: 'INVENTORY_MANAGER',
+      name: 'Inventory Manager',
+      description: 'Inventory Manager role',
+      permissions: [
+        PERMISSIONS.DASHBOARD_VIEW,
+        PERMISSIONS.INVENTORY_VIEW,
+        PERMISSIONS.INVENTORY_ADJUST,
+        PERMISSIONS.GRN_RECEIVE,
+        PERMISSIONS.PO_CREATE,
+        PERMISSIONS.PRODUCT_MANAGE,
+        PERMISSIONS.REPORTS_VIEW,
+      ],
+    },
+    {
+      id: 'role_purchasing_officer',
+      code: 'PURCHASING_OFFICER',
+      name: 'Purchasing Officer',
+      description: 'Purchasing Officer role',
+      permissions: [
+        PERMISSIONS.DASHBOARD_VIEW,
+        PERMISSIONS.INVENTORY_VIEW,
+        PERMISSIONS.PO_CREATE,
+        PERMISSIONS.GRN_RECEIVE,
+        PERMISSIONS.REPORTS_VIEW,
+      ],
+    },
+    {
+      id: 'role_food_truck_manager',
+      code: 'FOOD_TRUCK_MANAGER',
+      name: 'Food Truck Manager',
+      description: 'Food Truck Manager role',
+      permissions: [
+        PERMISSIONS.DASHBOARD_VIEW,
+        PERMISSIONS.POS_SELL,
+        PERMISSIONS.POS_REFUND,
+        PERMISSIONS.KDS_MANAGE,
+        PERMISSIONS.INVENTORY_VIEW,
+        PERMISSIONS.INVENTORY_ADJUST,
+        PERMISSIONS.DAILY_CLOSE,
+        PERMISSIONS.FLEET_MANAGE,
+        PERMISSIONS.CRM_MANAGE,
+      ],
+    },
+    {
+      id: 'role_cashier',
+      code: 'CASHIER',
+      name: 'Cashier',
+      description: 'Cashier role',
+      permissions: [PERMISSIONS.POS_SELL, PERMISSIONS.CRM_MANAGE],
+    },
+    {
+      id: 'role_kitchen_staff',
+      code: 'KITCHEN_STAFF',
+      name: 'Kitchen Staff',
+      description: 'Kitchen Staff role',
+      permissions: [PERMISSIONS.KDS_MANAGE, PERMISSIONS.INVENTORY_VIEW],
+    },
+    {
+      id: 'role_hr_manager',
+      code: 'HR_MANAGER',
+      name: 'HR Manager',
+      description: 'HR Manager role',
+      permissions: [PERMISSIONS.DASHBOARD_VIEW, PERMISSIONS.HR_MANAGE, PERMISSIONS.PAYROLL_RUN, PERMISSIONS.REPORTS_VIEW],
+    },
+  ];
+
+  const uoms = [
+    { id: 'uom_g', code: 'g', name: 'Grams' },
+    { id: 'uom_kg', code: 'kg', name: 'Kilograms' },
+    { id: 'uom_ml', code: 'ml', name: 'Milliliters' },
+    { id: 'uom_l', code: 'L', name: 'Liters' },
+    { id: 'uom_pcs', code: 'pcs', name: 'Pieces' },
+  ];
+
+  const unitConversions = [
+    { id: 'conv_kg_g', from_uom_id: 'uom_kg', to_uom_id: 'uom_g', factor: 1000 },
+    { id: 'conv_l_ml', from_uom_id: 'uom_l', to_uom_id: 'uom_ml', factor: 1000 },
+  ];
+
+  const pettyCashFunds = [
+    { id: 'pc_1', location_id: 'loc_truck_1', fund_name: 'Truck 01 Petty Cash', float_amount: 5000, current_balance: 4250 },
+    { id: 'pc_2', location_id: 'loc_truck_2', fund_name: 'Truck 02 Petty Cash', float_amount: 5000, current_balance: 4600 },
+  ];
+
+  const financialPeriods = [
+    { id: 'fp_2026_11', name: '2026-11', period_start: '2026-11-01', period_end: '2026-11-30', status: 'OPEN' },
+  ];
+
+  const payrollRule = {
+    id: 'pr_ph_2026',
+    code: 'PH_STATUTORY_2026',
+    name: 'Configurable Philippine Statutory Contributions',
+    is_active: 1,
+    config: {
+      sssEmployeeRatePct: 4.5,
+      philhealthEmployeeRatePct: 2.5,
+      pagibigFixedEmployeePhp: 200,
+      overtimeMultiplier: 1.25,
+      taxExemptMonthlyCeilingPhp: 20833,
+      withholdingRateAboveCeilingPct: 15,
+    },
+  };
+
+  const metaId = `ws_${uid}`;
+  batch.set(doc(db, 'workspace_meta', metaId), {
+    id: metaId,
+    ownerUid: uid,
+    seeded: true,
+    businessName: 'Maximus Barbecue ERP',
+    currency: 'PHP',
+    roles,
+    uoms,
+    unitConversions,
+    pettyCashFunds,
+    financialPeriods,
+    payrollRule,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  });
+
+  // 2. Locations (no updatedAt)
+  const locs = [
+    { id: 'loc_commissary', code: 'COM-01', name: 'Central Commissary Kitchen', type: 'COMMISSARY', address: 'Pasig Food Hub, Metro Manila', kdsEnabled: false },
+    { id: 'loc_truck_1', code: 'TRK-01', name: 'Truck 01 — BGC High Street', type: 'FOOD_TRUCK', address: '7th Ave & Bonifacio High St, Taguig', kdsEnabled: true },
+    { id: 'loc_truck_2', code: 'TRK-02', name: 'Truck 02 — Ayala Triangle', type: 'FOOD_TRUCK', address: 'Makati Ave Night Market, Makati', kdsEnabled: true },
+  ];
+  for (const l of locs) {
+    const docId = toDocId(l.id, uid);
+    batch.set(doc(db, 'locations', docId), {
+      id: docId,
+      ownerUid: uid,
+      code: l.code,
+      name: l.name,
+      type: l.type,
+      address: l.address,
+      isActive: true,
+      kdsEnabled: l.kdsEnabled,
+      createdAt: serverTimestamp(),
+    });
+  }
+
+  // 3. Food Trucks & Fleet Logs
+  const trucks = [
+    { id: 'trk_1', locationId: 'loc_truck_1', plateNumber: 'NAA-4821', makeModel: 'Isuzu NLR Custom Kitchen Van', status: 'ACTIVE', currentSite: 'BGC High Street South', odometerKm: 42850 },
+    { id: 'trk_2', locationId: 'loc_truck_2', plateNumber: 'NCB-9104', makeModel: 'Mitsubishi Canter Food Rig', status: 'ACTIVE', currentSite: 'Ayala Triangle Gardens', odometerKm: 31420 },
+  ];
+  for (const t of trucks) {
+    const docId = toDocId(t.id, uid);
+    batch.set(doc(db, 'food_trucks', docId), {
+      id: docId,
+      ownerUid: uid,
+      locationId: toDocId(t.locationId, uid),
+      plateNumber: t.plateNumber,
+      makeModel: t.makeModel,
+      status: t.status,
+      currentSite: t.currentSite,
+      odometerKm: t.odometerKm,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  const fleetSeeds = [
+    { id: 'ta_1', logType: 'ASSIGNMENT', truckId: 'trk_1', siteName: 'BGC High Street South', assignedDate: todayStr, shiftNotes: 'Lunch & Dinner Peak Service', liters: null, totalCost: null, odometerKm: null, title: null, description: null, serviceDate: null, nextDueDate: null },
+    { id: 'ta_2', logType: 'ASSIGNMENT', truckId: 'trk_2', siteName: 'Ayala Triangle Gardens', assignedDate: todayStr, shiftNotes: 'Evening Street Market', liters: null, totalCost: null, odometerKm: null, title: null, description: null, serviceDate: null, nextDueDate: null },
+    { id: 'fuel_1', logType: 'FUEL', truckId: 'trk_1', siteName: null, assignedDate: daysFromNow(-2), shiftNotes: null, liters: 42.5, totalCost: 2450, odometerKm: 42850, title: null, description: null, serviceDate: null, nextDueDate: null },
+    { id: 'mnt_1', logType: 'MAINTENANCE', truckId: 'trk_2', siteName: null, assignedDate: null, shiftNotes: null, liters: null, totalCost: 1800, odometerKm: null, title: 'Generator Oil & Filter Service', description: 'Scheduled 500-hr generator preventive maintenance', serviceDate: daysFromNow(-3).slice(0, 10), nextDueDate: daysFromNow(27).slice(0, 10) },
+  ];
+  for (const fl of fleetSeeds) {
+    const docId = toDocId(fl.id, uid);
+    batch.set(doc(db, 'fleet_logs', docId), {
+      id: docId,
+      ownerUid: uid,
+      logType: fl.logType,
+      truckId: toDocId(fl.truckId, uid),
+      siteName: fl.siteName,
+      assignedDate: fl.assignedDate,
+      shiftNotes: fl.shiftNotes,
+      liters: fl.liters,
+      totalCost: fl.totalCost,
+      odometerKm: fl.odometerKm,
+      title: fl.title,
+      description: fl.description,
+      serviceDate: fl.serviceDate,
+      nextDueDate: fl.nextDueDate,
+      createdAt: serverTimestamp(),
+    });
+  }
+
+  // 4. ERP Users (including signed-in Google Owner + seeded RBAC accounts)
+  const erpUserSeeds: Array<{
+    id: string;
+    email: string;
+    fullName: string;
+    roleId: string;
+    roleCode: string;
+    roleName: string;
+    assignedLocationId: string | null;
+    avatarUrl: string | null;
+  }> = [
+    { id: 'usr_superadmin', email: 'superadmin@maximusbbq.ph', fullName: 'System Super Admin', roleId: 'role_super_admin', roleCode: 'SUPER_ADMIN', roleName: 'Super Administrator', assignedLocationId: null, avatarUrl: null },
+    { id: 'usr_owner', email: 'owner@maximusbbq.ph', fullName: 'Marco Santos (Owner)', roleId: 'role_business_owner', roleCode: 'BUSINESS_OWNER', roleName: 'Business Owner', assignedLocationId: null, avatarUrl: null },
+    { id: 'usr_ops', email: 'ops@maximusbbq.ph', fullName: 'Elena Reyes (Operations)', roleId: 'role_operations_manager', roleCode: 'OPERATIONS_MANAGER', roleName: 'Operations Manager', assignedLocationId: null, avatarUrl: null },
+    { id: 'usr_fin', email: 'finance@maximusbbq.ph', fullName: 'Paolo Cruz (Finance)', roleId: 'role_finance_manager', roleCode: 'FINANCE_MANAGER', roleName: 'Finance Manager', assignedLocationId: null, avatarUrl: null },
+    { id: 'usr_cashier', email: 'cashier@maximusbbq.ph', fullName: 'Bea Mendoza (Cashier)', roleId: 'role_cashier', roleCode: 'CASHIER', roleName: 'Cashier', assignedLocationId: toDocId('loc_truck_1', uid), avatarUrl: null },
+    { id: 'usr_kitchen', email: 'kitchen@maximusbbq.ph', fullName: 'Carlo Villanueva (Kitchen)', roleId: 'role_kitchen_staff', roleCode: 'KITCHEN_STAFF', roleName: 'Kitchen Staff', assignedLocationId: toDocId('loc_truck_1', uid), avatarUrl: null },
+  ];
+
+  const googleEmail = (firebaseUser.email || '').trim().toLowerCase().slice(0, 200);
+  const googleDisplayName = (firebaseUser.displayName?.trim() || googleEmail.split('@')[0]?.trim() || 'Workspace Owner').slice(0, 150);
+  const rawGooglePhoto = firebaseUser.photoURL ? String(firebaseUser.photoURL).trim() : '';
+  const safeGooglePhoto = rawGooglePhoto && rawGooglePhoto.length <= 250000 ? rawGooglePhoto : null;
+  if (googleEmail && !erpUserSeeds.some((u) => u.email.toLowerCase() === googleEmail)) {
+    erpUserSeeds.unshift({
+      id: 'usr_google_owner',
+      email: googleEmail,
+      fullName: googleDisplayName,
+      roleId: 'role_super_admin',
+      roleCode: 'SUPER_ADMIN',
+      roleName: 'Super Administrator',
+      assignedLocationId: null,
+      avatarUrl: safeGooglePhoto,
+    });
+  }
+
+  for (const u of erpUserSeeds) {
+    const docId = toDocId(u.id, uid);
+    batch.set(doc(db, 'erp_users', docId), {
+      id: docId,
+      ownerUid: uid,
+      email: u.email,
+      fullName: u.fullName,
+      roleId: u.roleId,
+      roleCode: u.roleCode,
+      roleName: u.roleName,
+      assignedLocationId: u.assignedLocationId,
+      avatarUrl: u.avatarUrl,
+      passwordHash: demoPassHash,
+      isActive: true,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  // 5. Inventory Items & Stock Batches
+  const invSeeds = [
+    { id: 'ing_pork', sku: 'ING-PORK', name: 'Crispy Pork Maskara & Belly', baseUomId: 'uom_g', uomCode: 'g', costingMethod: 'FIFO', minStockLevel: 5000, reorderPoint: 8000, lastUnitCost: 0.34, weightedAvgCost: 0.33 },
+    { id: 'ing_beef', sku: 'ING-BEEF', name: 'Wagyu-Blend Ground Beef', baseUomId: 'uom_g', uomCode: 'g', costingMethod: 'FIFO', minStockLevel: 4000, reorderPoint: 6000, lastUnitCost: 0.58, weightedAvgCost: 0.56 },
+    { id: 'ing_tortilla', sku: 'ING-TORT', name: 'Artisan Corn Tortillas', baseUomId: 'uom_pcs', uomCode: 'pcs', costingMethod: 'FIFO', minStockLevel: 100, reorderPoint: 150, lastUnitCost: 8.5, weightedAvgCost: 8.5 },
+    { id: 'ing_bun', sku: 'ING-BUN', name: 'Toasted Brioche Buns', baseUomId: 'uom_pcs', uomCode: 'pcs', costingMethod: 'FIFO', minStockLevel: 80, reorderPoint: 120, lastUnitCost: 14.0, weightedAvgCost: 14.0 },
+    { id: 'ing_cheddar', sku: 'ING-CHED', name: 'Aged Cheddar Slices', baseUomId: 'uom_pcs', uomCode: 'pcs', costingMethod: 'WEIGHTED_AVERAGE', minStockLevel: 100, reorderPoint: 140, lastUnitCost: 11.0, weightedAvgCost: 10.8 },
+    { id: 'ing_potato', sku: 'ING-POT', name: 'Russet Shoestring Potatoes', baseUomId: 'uom_g', uomCode: 'g', costingMethod: 'FIFO', minStockLevel: 6000, reorderPoint: 9000, lastUnitCost: 0.14, weightedAvgCost: 0.14 },
+    { id: 'ing_mango', sku: 'ING-MANG', name: 'Guimaras Ripe Mango Puree', baseUomId: 'uom_ml', uomCode: 'ml', costingMethod: 'FIFO', minStockLevel: 4000, reorderPoint: 6000, lastUnitCost: 0.16, weightedAvgCost: 0.16 },
+    { id: 'ing_truffle', sku: 'ING-TRUF', name: 'Black Truffle Garlic Aioli', baseUomId: 'uom_ml', uomCode: 'ml', costingMethod: 'FIFO', minStockLevel: 1500, reorderPoint: 2500, lastUnitCost: 0.42, weightedAvgCost: 0.42 },
+  ];
+  for (const item of invSeeds) {
+    const docId = toDocId(item.id, uid);
+    batch.set(doc(db, 'inventory_items', docId), {
+      id: docId,
+      ownerUid: uid,
+      sku: item.sku,
+      name: item.name,
+      itemType: 'RAW_MATERIAL',
+      baseUomId: item.baseUomId,
+      uomCode: item.uomCode,
+      costingMethod: item.costingMethod,
+      minStockLevel: item.minStockLevel,
+      reorderPoint: item.reorderPoint,
+      lastUnitCost: item.lastUnitCost,
+      weightedAvgCost: item.weightedAvgCost,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  const batchSeeds = [
+    ['bat_1', 'ing_pork', 'loc_truck_1', 'LOT-PRK-101', 12000, 9500, 0.32, daysFromNow(5), daysFromNow(-4)],
+    ['bat_2', 'ing_pork', 'loc_truck_1', 'LOT-PRK-102', 8000, 8000, 0.34, daysFromNow(8), daysFromNow(-1)],
+    ['bat_3', 'ing_beef', 'loc_truck_1', 'LOT-BEF-201', 10000, 7400, 0.58, daysFromNow(2), daysFromNow(-3)],
+    ['bat_4', 'ing_tortilla', 'loc_truck_1', 'LOT-TRT-301', 300, 210, 8.5, daysFromNow(14), daysFromNow(-2)],
+    ['bat_5', 'ing_bun', 'loc_truck_1', 'LOT-BUN-401', 150, 95, 14.0, daysFromNow(3), daysFromNow(-2)],
+    ['bat_6', 'ing_cheddar', 'loc_truck_1', 'LOT-CHD-501', 250, 180, 10.8, daysFromNow(25), daysFromNow(-5)],
+    ['bat_7', 'ing_potato', 'loc_truck_1', 'LOT-POT-601', 15000, 11500, 0.14, daysFromNow(30), daysFromNow(-4)],
+    ['bat_8', 'ing_mango', 'loc_truck_1', 'LOT-MNG-701', 9000, 6200, 0.16, daysFromNow(6), daysFromNow(-2)],
+    ['bat_9', 'ing_truffle', 'loc_truck_1', 'LOT-TRF-801', 3000, 1800, 0.42, daysFromNow(20), daysFromNow(-6)],
+    ['bat_10', 'ing_pork', 'loc_truck_2', 'LOT-PRK-202', 10000, 8200, 0.34, daysFromNow(7), daysFromNow(-1)],
+    ['bat_11', 'ing_beef', 'loc_truck_2', 'LOT-BEF-202', 9000, 6800, 0.58, daysFromNow(6), daysFromNow(-1)],
+    ['bat_12', 'ing_tortilla', 'loc_truck_2', 'LOT-TRT-202', 240, 180, 8.5, daysFromNow(15), daysFromNow(-1)],
+    ['bat_13', 'ing_bun', 'loc_truck_2', 'LOT-BUN-202', 180, 140, 14.0, daysFromNow(4), daysFromNow(-1)],
+    ['bat_14', 'ing_cheddar', 'loc_truck_2', 'LOT-CHD-202', 200, 160, 10.8, daysFromNow(25), daysFromNow(-1)],
+    ['bat_15', 'ing_potato', 'loc_truck_2', 'LOT-POT-202', 12000, 9600, 0.14, daysFromNow(30), daysFromNow(-1)],
+    ['bat_16', 'ing_mango', 'loc_truck_2', 'LOT-MNG-202', 8000, 6400, 0.16, daysFromNow(7), daysFromNow(-1)],
+    ['bat_17', 'ing_truffle', 'loc_truck_2', 'LOT-TRF-202', 3000, 2600, 0.42, daysFromNow(20), daysFromNow(-1)],
+    ['bat_18', 'ing_pork', 'loc_commissary', 'LOT-COM-01', 25000, 25000, 0.32, daysFromNow(10), daysFromNow(-2)],
+    ['bat_19', 'ing_beef', 'loc_commissary', 'LOT-COM-02', 20000, 20000, 0.55, daysFromNow(9), daysFromNow(-2)],
+    ['bat_20', 'ing_bun', 'loc_commissary', 'LOT-COM-03', 400, 400, 13.5, daysFromNow(6), daysFromNow(-1)],
+  ] as const;
+
+  for (const [id, itemId, locId, batchNumber, initialQty, remainingQty, unitCost, expiryDate, receivedAt] of batchSeeds) {
+    const docId = toDocId(id, uid);
+    batch.set(doc(db, 'stock_batches', docId), {
+      id: docId,
+      ownerUid: uid,
+      inventoryItemId: toDocId(itemId, uid),
+      locationId: toDocId(locId, uid),
+      batchNumber,
+      initialQty,
+      remainingQty,
+      unitCost,
+      expiryDate,
+      receivedAt,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  // 6. Tax Configs & Categories
+  const taxSeeds = [
+    { id: 'tax_ph_vat', code: 'PH_VAT_12', name: 'Philippine VAT (12% Inclusive)', ratePercent: 12.0, isInclusive: true, isActive: true },
+    { id: 'tax_ph_pct', code: 'PH_NONVAT_3', name: 'Philippine Percentage Tax (3%)', ratePercent: 3.0, isInclusive: true, isActive: false },
+  ];
+  for (const tc of taxSeeds) {
+    const docId = toDocId(tc.id, uid);
+    batch.set(doc(db, 'tax_configs', docId), {
+      id: docId,
+      ownerUid: uid,
+      code: tc.code,
+      name: tc.name,
+      ratePercent: tc.ratePercent,
+      isInclusive: tc.isInclusive,
+      isActive: tc.isActive,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  const catSeeds = [
+    { id: 'cat_tacos', name: 'Street Tacos', sortOrder: 1, showInPos: true },
+    { id: 'cat_burgers', name: 'Smash Burgers', sortOrder: 2, showInPos: true },
+    { id: 'cat_sides', name: 'Loaded Sides', sortOrder: 3, showInPos: true },
+    { id: 'cat_drinks', name: 'Coolers & Shakes', sortOrder: 4, showInPos: true },
+  ];
+  for (const c of catSeeds) {
+    const docId = toDocId(c.id, uid);
+    batch.set(doc(db, 'categories', docId), {
+      id: docId,
+      ownerUid: uid,
+      name: c.name,
+      sortOrder: c.sortOrder,
+      showInPos: c.showInPos,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  // 7. Products (with embedded variants, modifiers, recipe ingredients)
+  const productSeeds = [
+    {
+      id: 'prd_sisig',
+      sku: 'MNU-01',
+      name: 'Crispy Pork Sisig Tacos (3 pcs)',
+      description: 'Charred corn tortillas with crispy pork sisig, calamansi & chili crema',
+      imageUrl: '/src/assets/images/dish_sisig_taco_1795140886147.jpg',
+      categoryId: toDocId('cat_tacos', uid),
+      basePrice: 215,
+      packagingCost: 12,
+      directLaborCost: 18,
+      targetFoodCostPct: 34,
+      taxConfigId: toDocId('tax_ph_vat', uid),
+      expiryDate: null,
+      isAvailable: true,
+      variants: [
+        { id: 'var_sisig_3', name: 'Solo (3 pcs)', priceDelta: 0, portionMultiplier: 1.0 },
+        { id: 'var_sisig_5', name: 'Barkada (5 pcs)', priceDelta: 125, portionMultiplier: 1.66 },
+      ],
+      modifiers: [
+        { id: 'mod_extra_pork', groupName: 'Protein Boost', name: 'Extra Crispy Sisig', priceDelta: 55, inventoryItemId: toDocId('ing_pork', uid), deductQty: 60, uomId: 'uom_g' },
+      ],
+      recipeYieldQty: 1,
+      prepInstructions: 'Crisp pork on flat-top 4 min, assemble on charred tortillas',
+      ingredients: [
+        { id: 'ri_1', inventoryItemId: toDocId('ing_pork', uid), quantity: 160, uomId: 'uom_g', wasteFactorPct: 5 },
+        { id: 'ri_2', inventoryItemId: toDocId('ing_tortilla', uid), quantity: 3, uomId: 'uom_pcs', wasteFactorPct: 2 },
+      ],
+    },
+    {
+      id: 'prd_burger',
+      sku: 'MNU-02',
+      name: 'Double Wagyu Smash Burger',
+      description: 'Double seared beef patties, aged cheddar, caramelized onions on brioche',
+      imageUrl: '/src/assets/images/dish_wagyu_burger_1795140888993.jpg',
+      categoryId: toDocId('cat_burgers', uid),
+      basePrice: 285,
+      packagingCost: 14,
+      directLaborCost: 22,
+      targetFoodCostPct: 36,
+      taxConfigId: toDocId('tax_ph_vat', uid),
+      expiryDate: null,
+      isAvailable: true,
+      variants: [
+        { id: 'var_brg_dbl', name: 'Double Patty', priceDelta: 0, portionMultiplier: 1.0 },
+        { id: 'var_brg_trp', name: 'Triple Smash', priceDelta: 95, portionMultiplier: 1.5 },
+      ],
+      modifiers: [
+        { id: 'mod_extra_cheese', groupName: 'Add-ons', name: 'Extra Aged Cheddar', priceDelta: 30, inventoryItemId: toDocId('ing_cheddar', uid), deductQty: 1, uomId: 'uom_pcs' },
+      ],
+      recipeYieldQty: 1,
+      prepInstructions: 'Smash two 90g patties at 220C, melt 2 slices cheddar',
+      ingredients: [
+        { id: 'ri_3', inventoryItemId: toDocId('ing_beef', uid), quantity: 180, uomId: 'uom_g', wasteFactorPct: 4 },
+        { id: 'ri_4', inventoryItemId: toDocId('ing_bun', uid), quantity: 1, uomId: 'uom_pcs', wasteFactorPct: 1 },
+        { id: 'ri_5', inventoryItemId: toDocId('ing_cheddar', uid), quantity: 2, uomId: 'uom_pcs', wasteFactorPct: 0 },
+      ],
+    },
+    {
+      id: 'prd_fries',
+      sku: 'MNU-03',
+      name: 'Truffle Parmesan Fries',
+      description: 'Hand-cut Russet fries tossed in parmesan with garlic truffle aioli',
+      imageUrl: '/src/assets/images/dish_truffle_fries_1795140887488.jpg',
+      categoryId: toDocId('cat_sides', uid),
+      basePrice: 155,
+      packagingCost: 10,
+      directLaborCost: 12,
+      targetFoodCostPct: 30,
+      taxConfigId: toDocId('tax_ph_vat', uid),
+      expiryDate: null,
+      isAvailable: true,
+      variants: [
+        { id: 'var_frs_reg', name: 'Regular Boat', priceDelta: 0, portionMultiplier: 1.0 },
+        { id: 'var_frs_shr', name: 'Sharing Tray', priceDelta: 85, portionMultiplier: 1.75 },
+      ],
+      modifiers: [
+        { id: 'mod_extra_aioli', groupName: 'Dip Upgrade', name: 'Extra Truffle Aioli Cup', priceDelta: 35, inventoryItemId: toDocId('ing_truffle', uid), deductQty: 30, uomId: 'uom_ml' },
+      ],
+      recipeYieldQty: 1,
+      prepInstructions: 'Double-fry Russet potatoes, serve with 45ml truffle aioli',
+      ingredients: [
+        { id: 'ri_6', inventoryItemId: toDocId('ing_potato', uid), quantity: 220, uomId: 'uom_g', wasteFactorPct: 6 },
+        { id: 'ri_7', inventoryItemId: toDocId('ing_truffle', uid), quantity: 45, uomId: 'uom_ml', wasteFactorPct: 3 },
+      ],
+    },
+    {
+      id: 'prd_mango',
+      sku: 'MNU-04',
+      name: 'Guimaras Mango Graham Shake',
+      description: 'Layered ripe mango puree, crushed graham & whipped cream',
+      imageUrl: '/src/assets/images/dish_mango_shake_1795140887833.jpg',
+      categoryId: toDocId('cat_drinks', uid),
+      basePrice: 145,
+      packagingCost: 11,
+      directLaborCost: 10,
+      targetFoodCostPct: 32,
+      taxConfigId: toDocId('tax_ph_vat', uid),
+      expiryDate: null,
+      isAvailable: true,
+      variants: [
+        { id: 'var_mng_16', name: '16oz Cup', priceDelta: 0, portionMultiplier: 1.0 },
+        { id: 'var_mng_22', name: '22oz Tall', priceDelta: 40, portionMultiplier: 1.35 },
+      ],
+      modifiers: [],
+      recipeYieldQty: 1,
+      prepInstructions: 'Blend 220ml mango puree with ice, layer graham',
+      ingredients: [
+        { id: 'ri_8', inventoryItemId: toDocId('ing_mango', uid), quantity: 220, uomId: 'uom_ml', wasteFactorPct: 4 },
+      ],
+    },
+  ];
+  for (const p of productSeeds) {
+    const docId = toDocId(p.id, uid);
+    batch.set(doc(db, 'products', docId), {
+      ...p,
+      id: docId,
+      ownerUid: uid,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  // 8. Chart of Accounts (no updatedAt)
+  const accountSeeds = [
+    ['acc_1000', '1000', 'Cash on Hand & Register', 'ASSET', true],
+    ['acc_1010', '1010', 'BPI Operating Bank & E-Wallet Clearing', 'ASSET', true],
+    ['acc_1200', '1200', 'Food & Packaging Inventory', 'ASSET', true],
+    ['acc_2000', '2000', 'Accounts Payable', 'LIABILITY', true],
+    ['acc_2050', '2050', 'Accrued Purchases (GRNI)', 'LIABILITY', true],
+    ['acc_2100', '2100', 'Output VAT Payable', 'LIABILITY', true],
+    ['acc_3000', '3000', 'Owner Equity', 'EQUITY', true],
+    ['acc_4000', '4000', 'Food & Beverage Sales Revenue', 'REVENUE', true],
+    ['acc_5000', '5000', 'Cost of Goods Sold (COGS)', 'EXPENSE', true],
+    ['acc_6100', '6100', 'Fuel & LPG Expense', 'EXPENSE', false],
+    ['acc_6200', '6200', 'Truck Rent, Parking & Permits', 'EXPENSE', false],
+    ['acc_6300', '6300', 'Salaries & Wages Expense', 'EXPENSE', false],
+    ['acc_6400', '6400', 'Vehicle Maintenance & Repairs', 'EXPENSE', false],
+  ] as const;
+  for (const [id, code, name, type, isSystem] of accountSeeds) {
+    const docId = toDocId(id, uid);
+    batch.set(doc(db, 'accounts', docId), {
+      id: docId,
+      ownerUid: uid,
+      code,
+      name,
+      type,
+      isSystem,
+      createdAt: serverTimestamp(),
+    });
+  }
+
+  // 9. Suppliers, POs, Supplier Invoices
+  const supSeeds = [
+    { id: 'sup_1', code: 'SUP-MET', name: 'Metro Meat & Poultry Trading', contactPerson: 'Ramon Tan', phone: '+63 917 555 1021', email: 'orders@metromeat.ph', address: 'Marikina Cold Storage Hub', tin: '008-412-901-000', paymentTerms: 15 },
+    { id: 'sup_2', code: 'SUP-BAK', name: 'Artisan Bakehouse Manila', contactPerson: 'Grace Lim', phone: '+63 918 442 8890', email: 'supply@artisanbake.ph', address: 'Mandaluyong City', tin: '009-221-445-000', paymentTerms: 7 },
+    { id: 'sup_3', code: 'SUP-FRU', name: 'Visayas Highland Produce Corp', contactPerson: 'Lito Dizon', phone: '+63 922 778 3312', email: 'fresh@visayasproduce.ph', address: 'Divisoria Cold Hub', tin: '007-889-123-000', paymentTerms: 0 },
+  ];
+  for (const s of supSeeds) {
+    const docId = toDocId(s.id, uid);
+    batch.set(doc(db, 'suppliers', docId), {
+      ...s,
+      id: docId,
+      ownerUid: uid,
+      isActive: true,
+      createdAt: serverTimestamp(),
+    });
+  }
+
+  const poSeeds = [
+    {
+      id: 'po_1',
+      poNumber: 'PO-2026-089',
+      supplierId: toDocId('sup_2', uid),
+      locationId: toDocId('loc_truck_1', uid),
+      status: 'PENDING_APPROVAL',
+      totalAmount: 4200,
+      approvedBy: null,
+      notes: '',
+      orderedAt: daysFromNow(-1),
+      expectedAt: daysFromNow(1),
+      items: [{ id: 'poi_1', inventoryItemId: toDocId('ing_bun', uid), orderedQty: 300, receivedQty: 0, unitCost: 14.0 }],
+    },
+    {
+      id: 'po_2',
+      poNumber: 'PO-2026-090',
+      supplierId: toDocId('sup_1', uid),
+      locationId: toDocId('loc_commissary', uid),
+      status: 'APPROVED',
+      totalAmount: 12400,
+      approvedBy: toDocId('usr_ops', uid),
+      notes: '',
+      orderedAt: daysFromNow(-1),
+      expectedAt: daysFromNow(1),
+      items: [
+        { id: 'poi_2', inventoryItemId: toDocId('ing_pork', uid), orderedQty: 20000, receivedQty: 0, unitCost: 0.34 },
+        { id: 'poi_3', inventoryItemId: toDocId('ing_beef', uid), orderedQty: 10000, receivedQty: 0, unitCost: 0.56 },
+      ],
+    },
+  ];
+  for (const po of poSeeds) {
+    const docId = toDocId(po.id, uid);
+    batch.set(doc(db, 'purchase_orders', docId), {
+      ...po,
+      id: docId,
+      ownerUid: uid,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  const invDocId = toDocId('sinv_1', uid);
+  batch.set(doc(db, 'supplier_invoices', invDocId), {
+    id: invDocId,
+    ownerUid: uid,
+    invoiceNumber: 'SI-MET-9941',
+    supplierId: toDocId('sup_1', uid),
+    purchaseOrderId: null,
+    totalAmount: 18500,
+    paidAmount: 10000,
+    dueDate: daysFromNow(5),
+    status: 'PARTIAL',
+    payments: [],
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  });
+
+  // 10. Customers
+  const custSeeds = [
+    { id: 'cus_1', fullName: 'Andrea Bautista', phone: '09171234567', email: 'andrea.b@gmail.com', loyaltyPoints: 420, tier: 'GOLD', preferences: 'Extra calamansi on sisig tacos', feedbackNotes: null, registeredAt: '2026-10-15', locationId: toDocId('loc_truck_1', uid) },
+    { id: 'cus_2', fullName: 'Rafael Navarro', phone: '09189876543', email: 'rafael.n@outlook.com', loyaltyPoints: 185, tier: 'SILVER', preferences: 'No onions on smash burger', feedbackNotes: null, registeredAt: '2026-10-28', locationId: toDocId('loc_truck_2', uid) },
+    { id: 'cus_3', fullName: 'Katrina Sy', phone: '09178882211', email: 'katrina.sy@company.ph', loyaltyPoints: 610, tier: 'PLATINUM', preferences: 'Corporate catering organizer (BGC)', feedbackNotes: null, registeredAt: '2026-11-05', locationId: toDocId('loc_truck_1', uid) },
+  ];
+  for (const c of custSeeds) {
+    const docId = toDocId(c.id, uid);
+    batch.set(doc(db, 'customers', docId), {
+      ...c,
+      id: docId,
+      ownerUid: uid,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  // 11. Employees & Attendance
+  const empSeeds = [
+    { id: 'emp_1', employeeCode: 'EMP-001', fullName: 'Bea Mendoza', department: 'Front of House', position: 'Lead Cashier', locationId: toDocId('loc_truck_1', uid), payType: 'DAILY', baseRate: 720, avatarUrl: null },
+    { id: 'emp_2', employeeCode: 'EMP-002', fullName: 'Carlo Villanueva', department: 'Culinary', position: 'Line Cook', locationId: toDocId('loc_truck_1', uid), payType: 'DAILY', baseRate: 760, avatarUrl: null },
+    { id: 'emp_3', employeeCode: 'EMP-003', fullName: 'Jericho Palma', department: 'Fleet & Ops', position: 'Truck Driver / Cook', locationId: toDocId('loc_truck_2', uid), payType: 'DAILY', baseRate: 800, avatarUrl: null },
+    { id: 'emp_4', employeeCode: 'EMP-004', fullName: 'Dianne Mercado', department: 'Front of House', position: 'Cashier', locationId: toDocId('loc_truck_2', uid), payType: 'DAILY', baseRate: 690, avatarUrl: null },
+  ];
+  for (const e of empSeeds) {
+    const docId = toDocId(e.id, uid);
+    batch.set(doc(db, 'employees', docId), {
+      ...e,
+      id: docId,
+      ownerUid: uid,
+      isActive: true,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  const attSeeds = [
+    { id: 'att_1', employeeId: toDocId('emp_1', uid), clockIn: `${todayStr}T09:00:00`, clockOut: null, overtimeHours: 0, status: 'PRESENT', notes: null },
+    { id: 'att_2', employeeId: toDocId('emp_2', uid), clockIn: `${todayStr}T08:45:00`, clockOut: null, overtimeHours: 1.5, status: 'PRESENT', notes: null },
+    { id: 'att_3', employeeId: toDocId('emp_3', uid), clockIn: `${todayStr}T09:15:00`, clockOut: null, overtimeHours: 0, status: 'LATE', notes: null },
+  ];
+  for (const a of attSeeds) {
+    const docId = toDocId(a.id, uid);
+    batch.set(doc(db, 'attendance_logs', docId), {
+      ...a,
+      id: docId,
+      ownerUid: uid,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  // 12. Sales & Journal Entries
+  const sampleOrders = [
+    { dayOffset: -6, loc: 'loc_truck_1', prod: 'prd_sisig', name: 'Crispy Pork Sisig Tacos (3 pcs)', qty: 6, price: 215, cogs: 82, method: 'CASH', kds: 'COMPLETED', cust: 'cus_1' },
+    { dayOffset: -5, loc: 'loc_truck_2', prod: 'prd_burger', name: 'Double Wagyu Smash Burger', qty: 8, price: 285, cogs: 140, method: 'E_WALLET', kds: 'COMPLETED', cust: 'cus_2' },
+    { dayOffset: -4, loc: 'loc_truck_1', prod: 'prd_fries', name: 'Truffle Parmesan Fries', qty: 10, price: 155, cogs: 52, method: 'CARD', kds: 'COMPLETED', cust: null },
+    { dayOffset: -3, loc: 'loc_truck_1', prod: 'prd_burger', name: 'Double Wagyu Smash Burger', qty: 9, price: 285, cogs: 140, method: 'E_WALLET', kds: 'COMPLETED', cust: 'cus_3' },
+    { dayOffset: -2, loc: 'loc_truck_2', prod: 'prd_sisig', name: 'Crispy Pork Sisig Tacos (3 pcs)', qty: 11, price: 215, cogs: 82, method: 'CASH', kds: 'COMPLETED', cust: null },
+    { dayOffset: -1, loc: 'loc_truck_1', prod: 'prd_mango', name: 'Guimaras Mango Graham Shake', qty: 14, price: 145, cogs: 37, method: 'E_WALLET', kds: 'COMPLETED', cust: 'cus_1' },
+    { dayOffset: 0, loc: 'loc_truck_1', prod: 'prd_sisig', name: 'Crispy Pork Sisig Tacos (3 pcs)', qty: 4, price: 215, cogs: 82, method: 'CASH', kds: 'PREPARING', cust: 'cus_1' },
+    { dayOffset: 0, loc: 'loc_truck_1', prod: 'prd_burger', name: 'Double Wagyu Smash Burger', qty: 3, price: 285, cogs: 140, method: 'E_WALLET', kds: 'PENDING', cust: 'cus_2' },
+    { dayOffset: 0, loc: 'loc_truck_2', prod: 'prd_fries', name: 'Truffle Parmesan Fries', qty: 5, price: 155, cogs: 52, method: 'CARD', kds: 'READY', cust: null },
+  ];
+
+  sampleOrders.forEach((o, i) => {
+    const sid = toDocId(`sale_seed_${i + 1}`, uid);
+    const gross = o.qty * o.price;
+    const tax = Number((gross - gross / 1.12).toFixed(2));
+    const sub = Number((gross - tax).toFixed(2));
+    const cogs = Number((o.qty * o.cogs).toFixed(2));
+    const soldAt = daysFromNow(o.dayOffset);
+    const rcpt = `OR-2026${String(101 + i)}`;
+
+    batch.set(doc(db, 'sales', sid), {
+      id: sid,
+      ownerUid: uid,
+      receiptNumber: rcpt,
+      clientTxnId: `seed_txn_${i + 1}`,
+      locationId: toDocId(o.loc, uid),
+      cashierId: toDocId('usr_cashier', uid),
+      customerId: o.cust ? toDocId(o.cust, uid) : null,
+      channel: 'WALK_IN',
+      status: 'COMPLETED',
+      kdsStatus: o.kds,
+      subtotal: sub,
+      discountAmount: 0,
+      taxAmount: tax,
+      totalAmount: gross,
+      totalCogs: cogs,
+      notes: null,
+      isOfflineSynced: false,
+      items: [
+        {
+          id: `si_seed_${i + 1}`,
+          productId: toDocId(o.prod, uid),
+          variantId: null,
+          productName: o.name,
+          variantName: 'Standard',
+          quantity: o.qty,
+          unitPrice: o.price,
+          lineTotal: gross,
+          cogsAmount: cogs,
+          modifiers: [],
+          kitchenNotes: null,
+        },
+      ],
+      payments: [{ id: `pay_seed_${i + 1}`, method: o.method, amount: gross, referenceNo: null, paidAt: soldAt }],
+      soldAt,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    const jeId = toDocId(`je_seed_${i + 1}`, uid);
+    batch.set(doc(db, 'journal_entries', jeId), {
+      id: jeId,
+      ownerUid: uid,
+      entryNumber: `JE-POS-${rcpt}`,
+      entryDate: soldAt,
+      description: `POS Sale ${rcpt}`,
+      referenceType: 'SALE',
+      referenceId: sid,
+      isReversed: false,
+      lines: [
+        { id: `jl_${i}_1`, accountId: toDocId(o.method === 'CASH' ? 'acc_1000' : 'acc_1010', uid), debit: gross, credit: 0, memo: `${o.method} receipt` },
+        { id: `jl_${i}_2`, accountId: toDocId('acc_4000', uid), debit: 0, credit: sub, memo: 'Food Sales Revenue' },
+        { id: `jl_${i}_3`, accountId: toDocId('acc_2100', uid), debit: 0, credit: tax, memo: 'Output VAT 12%' },
+        { id: `jl_${i}_4`, accountId: toDocId('acc_5000', uid), debit: cogs, credit: 0, memo: 'Cost of Goods Sold' },
+        { id: `jl_${i}_5`, accountId: toDocId('acc_1200', uid), debit: 0, credit: cogs, memo: 'Inventory Asset Reduction' },
+      ],
+      createdAt: serverTimestamp(),
+    });
+  });
+
+  // 13. Expenses (no updatedAt)
+  const expSeeds = [
+    { id: 'exp_1', locationId: toDocId('loc_truck_1', uid), accountId: toDocId('acc_6100', uid), category: 'FUEL', amount: 2450, description: 'Diesel Refill — Petron BGC', expenseDate: daysFromNow(-2) },
+    { id: 'exp_2', locationId: toDocId('loc_truck_1', uid), accountId: toDocId('acc_6100', uid), category: 'LPG', amount: 1150, description: '2x 11kg Solane LPG Tank', expenseDate: daysFromNow(-1) },
+    { id: 'exp_3', locationId: toDocId('loc_truck_2', uid), accountId: toDocId('acc_6200', uid), category: 'RENT_PARKING', amount: 3500, description: 'Ayala Night Market Slot Fee', expenseDate: daysFromNow(-1) },
+    { id: 'exp_4', locationId: toDocId('loc_truck_2', uid), accountId: toDocId('acc_6400', uid), category: 'MAINTENANCE', amount: 1800, description: 'Generator Oil & Filter Service', expenseDate: daysFromNow(-3) },
+  ];
+  for (const e of expSeeds) {
+    const docId = toDocId(e.id, uid);
+    batch.set(doc(db, 'expenses', docId), {
+      ...e,
+      id: docId,
+      ownerUid: uid,
+      isRecurring: false,
+      paidFromPettyCash: false,
+      createdAt: serverTimestamp(),
+    });
+  }
+
+  // 14. Notifications
+  const notifSeeds = [
+    { id: 'ntf_1', type: 'LOW_STOCK', severity: 'WARNING', title: 'Low Stock: Toasted Brioche Buns', message: 'Truck 01 has 95 pcs remaining (below reorder point of 120 pcs).', locationId: toDocId('loc_truck_1', uid) },
+    { id: 'ntf_2', type: 'EXPIRY', severity: 'CRITICAL', title: 'Expiring Batch: Wagyu-Blend Ground Beef', message: 'LOT-BEF-201 (7,400g) on Truck 01 expires within 48 hours.', locationId: toDocId('loc_truck_1', uid) },
+    { id: 'ntf_3', type: 'PO_PENDING', severity: 'INFO', title: 'Purchase Order Awaiting Approval', message: 'PO-2026-089 (Artisan Bakehouse Manila · ₱4,200.00) needs manager approval.', locationId: toDocId('loc_truck_1', uid) },
+  ];
+  for (const n of notifSeeds) {
+    const docId = toDocId(n.id, uid);
+    batch.set(doc(db, 'notifications', docId), {
+      ...n,
+      id: docId,
+      ownerUid: uid,
+      isRead: false,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  try {
+    await batch.commit();
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, 'workspace_seed_batch');
+  }
+}
+
+async function loadSnapshot(force = false): Promise<WorkspaceSnapshot> {
+  const user = auth.currentUser;
+  if (!user) throw new Error('Authentication required');
+  const uid = user.uid;
+
+  if (!force && cachedSnapshot && cachedSnapshot.uid === uid) {
+    return cachedSnapshot;
+  }
+
+  if (!force) {
+    const inflight = inflightSnapshotByUid.get(uid);
+    if (inflight) return inflight;
+  }
+
+  const task = (async (): Promise<WorkspaceSnapshot> => {
+    await syncFirebaseUserAndSeed(user);
+
+    // Fetch workspace collections in bounded waves to avoid overloading the Firestore Listen stream with 27 concurrent targets.
+    const [meta, erpUsers, employees, categories, products, inventoryItems, stockBatches] = await Promise.all([
+      getWorkspaceMeta(uid),
+      queryCollection('erp_users', uid),
+      queryCollection('employees', uid),
+      queryCollection('categories', uid),
+      queryCollection('products', uid),
+      queryCollection('inventory_items', uid),
+      queryCollection('stock_batches', uid),
+    ]);
+
+    const [inventoryTxns, stockTransfers, sales, suppliers, purchaseOrders, goodsReceipts, supplierInvoices] = await Promise.all([
+      queryCollection('inventory_transactions', uid),
+      queryCollection('stock_transfers', uid),
+      queryCollection('sales', uid),
+      queryCollection('suppliers', uid),
+      queryCollection('purchase_orders', uid),
+      queryCollection('goods_receipts', uid),
+      queryCollection('supplier_invoices', uid),
+    ]);
+
+    const [accounts, journalEntries, expenses, dailyClosings, taxConfigs, locations, foodTrucks] = await Promise.all([
+      queryCollection('accounts', uid),
+      queryCollection('journal_entries', uid),
+      queryCollection('expenses', uid),
+      queryCollection('daily_closings', uid),
+      queryCollection('tax_configs', uid),
+      queryCollection('locations', uid),
+      queryCollection('food_trucks', uid),
+    ]);
+
+    const [fleetLogs, attendanceLogs, payrollRuns, customers, notifications, auditLogs] = await Promise.all([
+      queryCollection('fleet_logs', uid),
+      queryCollection('attendance_logs', uid),
+      queryCollection('payroll_runs', uid),
+      queryCollection('customers', uid),
+      queryCollection('notifications', uid),
+      queryCollection('audit_logs', uid),
+    ]);
+
+    const snapshot: WorkspaceSnapshot = {
+      uid,
+      meta,
+      erpUsers,
+      employees,
+      categories,
+      products,
+      inventoryItems,
+      stockBatches,
+      inventoryTxns,
+      stockTransfers,
+      sales,
+      suppliers,
+      purchaseOrders,
+      goodsReceipts,
+      supplierInvoices,
+      accounts,
+      journalEntries,
+      expenses,
+      dailyClosings,
+      taxConfigs,
+      locations,
+      foodTrucks,
+      fleetLogs,
+      attendanceLogs,
+      payrollRuns,
+      customers,
+      notifications,
+      auditLogs,
+    };
+
+    cachedSnapshot = snapshot;
+    return snapshot;
+  })().finally(() => {
+    if (inflightSnapshotByUid.get(uid) === task) {
+      inflightSnapshotByUid.delete(uid);
+    }
+  });
+
+  inflightSnapshotByUid.set(uid, task);
+  return task;
+}
+
+// =====================================================
+// ACTIVE ERP USER & RBAC HELPERS
+// =====================================================
+function toAuthUser(erpUser: any, snap: WorkspaceSnapshot): AuthUser {
+  const role = (snap.meta?.roles || []).find((r: any) => r.id === erpUser.roleId || r.code === erpUser.roleCode);
+  return {
+    id: toLogicalId(erpUser.id, snap.uid),
+    email: erpUser.email,
+    fullName: erpUser.fullName,
+    roleCode: erpUser.roleCode as RoleCode,
+    roleName: erpUser.roleName || role?.name || erpUser.roleCode,
+    permissions: role?.permissions || [],
+    assignedLocationId: erpUser.assignedLocationId ? toLogicalId(erpUser.assignedLocationId, snap.uid) : null,
+    avatarUrl: erpUser.avatarUrl || null,
+  };
+}
+
+export function getActiveErpUserId(): string | null {
+  try {
+    return sessionStorage.getItem(ACTIVE_USER_SESSION_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setActiveErpUserId(id: string | null) {
+  try {
+    if (id) sessionStorage.setItem(ACTIVE_USER_SESSION_KEY, id);
+    else sessionStorage.removeItem(ACTIVE_USER_SESSION_KEY);
+  } catch {
+    // ignore storage restrictions
+  }
+}
+
+function resolveCurrentErpUser(snap: WorkspaceSnapshot): AuthUser {
+  const activeUsers = snap.erpUsers.filter((u) => u.isActive);
+  if (!activeUsers.length) throw new Error('No active ERP user accounts found');
+
+  const storedLogicalId = getActiveErpUserId();
+  if (storedLogicalId) {
+    const match = activeUsers.find((u) => toLogicalId(u.id, snap.uid) === storedLogicalId || u.id === storedLogicalId);
+    if (match) return toAuthUser(match, snap);
+  }
+
+  const fbEmail = (auth.currentUser?.email || '').toLowerCase();
+  const byEmail = activeUsers.find((u) => String(u.email || '').toLowerCase() === fbEmail);
+  const chosen =
+    byEmail ||
+    activeUsers.find((u) => u.roleCode === 'SUPER_ADMIN') ||
+    activeUsers.find((u) => u.roleCode === 'BUSINESS_OWNER') ||
+    activeUsers[0];
+
+  setActiveErpUserId(toLogicalId(chosen.id, snap.uid));
+  return toAuthUser(chosen, snap);
+}
+
+function assertPerm(user: AuthUser, perm: string) {
+  if (user.roleCode === 'SUPER_ADMIN' || user.roleCode === 'BUSINESS_OWNER' || user.permissions.includes(perm)) return;
+  throw new Error(`Permission denied: requires ${perm}`);
+}
+
+function assertAnyPerm(user: AuthUser, ...perms: string[]) {
+  if (user.roleCode === 'SUPER_ADMIN' || user.roleCode === 'BUSINESS_OWNER' || perms.some((p) => user.permissions.includes(p))) return;
+  throw new Error(`Permission denied: requires one of ${perms.join(', ')}`);
+}
+
+function assertOwnerOrSuperAdmin(user: AuthUser) {
+  if (user.roleCode === 'SUPER_ADMIN' || user.roleCode === 'BUSINESS_OWNER') return;
+  throw new Error('Restricted: Company Owner or Super Admin access only');
+}
+
+// =====================================================
+// DOMAIN ENGINE HELPERS
+// =====================================================
+function convertQty(qty: number, fromUomId: string, toUomId: string, snap: WorkspaceSnapshot): number {
+  if (fromUomId === toUomId) return qty;
+  const convs: any[] = snap.meta?.unitConversions || [];
+  const direct = convs.find((c) => c.from_uom_id === fromUomId && c.to_uom_id === toUomId);
+  if (direct) return qty * direct.factor;
+  const inverse = convs.find((c) => c.from_uom_id === toUomId && c.to_uom_id === fromUomId);
+  if (inverse) return qty / inverse.factor;
+  throw new Error(`Missing unit conversion between ${fromUomId} and ${toUomId}`);
+}
+
+async function addAuditLog(
+  uid: string,
+  userId: string | null,
+  userName: string | null,
+  action: string,
+  entityType: string,
+  entityId: string,
+  details?: Record<string, unknown> | string | null,
+) {
+  const id = toDocId(crypto.randomUUID(), uid);
+  const path = `audit_logs/${id}`;
+  try {
+    await setDoc(doc(db, 'audit_logs', id), {
+      id,
+      ownerUid: uid,
+      userId,
+      userName,
+      action,
+      entityType,
+      entityId,
+      details: formatDetailsText(details),
+      loggedAt: new Date().toISOString(),
+      createdAt: serverTimestamp(),
+    });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.CREATE, path);
+  }
+}
+
+async function addNotificationIfMissing(
+  snap: WorkspaceSnapshot,
+  type: string,
+  severity: 'INFO' | 'WARNING' | 'CRITICAL',
+  title: string,
+  message: string,
+  locationId?: string | null,
+) {
+  const cleanLocId = locationId || null;
+  const exists = snap.notifications.some(
+    (n) =>
+      n.type === type &&
+      n.title === title &&
+      !n.isRead &&
+      (cleanLocId ? n.locationId === cleanLocId : true),
+  );
+  if (exists) return;
+  const id = toDocId(crypto.randomUUID(), snap.uid);
+  const path = `notifications/${id}`;
+  const docObj = {
+    id,
+    ownerUid: snap.uid,
+    type,
+    severity,
+    title,
+    message,
+    locationId: cleanLocId,
+    isRead: false,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+  try {
+    await setDoc(doc(db, 'notifications', id), docObj);
+    snap.notifications.push({ ...docObj, createdAt: new Date().toISOString() });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.CREATE, path);
+  }
+}
+
+function getProductCostingList(snap: WorkspaceSnapshot) {
+  const catMap = new Map(snap.categories.map((c) => [c.id, c]));
+  const taxMap = new Map(snap.taxConfigs.map((t) => [t.id, t]));
+  const itemMap = new Map(snap.inventoryItems.map((i) => [i.id, i]));
+  const uomMap = new Map<string, any>((snap.meta?.uoms || []).map((u: any) => [u.id, u]));
+
+  const sorted = [...snap.products].sort((a, b) => {
+    const ca = catMap.get(a.categoryId)?.sortOrder ?? 999;
+    const cb = catMap.get(b.categoryId)?.sortOrder ?? 999;
+    if (ca !== cb) return ca - cb;
+    return String(a.name).localeCompare(String(b.name));
+  });
+
+  return sorted.map((p) => {
+    const cat = catMap.get(p.categoryId);
+    const tc = p.taxConfigId ? taxMap.get(p.taxConfigId) : null;
+    const yieldQty = Number(p.recipeYieldQty || 1);
+
+    let ingredientCost = 0;
+    const ingredients = (p.ingredients || []).map((ing: any) => {
+      const invItem = itemMap.get(ing.inventoryItemId) || itemMap.get(toDocId(ing.inventoryItemId, snap.uid));
+      const uom = uomMap.get(ing.uomId);
+      let lineCost = 0;
+      if (invItem) {
+        const effQty = (Number(ing.quantity) * (1 + Number(ing.wasteFactorPct || 0) / 100)) / yieldQty;
+        try {
+          const baseQty = convertQty(effQty, ing.uomId, invItem.baseUomId, snap);
+          const unitCost = invItem.costingMethod === 'WEIGHTED_AVERAGE' ? invItem.weightedAvgCost : invItem.lastUnitCost;
+          lineCost = round2(baseQty * unitCost);
+        } catch {
+          lineCost = 0;
+        }
+      }
+      ingredientCost += lineCost;
+      return {
+        id: ing.id,
+        recipe_id: toLogicalId(p.id, snap.uid),
+        inventory_item_id: toLogicalId(ing.inventoryItemId, snap.uid),
+        quantity: Number(ing.quantity),
+        uom_id: ing.uomId,
+        waste_factor_pct: Number(ing.wasteFactorPct || 0),
+        item_name: invItem?.name || 'Ingredient',
+        base_uom_id: invItem?.baseUomId || ing.uomId,
+        costing_method: invItem?.costingMethod || 'FIFO',
+        last_unit_cost: invItem?.lastUnitCost || 0,
+        weighted_avg_cost: invItem?.weightedAvgCost || 0,
+        uom_code: uom?.code || invItem?.uomCode || '',
+        computedLineCost: lineCost,
+      };
+    });
+
+    ingredientCost = round2(ingredientCost);
+    const directCost = round2(ingredientCost + Number(p.packagingCost || 0) + Number(p.directLaborCost || 0));
+    const grossProfit = round2(Number(p.basePrice) - directCost);
+    const foodCostPct = Number(p.basePrice) > 0 ? round2((ingredientCost / Number(p.basePrice)) * 100) : 0;
+    const marginPct = Number(p.basePrice) > 0 ? round2((grossProfit / Number(p.basePrice)) * 100) : 0;
+
+    return {
+      id: toLogicalId(p.id, snap.uid),
+      sku: p.sku,
+      name: p.name,
+      description: p.description || '',
+      image_url: p.imageUrl || null,
+      category_id: toLogicalId(p.categoryId, snap.uid),
+      category_name: cat?.name || 'Uncategorized',
+      category_show_in_pos: cat?.showInPos !== false ? 1 : 0,
+      base_price: Number(p.basePrice),
+      packaging_cost: Number(p.packagingCost || 0),
+      direct_labor_cost: Number(p.directLaborCost || 0),
+      target_food_cost_pct: Number(p.targetFoodCostPct || 35),
+      tax_config_id: p.taxConfigId ? toLogicalId(p.taxConfigId, snap.uid) : null,
+      tax_code: tc?.code || null,
+      rate_percent: tc?.ratePercent ?? 0,
+      is_inclusive: tc?.isInclusive ? 1 : 0,
+      expiry_date: p.expiryDate || null,
+      is_available: p.isAvailable ? 1 : 0,
+      variants: (p.variants || []).map((v: any) => ({
+        id: v.id,
+        product_id: toLogicalId(p.id, snap.uid),
+        name: v.name,
+        price_delta: Number(v.priceDelta || 0),
+        portion_multiplier: Number(v.portionMultiplier || 1),
+      })),
+      modifiers: (p.modifiers || []).map((m: any) => ({
+        id: m.id,
+        product_id: toLogicalId(p.id, snap.uid),
+        group_name: m.groupName,
+        name: m.name,
+        price_delta: Number(m.priceDelta || 0),
+        inventory_item_id: m.inventoryItemId ? toLogicalId(m.inventoryItemId, snap.uid) : null,
+        deduct_qty: Number(m.deductQty || 0),
+        uom_id: m.uomId || null,
+      })),
+      recipe: {
+        id: toLogicalId(p.id, snap.uid),
+        product_id: toLogicalId(p.id, snap.uid),
+        yield_qty: yieldQty,
+        prep_instructions: p.prepInstructions || '',
+        ingredients,
+      },
+      costing: {
+        ingredientCost,
+        packagingCost: Number(p.packagingCost || 0),
+        directLaborCost: Number(p.directLaborCost || 0),
+        directCost,
+        grossProfit,
+        foodCostPct,
+        marginPct,
+        isMarginAlert: foodCostPct > Number(p.targetFoodCostPct || 35),
+      },
+    };
+  });
+}
+
+async function receiveStockFirestore(
+  snap: WorkspaceSnapshot,
+  input: {
+    inventoryItemId: string;
+    locationId: string;
+    quantity: number;
+    unitCost: number;
+    batchNumber: string;
+    expiryDate?: string | null;
+    txnType?: string;
+    referenceType?: string;
+    referenceId?: string;
+    userId?: string;
+    notes?: string;
+  },
+) {
+  if (input.quantity <= 0) throw new Error('Received quantity must be positive');
+  const itemDocId = toDocId(input.inventoryItemId, snap.uid);
+  const locDocId = toDocId(input.locationId, snap.uid);
+  const item = snap.inventoryItems.find((i) => i.id === itemDocId);
+  if (!item) throw new Error('Inventory item not found');
+
+  const currentQty = snap.stockBatches
+    .filter((b) => b.inventoryItemId === itemDocId && b.remainingQty > 0)
+    .reduce((s, b) => s + Number(b.remainingQty || 0), 0);
+
+  const newTotal = currentQty + input.quantity;
+  const newWac =
+    newTotal > 0 ? (currentQty * Number(item.weightedAvgCost) + input.quantity * input.unitCost) / newTotal : input.unitCost;
+
+  const batchId = toDocId(crypto.randomUUID(), snap.uid);
+  const txnId = toDocId(crypto.randomUUID(), snap.uid);
+  const nowIso = new Date().toISOString();
+  const totalCost = round2(input.quantity * input.unitCost);
+
+  const batch = writeBatch(db);
+  const newBatchObj = {
+    id: batchId,
+    ownerUid: snap.uid,
+    inventoryItemId: itemDocId,
+    locationId: locDocId,
+    batchNumber: input.batchNumber,
+    initialQty: round4(input.quantity),
+    remainingQty: round4(input.quantity),
+    unitCost: round4(input.unitCost),
+    expiryDate: input.expiryDate || null,
+    receivedAt: nowIso,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+  batch.set(doc(db, 'stock_batches', batchId), newBatchObj);
+
+  batch.update(doc(db, 'inventory_items', itemDocId), {
+    lastUnitCost: round4(input.unitCost),
+    weightedAvgCost: round4(newWac),
+    updatedAt: serverTimestamp(),
+  });
+
+  const txnObj = {
+    id: txnId,
+    ownerUid: snap.uid,
+    inventoryItemId: itemDocId,
+    locationId: locDocId,
+    batchId,
+    txnType: input.txnType || 'IN_PURCHASE',
+    quantityDelta: round4(input.quantity),
+    unitCost: round4(input.unitCost),
+    totalCost,
+    referenceType: input.referenceType || null,
+    referenceId: input.referenceId || null,
+    notes: input.notes || null,
+    createdBy: input.userId || null,
+    txnDate: nowIso,
+    createdAt: serverTimestamp(),
+  };
+  batch.set(doc(db, 'inventory_transactions', txnId), txnObj);
+
+  try {
+    await batch.commit();
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, 'stock_receive');
+  }
+
+  snap.stockBatches.push(newBatchObj);
+  item.lastUnitCost = round4(input.unitCost);
+  item.weightedAvgCost = round4(newWac);
+  snap.inventoryTxns.push({ ...txnObj, createdAt: nowIso });
+
+  return { batchId, totalCost };
+}
+
+async function deductStockFirestore(
+  snap: WorkspaceSnapshot,
+  input: {
+    inventoryItemId: string;
+    locationId: string;
+    quantity: number;
+    txnType: string;
+    referenceType: string;
+    referenceId: string;
+    userId?: string;
+    notes?: string;
+    allowNegative?: boolean;
+  },
+) {
+  let remaining = input.quantity;
+  if (remaining <= 0) return { totalCogs: 0, consumedBatches: [] as Array<{ qty: number; unitCost: number }> };
+
+  const itemDocId = toDocId(input.inventoryItemId, snap.uid);
+  const locDocId = toDocId(input.locationId, snap.uid);
+  const item = snap.inventoryItems.find((i) => i.id === itemDocId);
+  if (!item) throw new Error(`Inventory item ${input.inventoryItemId} not found`);
+
+  const batches = snap.stockBatches
+    .filter((b) => b.inventoryItemId === itemDocId && b.locationId === locDocId && Number(b.remainingQty) > 0)
+    .sort((a, b) => String(a.receivedAt).localeCompare(String(b.receivedAt)));
+
+  const avail = batches.reduce((s, b) => s + Number(b.remainingQty), 0);
+  if (input.allowNegative === false && avail + 0.0001 < remaining) {
+    throw new Error(`Insufficient stock for ${item.name} (short by ${round2(remaining - avail)})`);
+  }
+
+  const batch = writeBatch(db);
+  const nowIso = new Date().toISOString();
+  let totalCogs = 0;
+  const consumedBatches: Array<{ qty: number; unitCost: number }> = [];
+
+  for (const b of batches) {
+    if (remaining <= 0) break;
+    const take = Math.min(Number(b.remainingQty), remaining);
+    const effectiveCost = item.costingMethod === 'WEIGHTED_AVERAGE' ? Number(item.weightedAvgCost) : Number(b.unitCost);
+    const nextRem = round4(Number(b.remainingQty) - take);
+    b.remainingQty = nextRem;
+
+    batch.update(doc(db, 'stock_batches', b.id), {
+      remainingQty: nextRem,
+      updatedAt: serverTimestamp(),
+    });
+
+    const lineCost = round2(take * effectiveCost);
+    const txnId = toDocId(crypto.randomUUID(), snap.uid);
+    const txnObj = {
+      id: txnId,
+      ownerUid: snap.uid,
+      inventoryItemId: itemDocId,
+      locationId: locDocId,
+      batchId: b.id,
+      txnType: input.txnType,
+      quantityDelta: round4(-take),
+      unitCost: round4(effectiveCost),
+      totalCost: lineCost,
+      referenceType: input.referenceType,
+      referenceId: input.referenceId,
+      notes: input.notes || null,
+      createdBy: input.userId || null,
+      txnDate: nowIso,
+      createdAt: serverTimestamp(),
+    };
+    batch.set(doc(db, 'inventory_transactions', txnId), txnObj);
+    snap.inventoryTxns.push({ ...txnObj, createdAt: nowIso });
+
+    totalCogs += lineCost;
+    consumedBatches.push({ qty: take, unitCost: effectiveCost });
+    remaining = round4(remaining - take);
+  }
+
+  if (remaining > 0) {
+    const fallbackCost = item.costingMethod === 'WEIGHTED_AVERAGE' ? Number(item.weightedAvgCost) : Number(item.lastUnitCost);
+    const shortageCost = round2(remaining * fallbackCost);
+    const txnId = toDocId(crypto.randomUUID(), snap.uid);
+    const txnObj = {
+      id: txnId,
+      ownerUid: snap.uid,
+      inventoryItemId: itemDocId,
+      locationId: locDocId,
+      batchId: null,
+      txnType: input.txnType,
+      quantityDelta: round4(-remaining),
+      unitCost: round4(fallbackCost),
+      totalCost: shortageCost,
+      referenceType: input.referenceType,
+      referenceId: input.referenceId,
+      notes: `${input.notes || ''} [UNBATCHED_SHORTAGE]`.trim(),
+      createdBy: input.userId || null,
+      txnDate: nowIso,
+      createdAt: serverTimestamp(),
+    };
+    batch.set(doc(db, 'inventory_transactions', txnId), txnObj);
+    snap.inventoryTxns.push({ ...txnObj, createdAt: nowIso });
+
+    totalCogs += shortageCost;
+    consumedBatches.push({ qty: remaining, unitCost: fallbackCost });
+  }
+
+  try {
+    await batch.commit();
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, 'stock_deduct');
+  }
+
+  const postQty = snap.stockBatches
+    .filter((b) => b.inventoryItemId === itemDocId && b.locationId === locDocId)
+    .reduce((s, b) => s + Number(b.remainingQty || 0), 0);
+
+  if (postQty <= Number(item.reorderPoint || 0)) {
+    const locName = snap.locations.find((l) => l.id === locDocId)?.name || 'Location';
+    await addNotificationIfMissing(
+      snap,
+      'LOW_STOCK',
+      'WARNING',
+      `Low Stock: ${item.name}`,
+      `${locName} has ${round2(postQty)} ${item.uomCode || ''} remaining (at or below reorder point of ${item.reorderPoint}).`.replace(/\s+/g, ' '),
+      locDocId,
+    );
+  }
+
+  return { totalCogs: round2(totalCogs), consumedBatches };
+}
+
+function isLocationKdsEnabled(loc: any): boolean {
+  if (!loc) return true;
+  return loc.kdsEnabled === undefined ? loc.type === 'FOOD_TRUCK' : Boolean(loc.kdsEnabled);
+}
+
+async function processSaleFirestore(snap: WorkspaceSnapshot, dto: any, user: AuthUser) {
+  if (dto.clientTxnId) {
+    const existing = snap.sales.find((s) => s.clientTxnId === dto.clientTxnId);
+    if (existing) return formatSaleDto(existing, snap);
+  }
+  if (!dto.items?.length) throw new Error('Order cart is empty');
+
+  const saleId = toDocId(crypto.randomUUID(), snap.uid);
+  const receiptNumber = `OR-${Date.now().toString().slice(-7)}`;
+  const soldAt = dto.soldAt || new Date().toISOString();
+  const locDocId = toDocId(dto.locationId, snap.uid);
+  const cashierDocId = toDocId(user.id, snap.uid);
+
+  let subtotal = 0;
+  let totalTax = 0;
+  let totalCogs = 0;
+  const preparedItems: any[] = [];
+
+  for (const line of dto.items) {
+    const prodDocId = toDocId(line.productId, snap.uid);
+    const prod = snap.products.find((p) => p.id === prodDocId);
+    if (!prod) throw new Error(`Product ${line.productId} not found`);
+
+    const tc = prod.taxConfigId ? snap.taxConfigs.find((t) => t.id === prod.taxConfigId) : null;
+    const variant = line.variantId ? (prod.variants || []).find((v: any) => v.id === line.variantId) : null;
+    const modIds = new Set((line.modifiers || []).map((m: any) => m.id));
+    const dbMods = (prod.modifiers || []).filter((m: any) => modIds.has(m.id));
+
+    const modPrice = dbMods.reduce((s: number, m: any) => s + Number(m.priceDelta || 0), 0);
+    const unitPrice = round2(Number(prod.basePrice) + Number(variant?.priceDelta || 0) + modPrice);
+    const grossLine = round2(unitPrice * Number(line.quantity));
+
+    let lineTax = 0;
+    if (tc && tc.isActive && tc.ratePercent > 0) {
+      const r = tc.ratePercent / 100;
+      if (tc.isInclusive) {
+        lineTax = round2(grossLine - grossLine / (1 + r));
+        subtotal += round2(grossLine - lineTax);
+      } else {
+        lineTax = round2(grossLine * r);
+        subtotal += grossLine;
+      }
+    } else {
+      subtotal += grossLine;
+    }
+    totalTax += lineTax;
+
+    let itemCogs = 0;
+    const portionMult = Number(variant?.portionMultiplier || 1);
+    const yieldQty = Number(prod.recipeYieldQty || 1);
+
+    for (const ri of prod.ingredients || []) {
+      const invItem = snap.inventoryItems.find((i) => i.id === ri.inventoryItemId || i.id === toDocId(ri.inventoryItemId, snap.uid));
+      if (!invItem) continue;
+      const rawQty = ((Number(ri.quantity) * (1 + Number(ri.wasteFactorPct || 0) / 100)) / yieldQty) * portionMult * Number(line.quantity);
+      const baseQty = convertQty(rawQty, ri.uomId, invItem.baseUomId, snap);
+      const deducted = await deductStockFirestore(snap, {
+        inventoryItemId: invItem.id,
+        locationId: locDocId,
+        quantity: baseQty,
+        txnType: 'OUT_SALE',
+        referenceType: 'SALE',
+        referenceId: saleId,
+        userId: user.id,
+        notes: `POS ${receiptNumber} - ${prod.name}`,
+      });
+      itemCogs += deducted.totalCogs;
+    }
+
+    for (const m of dbMods) {
+      if (m.inventoryItemId && m.deductQty > 0 && m.uomId) {
+        const invItem = snap.inventoryItems.find((i) => i.id === m.inventoryItemId || i.id === toDocId(m.inventoryItemId, snap.uid));
+        if (invItem) {
+          const baseQty = convertQty(Number(m.deductQty) * Number(line.quantity), m.uomId, invItem.baseUomId, snap);
+          const deducted = await deductStockFirestore(snap, {
+            inventoryItemId: invItem.id,
+            locationId: locDocId,
+            quantity: baseQty,
+            txnType: 'OUT_SALE',
+            referenceType: 'SALE',
+            referenceId: saleId,
+            userId: user.id,
+            notes: `Modifier ${m.name}`,
+          });
+          itemCogs += deducted.totalCogs;
+        }
+      }
+    }
+
+    itemCogs = round2(itemCogs);
+    totalCogs += itemCogs;
+    preparedItems.push({
+      id: crypto.randomUUID(),
+      productId: prod.id,
+      variantId: variant?.id || null,
+      productName: prod.name,
+      variantName: variant?.name || 'Standard',
+      quantity: Number(line.quantity),
+      unitPrice,
+      lineTotal: grossLine,
+      cogsAmount: itemCogs,
+      modifiers: (line.modifiers || []).map((m: any) => ({ id: m.id, name: m.name, priceDelta: Number(m.priceDelta || 0) })),
+      kitchenNotes: line.kitchenNotes || null,
+    });
+  }
+
+  const discount = round2(Number(dto.discountAmount || 0));
+  const totalAmount = round2(Math.max(0, subtotal + totalTax - discount));
+  const paidSum = round2((dto.payments || []).reduce((s: number, p: any) => s + Number(p.amount || 0), 0));
+  if (paidSum < totalAmount) {
+    throw new Error(`Payment (${paidSum}) is less than order total (${totalAmount})`);
+  }
+
+  const preparedPayments = (dto.payments || []).map((p: any) => ({
+    id: crypto.randomUUID(),
+    method: p.method,
+    amount: round2(Number(p.amount)),
+    referenceNo: p.referenceNo || null,
+    paidAt: soldAt,
+  }));
+
+  const saleLoc = snap.locations.find((l) => l.id === locDocId);
+  const kdsEnabledForLoc = isLocationKdsEnabled(saleLoc);
+
+  const saleDoc = {
+    id: saleId,
+    ownerUid: snap.uid,
+    receiptNumber,
+    clientTxnId: dto.clientTxnId || null,
+    locationId: locDocId,
+    cashierId: cashierDocId,
+    customerId: dto.customerId ? toDocId(dto.customerId, snap.uid) : null,
+    channel: dto.channel || 'WALK_IN',
+    status: 'COMPLETED',
+    kdsStatus: kdsEnabledForLoc ? 'PENDING' : 'COMPLETED',
+    subtotal: round2(subtotal),
+    discountAmount: discount,
+    taxAmount: round2(totalTax),
+    totalAmount,
+    totalCogs: round2(totalCogs),
+    notes: dto.notes || null,
+    isOfflineSynced: Boolean(dto.isOfflineSynced),
+    items: preparedItems,
+    payments: preparedPayments,
+    soldAt,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+
+  const batch = writeBatch(db);
+  batch.set(doc(db, 'sales', saleId), saleDoc);
+
+  if (dto.customerId) {
+    const custDocId = toDocId(dto.customerId, snap.uid);
+    const cust = snap.customers.find((c) => c.id === custDocId);
+    const pts = Math.floor(totalAmount / 50);
+    if (cust && pts > 0) {
+      batch.update(doc(db, 'customers', custDocId), {
+        loyaltyPoints: Number(cust.loyaltyPoints || 0) + pts,
+        updatedAt: serverTimestamp(),
+      });
+    }
+  }
+
+  const accByCode = new Map(snap.accounts.map((a) => [a.code, a.id]));
+  const cashAcc = accByCode.get('1000');
+  const bankAcc = accByCode.get('1010') || cashAcc;
+  const invAcc = accByCode.get('1200');
+  const taxAcc = accByCode.get('2100');
+  const revAcc = accByCode.get('4000');
+  const cogsAcc = accByCode.get('5000');
+
+  if (cashAcc && invAcc && revAcc && cogsAcc) {
+    const jeId = toDocId(crypto.randomUUID(), snap.uid);
+    const lines: any[] = [];
+    let rem = totalAmount;
+    for (const p of preparedPayments) {
+      if (rem <= 0) break;
+      const settle = round2(Math.min(p.amount, rem));
+      lines.push({
+        id: crypto.randomUUID(),
+        accountId: p.method === 'CASH' ? cashAcc : bankAcc!,
+        debit: settle,
+        credit: 0,
+        memo: `${p.method} payment`,
+      });
+      rem = round2(rem - settle);
+    }
+    const netRev = round2(Math.max(0, subtotal - discount));
+    lines.push({ id: crypto.randomUUID(), accountId: revAcc, debit: 0, credit: netRev, memo: 'Food & Beverage Sales' });
+    if (totalTax > 0 && taxAcc) {
+      lines.push({ id: crypto.randomUUID(), accountId: taxAcc, debit: 0, credit: round2(totalTax), memo: 'Output Tax Payable' });
+    }
+    if (totalCogs > 0) {
+      lines.push({ id: crypto.randomUUID(), accountId: cogsAcc, debit: round2(totalCogs), credit: 0, memo: 'COGS Recognition' });
+      lines.push({ id: crypto.randomUUID(), accountId: invAcc, debit: 0, credit: round2(totalCogs), memo: 'Inventory Asset Deduction' });
+    }
+    batch.set(doc(db, 'journal_entries', jeId), {
+      id: jeId,
+      ownerUid: snap.uid,
+      entryNumber: `JE-POS-${receiptNumber}`,
+      entryDate: soldAt,
+      description: `POS Sale ${receiptNumber}`,
+      referenceType: 'SALE',
+      referenceId: saleId,
+      isReversed: false,
+      lines,
+      createdAt: serverTimestamp(),
+    });
+  }
+
+  try {
+    await batch.commit();
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, `sales/${saleId}`);
+  }
+
+  await addAuditLog(snap.uid, user.id, user.fullName, 'POS_SALE', 'Sale', toLogicalId(saleId, snap.uid), {
+    receiptNumber,
+    totalAmount,
+    totalCogs,
+  });
+  invalidateWorkspaceCache();
+
+  return formatSaleDto({ ...saleDoc, createdAt: soldAt }, snap);
+}
+
+function formatSaleDto(s: any, snap: WorkspaceSnapshot) {
+  const loc = snap.locations.find((l) => l.id === s.locationId);
+  const truck = snap.foodTrucks.find((t) => t.locationId === s.locationId);
+  const cashier = snap.erpUsers.find((u) => u.id === s.cashierId);
+  const cust = s.customerId ? snap.customers.find((c) => c.id === s.customerId) : null;
+  const logicalId = toLogicalId(s.id, snap.uid);
+
+  return {
+    id: logicalId,
+    receipt_number: s.receiptNumber,
+    client_txn_id: s.clientTxnId || null,
+    location_id: toLogicalId(s.locationId, snap.uid),
+    location_name: loc?.name || 'Location',
+    location_address: loc?.address || truck?.currentSite || '',
+    truck_site: truck?.currentSite || '',
+    cashier_id: toLogicalId(s.cashierId, snap.uid),
+    cashier_name: cashier?.fullName || 'Cashier',
+    customer_id: s.customerId ? toLogicalId(s.customerId, snap.uid) : null,
+    customer_name: cust?.fullName || null,
+    channel: s.channel,
+    status: s.status,
+    kds_status: s.kdsStatus,
+    subtotal: Number(s.subtotal),
+    discount_amount: Number(s.discountAmount || 0),
+    tax_amount: Number(s.taxAmount || 0),
+    total_amount: Number(s.totalAmount),
+    total_cogs: Number(s.totalCogs || 0),
+    notes: s.notes || null,
+    is_offline_synced: s.isOfflineSynced ? 1 : 0,
+    sold_at: s.soldAt,
+    items: (s.items || []).map((it: any) => ({
+      id: it.id,
+      sale_id: logicalId,
+      product_id: toLogicalId(it.productId, snap.uid),
+      variant_id: it.variantId || null,
+      product_name: it.productName,
+      variant_name: it.variantName || 'Standard',
+      quantity: Number(it.quantity),
+      unit_price: Number(it.unitPrice),
+      line_total: Number(it.lineTotal),
+      cogs_amount: Number(it.cogsAmount || 0),
+      modifiers_json: JSON.stringify(it.modifiers || []),
+      kitchen_notes: it.kitchenNotes || null,
+    })),
+    payments: (s.payments || []).map((p: any) => ({
+      id: p.id,
+      sale_id: logicalId,
+      method: p.method,
+      amount: Number(p.amount),
+      reference_no: p.referenceNo || null,
+      paid_at: p.paidAt,
+    })),
+  };
+}
+
+// =====================================================
+// MAIN API ROUTER OVER FIRESTORE
+// =====================================================
+export async function firestoreApiRequest<T = any>(rawPath: string, options: RequestInit = {}): Promise<T> {
+  const method = (options.method || 'GET').toUpperCase();
+  const [pathname, queryString = ''] = rawPath.split('?');
+  const qs = new URLSearchParams(queryString);
+  const body = options.body ? JSON.parse(String(options.body)) : {};
+
+  const snap = await loadSnapshot();
+  const uid = snap.uid;
+
+  // 1. AUTH ROUTES
+  if (pathname === '/auth/demo-accounts' && method === 'GET') {
+    const active = snap.erpUsers
+      .filter((u) => u.isActive)
+      .sort((a, b) => {
+        const rank = (c: string) => (c === 'SUPER_ADMIN' ? 0 : c === 'BUSINESS_OWNER' ? 1 : 2);
+        const rDiff = rank(a.roleCode) - rank(b.roleCode);
+        return rDiff !== 0 ? rDiff : String(a.fullName).localeCompare(String(b.fullName));
+      })
+      .map((u) => ({
+        id: toLogicalId(u.id, uid),
+        email: u.email,
+        full_name: u.fullName,
+        avatar_url: u.avatarUrl || null,
+        role_code: u.roleCode,
+        role_name: u.roleName,
+      }));
+    return active as T;
+  }
+
+  if (pathname === '/auth/login' && method === 'POST') {
+    const email = String(body.email || '').trim().toLowerCase();
+    const password = String(body.password || '');
+    if (!email || !password) throw new Error('Email and password are required');
+    const found = snap.erpUsers.find((u) => String(u.email || '').toLowerCase() === email && u.isActive);
+    if (!found || !(await verifyPassword(password, found.passwordHash))) {
+      throw new Error('Invalid email or password');
+    }
+    const authUser = toAuthUser(found, snap);
+    setActiveErpUserId(authUser.id);
+    await addAuditLog(uid, authUser.id, authUser.fullName, 'LOGIN', 'Session', authUser.id);
+    invalidateWorkspaceCache();
+    return { token: 'firebase-session', user: authUser } as T;
+  }
+
+  if (pathname === '/auth/demo-switch' && method === 'POST') {
+    const targetId = String(body.userId || '');
+    const found = snap.erpUsers.find((u) => (toLogicalId(u.id, uid) === targetId || u.id === targetId) && u.isActive);
+    if (!found) throw new Error('User not found');
+    const authUser = toAuthUser(found, snap);
+    setActiveErpUserId(authUser.id);
+    await addAuditLog(uid, authUser.id, authUser.fullName, 'ROLE_SWITCH', 'User', authUser.id, { role: authUser.roleCode });
+    invalidateWorkspaceCache();
+    return { token: 'firebase-session', user: authUser } as T;
+  }
+
+  if (pathname === '/auth/logout' && method === 'POST') {
+    setActiveErpUserId(null);
+    return { ok: true } as T;
+  }
+
+  const user = resolveCurrentErpUser(snap);
+
+  if (pathname === '/auth/me' && method === 'GET') {
+    return user as T;
+  }
+
+  // 2. LOCATIONS, NOTIFICATIONS & DASHBOARD
+  if (pathname === '/locations' && method === 'GET') {
+    const rows = snap.locations
+      .filter((l) => l.isActive)
+      .sort((a, b) => String(a.type).localeCompare(String(b.type)) || String(a.name).localeCompare(String(b.name)))
+      .map((l) => ({
+        id: toLogicalId(l.id, uid),
+        code: l.code,
+        name: l.name,
+        type: l.type,
+        address: l.address || '',
+        is_active: l.isActive ? 1 : 0,
+        kds_enabled: isLocationKdsEnabled(l) ? 1 : 0,
+      }));
+    return rows as T;
+  }
+
+  if (pathname === '/notifications' && method === 'GET') {
+    const rawLoc = (qs.get('locationId') || '').trim();
+    const locFilter = rawLoc && rawLoc !== 'ALL' ? toDocId(rawLoc, uid) : '';
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const escapeRx = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    const resolveNotifLocationId = (n: any): string => {
+      if (n.locationId) {
+        const direct = String(n.locationId);
+        if (locMap.has(direct)) return direct;
+        const asDoc = toDocId(direct, uid);
+        if (locMap.has(asDoc)) return asDoc;
+      }
+
+      const text = `${n.title || ''} ${n.message || ''}`;
+      const lowerText = text.toLowerCase();
+
+      for (const l of snap.locations) {
+        const fullName = String(l.name || '').trim().toLowerCase();
+        if (fullName && lowerText.includes(fullName)) return l.id;
+
+        const shortPrefix = fullName.split(/\s*[—\-]\s*/)[0]?.trim();
+        if (shortPrefix && shortPrefix.length >= 4) {
+          const rx = new RegExp(`(^|[^a-z0-9])${escapeRx(shortPrefix)}([^a-z0-9]|$)`, 'i');
+          if (rx.test(text)) return l.id;
+        }
+
+        const code = String(l.code || '').trim();
+        if (code && new RegExp(`(^|[^a-z0-9])${escapeRx(code)}([^a-z0-9]|$)`, 'i').test(text)) {
+          return l.id;
+        }
+      }
+
+      for (const po of snap.purchaseOrders) {
+        if (po.poNumber && text.includes(po.poNumber) && po.locationId) {
+          return po.locationId;
+        }
+      }
+
+      for (const b of snap.stockBatches) {
+        if (b.batchNumber && text.includes(b.batchNumber) && b.locationId) {
+          return b.locationId;
+        }
+      }
+
+      if (n.type === 'LOW_STOCK') {
+        const match = String(n.title || '').match(/^Low Stock:\s*(.+)$/i);
+        const itemName = match?.[1]?.trim().toLowerCase();
+        const item = itemName
+          ? snap.inventoryItems.find((it) => String(it.name || '').trim().toLowerCase() === itemName)
+          : null;
+        if (item) {
+          const recentOutTxn = [...snap.inventoryTxns]
+            .filter((t) => t.inventoryItemId === item.id && String(t.txnType || '').startsWith('OUT_'))
+            .sort((a, b) => String(b.txnDate || tsToIso(b.createdAt)).localeCompare(String(a.txnDate || tsToIso(a.createdAt))))[0];
+          if (recentOutTxn?.locationId) return recentOutTxn.locationId;
+
+          const lowLocs = snap.locations.filter((l) => {
+            const locQty = snap.stockBatches
+              .filter((b) => b.inventoryItemId === item.id && b.locationId === l.id)
+              .reduce((s, b) => s + Number(b.remainingQty || 0), 0);
+            return locQty <= Number(item.reorderPoint || 0);
+          });
+          if (lowLocs.length === 1) return lowLocs[0].id;
+        }
+      }
+
+      if (n.type === 'CASH_VARIANCE') {
+        const dateMatch = String(n.title || '').match(/\((\d{4}-\d{2}-\d{2})\)/);
+        if (dateMatch?.[1]) {
+          const dc = snap.dailyClosings.find((c) => c.businessDate === dateMatch[1]);
+          if (dc?.locationId) return dc.locationId;
+        }
+      }
+
+      return '';
+    };
+
+    const rows = [...snap.notifications]
+      .map((n) => ({ n, resolvedLocId: resolveNotifLocationId(n) }))
+      .filter(({ resolvedLocId }) => !locFilter || resolvedLocId === locFilter)
+      .sort((a, b) => Number(a.n.isRead) - Number(b.n.isRead) || tsToIso(b.n.createdAt).localeCompare(tsToIso(a.n.createdAt)))
+      .slice(0, 30)
+      .map(({ n, resolvedLocId }) => ({
+        id: toLogicalId(n.id, uid),
+        type: n.type,
+        severity: n.severity,
+        title: n.title,
+        message: n.message,
+        location_id: resolvedLocId ? toLogicalId(resolvedLocId, uid) : null,
+        location_name: resolvedLocId ? locMap.get(resolvedLocId)?.name || '' : '',
+        is_read: n.isRead ? 1 : 0,
+        created_at: tsToIso(n.createdAt),
+      }));
+    return rows as T;
+  }
+
+  if (pathname.startsWith('/notifications/') && pathname.endsWith('/read') && method === 'POST') {
+    const id = pathname.split('/')[2];
+    const docId = toDocId(id, uid);
+    try {
+      await updateDoc(doc(db, 'notifications', docId), { isRead: true, updatedAt: serverTimestamp() });
+      invalidateWorkspaceCache();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `notifications/${docId}`);
+    }
+    return { ok: true } as T;
+  }
+
+  if (pathname === '/dashboard/summary' && method === 'GET') {
+    assertPerm(user, PERMISSIONS.DASHBOARD_VIEW);
+    const to = qs.get('to') || new Date().toISOString();
+    const from = qs.get('from') || new Date(Date.now() - 30 * 86400000).toISOString();
+    const rawLoc = (qs.get('locationId') || '').trim();
+    const locFilter = rawLoc && rawLoc !== 'ALL' ? toDocId(rawLoc, uid) : '';
+
+    const completedSales = snap.sales.filter(
+      (s) => s.status === 'COMPLETED' && s.soldAt >= from && s.soldAt <= to && (!locFilter || s.locationId === locFilter),
+    );
+    const filteredExpenses = snap.expenses.filter(
+      (e) => e.expenseDate >= from && e.expenseDate <= to && (!locFilter || e.locationId === locFilter),
+    );
+
+    const totalSales = round2(completedSales.reduce((s, r) => s + Number(r.totalAmount || 0), 0));
+    const totalCogs = round2(completedSales.reduce((s, r) => s + Number(r.totalCogs || 0), 0));
+    const totalExpenses = round2(filteredExpenses.reduce((s, r) => s + Number(r.amount || 0), 0));
+    const grossProfit = round2(totalSales - totalCogs);
+    const netProfit = round2(grossProfit - totalExpenses);
+    const avgTicket = completedSales.length > 0 ? round2(totalSales / completedSales.length) : 0;
+    const pendingPOs = snap.purchaseOrders.filter(
+      (po) =>
+        ['PENDING_APPROVAL', 'APPROVED', 'PARTIAL', 'PARTIALLY_RECEIVED'].includes(po.status) &&
+        (!locFilter || po.locationId === locFilter),
+    ).length;
+
+    const invRows = snap.inventoryItems.map((i) => {
+      const batches = snap.stockBatches.filter((b) => b.inventoryItemId === i.id && (!locFilter || b.locationId === locFilter));
+      const currentQty = round2(batches.reduce((s, b) => s + Number(b.remainingQty || 0), 0));
+      const stockValue = round2(batches.reduce((s, b) => s + Number(b.remainingQty || 0) * Number(b.unitCost || 0), 0));
+      return {
+        id: toLogicalId(i.id, uid),
+        sku: i.sku,
+        name: i.name,
+        uom: i.uomCode,
+        reorder_point: Number(i.reorderPoint || 0),
+        current_qty: currentQty,
+        stock_value: stockValue,
+      };
+    });
+
+    const inventoryValuation = round2(invRows.reduce((s, r) => s + r.stock_value, 0));
+    const lowStockItems = invRows.filter((r) => r.current_qty <= r.reorder_point);
+
+    const payMap = new Map<string, number>();
+    for (const s of completedSales) {
+      for (const p of s.payments || []) {
+        payMap.set(p.method, round2((payMap.get(p.method) || 0) + Number(p.amount || 0)));
+      }
+    }
+    const salesByPayment = Array.from(payMap.entries()).map(([method, total]) => ({ method, total }));
+
+    const salesByLocation = snap.locations
+      .filter((l) => l.isActive !== false && l.type === 'FOOD_TRUCK' && (!locFilter || l.id === locFilter))
+      .map((l) => {
+        const locSales = completedSales.filter((s) => s.locationId === l.id);
+        return {
+          id: toLogicalId(l.id, uid),
+          name: l.name,
+          orders: locSales.length,
+          revenue: round2(locSales.reduce((s, r) => s + Number(r.totalAmount || 0), 0)),
+          cogs: round2(locSales.reduce((s, r) => s + Number(r.totalCogs || 0), 0)),
+        };
+      });
+
+    const prodAgg = new Map<string, { product_name: string; qty_sold: number; revenue: number; cogs: number }>();
+    const catAgg = new Map<string, number>();
+    const prodMap = new Map(snap.products.map((p) => [p.id, p]));
+    const catMap = new Map(snap.categories.map((c) => [c.id, c]));
+
+    for (const s of completedSales) {
+      for (const it of s.items || []) {
+        const prev = prodAgg.get(it.productId) || { product_name: it.productName, qty_sold: 0, revenue: 0, cogs: 0 };
+        prev.qty_sold += Number(it.quantity || 0);
+        prev.revenue = round2(prev.revenue + Number(it.lineTotal || 0));
+        prev.cogs = round2(prev.cogs + Number(it.cogsAmount || 0));
+        prodAgg.set(it.productId, prev);
+
+        const prod = prodMap.get(it.productId);
+        const catName = prod ? catMap.get(prod.categoryId)?.name || 'Other' : 'Other';
+        catAgg.set(catName, round2((catAgg.get(catName) || 0) + Number(it.lineTotal || 0)));
+      }
+    }
+
+    const topProducts = Array.from(prodAgg.values())
+      .sort((a, b) => b.revenue - a.revenue)
+      .slice(0, 6);
+    const salesByCategory = Array.from(catAgg.entries())
+      .map(([category, revenue]) => ({ category, revenue }))
+      .sort((a, b) => b.revenue - a.revenue);
+
+    const trendMap = new Map<string, { day: string; revenue: number; cogs: number; orders: number }>();
+    for (const s of completedSales) {
+      const day = String(s.soldAt).slice(0, 10);
+      const prev = trendMap.get(day) || { day, revenue: 0, cogs: 0, orders: 0 };
+      prev.revenue = round2(prev.revenue + Number(s.totalAmount || 0));
+      prev.cogs = round2(prev.cogs + Number(s.totalCogs || 0));
+      prev.orders += 1;
+      trendMap.set(day, prev);
+    }
+    const dailyTrends = Array.from(trendMap.values()).sort((a, b) => a.day.localeCompare(b.day));
+
+    const cutoffIso = new Date(Date.now() + 4 * 86400000).toISOString();
+    const itemMap = new Map(snap.inventoryItems.map((i) => [i.id, i]));
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const expiringBatches = snap.stockBatches
+      .filter((b) => Number(b.remainingQty) > 0 && b.expiryDate && b.expiryDate <= cutoffIso && (!locFilter || b.locationId === locFilter))
+      .sort((a, b) => String(a.expiryDate).localeCompare(String(b.expiryDate)))
+      .map((b) => ({
+        id: toLogicalId(b.id, uid),
+        batch_number: b.batchNumber,
+        remaining_qty: Number(b.remainingQty),
+        expiry_date: b.expiryDate,
+        item_name: itemMap.get(b.inventoryItemId)?.name || 'Item',
+        uom: itemMap.get(b.inventoryItemId)?.uomCode || '',
+        location_name: locMap.get(b.locationId)?.name || '',
+      }));
+
+    return {
+      kpis: { totalSales, grossProfit, netProfit, totalExpenses, txnCount: completedSales.length, avgTicket, inventoryValuation, pendingPOs },
+      lowStockItems,
+      expiringBatches,
+      salesByPayment,
+      salesByLocation,
+      salesByCategory,
+      topProducts,
+      dailyTrends,
+    } as T;
+  }
+
+  // 3. POS & KDS
+  if (pathname === '/pos/catalog' && method === 'GET') {
+    assertPerm(user, PERMISSIONS.POS_SELL);
+    const categories = [...snap.categories]
+      .filter((c) => c.showInPos !== false)
+      .sort((a, b) => a.sortOrder - b.sortOrder)
+      .map((c) => ({ id: toLogicalId(c.id, uid), name: c.name, sort_order: c.sortOrder, show_in_pos: true }));
+    const visibleCatIds = new Set(categories.map((c) => c.id));
+    const products = getProductCostingList(snap).filter((p) => p.is_available === 1 && visibleCatIds.has(p.category_id));
+    const customers = [...snap.customers]
+      .sort((a, b) => String(a.fullName).localeCompare(String(b.fullName)))
+      .map((c) => ({
+        id: toLogicalId(c.id, uid),
+        full_name: c.fullName,
+        phone: c.phone,
+        loyalty_points: c.loyaltyPoints,
+        tier: c.tier,
+      }));
+    return { categories, products, customers } as T;
+  }
+
+  if (pathname === '/pos/sales' && method === 'GET') {
+    assertPerm(user, PERMISSIONS.POS_SELL);
+    const locFilter = qs.get('locationId') ? toDocId(qs.get('locationId')!, uid) : '';
+    const rows = snap.sales
+      .filter((s) => !locFilter || s.locationId === locFilter)
+      .sort((a, b) => String(b.soldAt).localeCompare(String(a.soldAt)))
+      .slice(0, 60)
+      .map((s) => formatSaleDto(s, snap));
+    return rows as T;
+  }
+
+  if (pathname === '/pos/sales' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.POS_SELL);
+    return (await processSaleFirestore(snap, body, user)) as T;
+  }
+
+  if (pathname === '/pos/sales/sync-offline' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.POS_SELL);
+    const list = Array.isArray(body?.sales) ? body.sales : [];
+    const synced = [];
+    for (const s of list) {
+      synced.push(await processSaleFirestore(snap, { ...s, isOfflineSynced: true }, user));
+    }
+    return { syncedCount: synced.length, sales: synced } as T;
+  }
+
+  if (pathname.startsWith('/pos/sales/') && pathname.endsWith('/refund') && method === 'POST') {
+    assertPerm(user, PERMISSIONS.POS_REFUND);
+    const saleId = pathname.split('/')[3];
+    const saleDocId = toDocId(saleId, uid);
+    const sale = snap.sales.find((s) => s.id === saleDocId);
+    if (!sale) throw new Error('Sale not found');
+    if (sale.status === 'REFUNDED') throw new Error('Sale already refunded');
+
+    const reason = String(body?.reason || 'Manager authorized refund');
+    const nextNotes = `${sale.notes || ''} [REFUNDED: ${reason}]`.trim();
+
+    const batch = writeBatch(db);
+    batch.update(doc(db, 'sales', saleDocId), {
+      status: 'REFUNDED',
+      kdsStatus: 'CANCELLED',
+      notes: nextNotes,
+      updatedAt: serverTimestamp(),
+    });
+
+    const origJe = snap.journalEntries.find((je) => je.referenceType === 'SALE' && je.referenceId === saleDocId && !je.isReversed);
+    if (origJe) {
+      const revJeId = toDocId(crypto.randomUUID(), uid);
+      batch.set(doc(db, 'journal_entries', revJeId), {
+        id: revJeId,
+        ownerUid: uid,
+        entryNumber: `REV-${origJe.entryNumber}`,
+        entryDate: new Date().toISOString(),
+        description: `Refund Reversal: ${reason}`,
+        referenceType: 'SALE_REFUND',
+        referenceId: saleDocId,
+        isReversed: false,
+        lines: (origJe.lines || []).map((l: any) => ({
+          id: crypto.randomUUID(),
+          accountId: l.accountId,
+          debit: Number(l.credit || 0),
+          credit: Number(l.debit || 0),
+          memo: `Reversal: ${l.memo || ''}`,
+        })),
+        createdAt: serverTimestamp(),
+      });
+    }
+
+    try {
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `sales/${saleDocId}`);
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'REFUND_SALE', 'Sale', saleId, { receiptNumber: sale.receiptNumber, reason });
+    invalidateWorkspaceCache();
+    return { ...formatSaleDto({ ...sale, status: 'REFUNDED', kdsStatus: 'CANCELLED', notes: nextNotes }, snap) } as T;
+  }
+
+  if (pathname === '/kds/orders' && method === 'GET') {
+    assertPerm(user, PERMISSIONS.KDS_MANAGE);
+    const locFilter = qs.get('locationId') ? toDocId(qs.get('locationId')!, uid) : '';
+    const kdsEnabledLocIds = new Set(
+      snap.locations.filter((l) => l.isActive !== false && isLocationKdsEnabled(l)).map((l) => l.id),
+    );
+    const rows = snap.sales
+      .filter(
+        (s) =>
+          s.status === 'COMPLETED' &&
+          s.kdsStatus !== 'COMPLETED' &&
+          kdsEnabledLocIds.has(s.locationId) &&
+          (!locFilter || s.locationId === locFilter),
+      )
+      .sort((a, b) => String(a.soldAt).localeCompare(String(b.soldAt)))
+      .map((s) => formatSaleDto(s, snap));
+    return rows as T;
+  }
+
+  if (pathname.startsWith('/kds/orders/') && method === 'PATCH') {
+    assertPerm(user, PERMISSIONS.KDS_MANAGE);
+    const saleId = pathname.split('/')[3];
+    const saleDocId = toDocId(saleId, uid);
+    const kdsStatus = String(body.kdsStatus || '');
+    if (!['PENDING', 'PREPARING', 'READY', 'COMPLETED'].includes(kdsStatus)) {
+      throw new Error('Invalid KDS status');
+    }
+    try {
+      await updateDoc(doc(db, 'sales', saleDocId), { kdsStatus, updatedAt: serverTimestamp() });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `sales/${saleDocId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'KDS_STATUS', 'Sale', saleId, { kdsStatus });
+    invalidateWorkspaceCache();
+    return { ok: true, kdsStatus } as T;
+  }
+
+  // 4. PRODUCTS, CATEGORIES & BOM
+  if (pathname === '/products' && method === 'GET') {
+    assertPerm(user, PERMISSIONS.PRODUCT_MANAGE);
+    return {
+      products: getProductCostingList(snap),
+      categories: [...snap.categories]
+        .sort((a, b) => a.sortOrder - b.sortOrder || String(a.name).localeCompare(String(b.name)))
+        .map((c) => ({ id: toLogicalId(c.id, uid), name: c.name, sort_order: c.sortOrder, show_in_pos: c.showInPos !== false })),
+      inventoryItems: [...snap.inventoryItems]
+        .sort((a, b) => String(a.name).localeCompare(String(b.name)))
+        .map((i) => ({
+          id: toLogicalId(i.id, uid),
+          sku: i.sku,
+          name: i.name,
+          item_type: i.itemType,
+          base_uom_id: i.baseUomId,
+          uom_code: i.uomCode,
+          costing_method: i.costingMethod,
+          min_stock_level: i.minStockLevel,
+          reorder_point: i.reorderPoint,
+          last_unit_cost: i.lastUnitCost,
+          weighted_avg_cost: i.weightedAvgCost,
+        })),
+      uoms: snap.meta?.uoms || [],
+      taxConfigs: snap.taxConfigs.map((t) => ({
+        id: toLogicalId(t.id, uid),
+        code: t.code,
+        name: t.name,
+        rate_percent: t.ratePercent,
+        is_inclusive: t.isInclusive ? 1 : 0,
+        is_active: t.isActive ? 1 : 0,
+      })),
+    } as T;
+  }
+
+  if (pathname === '/categories' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.PRODUCT_MANAGE);
+    const cleanName = String(body?.name || '').trim();
+    if (!cleanName) throw new Error('Category name is required');
+    if (snap.categories.some((c) => String(c.name).toLowerCase() === cleanName.toLowerCase())) {
+      throw new Error(`Category "${cleanName}" already exists`);
+    }
+    const maxSort = snap.categories.reduce((m, c) => Math.max(m, Number(c.sortOrder || 0)), 0);
+    const sortOrder = Math.round(body?.sortOrder !== undefined && body?.sortOrder !== '' ? Number(body.sortOrder) : maxSort + 1);
+    const showInPos = body?.showInPos !== undefined ? Boolean(body.showInPos) : true;
+    const logicalId = crypto.randomUUID();
+    const docId = toDocId(logicalId, uid);
+    try {
+      await setDoc(doc(db, 'categories', docId), {
+        id: docId,
+        ownerUid: uid,
+        name: cleanName,
+        sortOrder,
+        showInPos,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `categories/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'CREATE_CATEGORY', 'Category', logicalId, { name: cleanName, sortOrder, showInPos });
+    invalidateWorkspaceCache();
+    return { id: logicalId, name: cleanName, sort_order: sortOrder, show_in_pos: showInPos } as T;
+  }
+
+  if (pathname.startsWith('/categories/') && method === 'PUT') {
+    assertPerm(user, PERMISSIONS.PRODUCT_MANAGE);
+    const id = pathname.split('/')[2];
+    const docId = toDocId(id, uid);
+    const existing = snap.categories.find((c) => c.id === docId);
+    if (!existing) throw new Error('Category not found');
+    const cleanName = String(body?.name || '').trim();
+    if (!cleanName) throw new Error('Category name is required');
+    if (snap.categories.some((c) => String(c.name).toLowerCase() === cleanName.toLowerCase() && c.id !== docId)) {
+      throw new Error(`Category "${cleanName}" already exists`);
+    }
+    const sortOrder = Math.round(body?.sortOrder !== undefined && body?.sortOrder !== '' ? Number(body.sortOrder) : existing.sortOrder);
+    const showInPos = body?.showInPos !== undefined ? Boolean(body.showInPos) : existing.showInPos !== false;
+    try {
+      await updateDoc(doc(db, 'categories', docId), {
+        name: cleanName,
+        sortOrder,
+        showInPos,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `categories/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_CATEGORY', 'Category', id, { name: cleanName, sortOrder, showInPos });
+    invalidateWorkspaceCache();
+    return { id, name: cleanName, sort_order: sortOrder, show_in_pos: showInPos } as T;
+  }
+
+  if (pathname === '/products' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.PRODUCT_MANAGE);
+    const { sku, name, description, imageUrl, categoryId, basePrice, packagingCost, directLaborCost, targetFoodCostPct, taxConfigId, expiryDate, ingredients } = body || {};
+    const cleanName = String(name || '').trim();
+    if (!cleanName) throw new Error('Product name is required');
+    const cleanCatInput = String(categoryId || '').trim();
+    if (!cleanCatInput) throw new Error('Category is required');
+    const catDocId = toDocId(cleanCatInput, uid);
+    if (!snap.categories.some((c) => c.id === catDocId)) throw new Error('Selected category does not exist');
+
+    const parsedPrice = Number(basePrice);
+    if (!Number.isFinite(parsedPrice) || parsedPrice < 0) throw new Error('Valid base price is required');
+
+    const cleanSku = String(sku || '').trim() || `MNU-${Date.now().toString().slice(-5)}`;
+    if (snap.products.some((p) => String(p.sku).toLowerCase() === cleanSku.toLowerCase())) {
+      throw new Error(`SKU "${cleanSku}" is already used by another product`);
+    }
+
+    const rawImageUrl = imageUrl ? String(imageUrl).trim() : '';
+    if (rawImageUrl.length > 250000) {
+      throw new Error('Product photo is too large. Please upload a smaller image.');
+    }
+    const cleanImageUrl = rawImageUrl || null;
+
+    const logicalId = crypto.randomUUID();
+    const docId = toDocId(logicalId, uid);
+    const cleanExpiry = expiryDate ? String(expiryDate).trim() || null : null;
+    const cleanTaxId = taxConfigId ? toDocId(String(taxConfigId), uid) : toDocId('tax_ph_vat', uid);
+    const mappedIngs = (ingredients || []).map((ing: any) => ({
+      id: crypto.randomUUID(),
+      inventoryItemId: toDocId(String(ing.inventoryItemId), uid),
+      quantity: Number(ing.quantity),
+      uomId: String(ing.uomId),
+      wasteFactorPct: Number(ing.wasteFactorPct || 0),
+    }));
+
+    try {
+      await setDoc(doc(db, 'products', docId), {
+        id: docId,
+        ownerUid: uid,
+        sku: cleanSku,
+        name: cleanName,
+        description: description ? String(description).trim() : '',
+        imageUrl: cleanImageUrl,
+        categoryId: catDocId,
+        basePrice: parsedPrice,
+        packagingCost: Number(packagingCost || 0),
+        directLaborCost: Number(directLaborCost || 0),
+        targetFoodCostPct: Number(targetFoodCostPct || 35),
+        taxConfigId: cleanTaxId,
+        expiryDate: cleanExpiry,
+        isAvailable: true,
+        variants: [],
+        modifiers: [],
+        recipeYieldQty: 1,
+        prepInstructions: '',
+        ingredients: mappedIngs,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `products/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'CREATE_PRODUCT', 'Product', logicalId, { name: cleanName, sku: cleanSku, basePrice: parsedPrice });
+    invalidateWorkspaceCache();
+    return { id: logicalId } as T;
+  }
+
+  if (pathname.startsWith('/products/') && pathname.endsWith('/recipe') && method === 'PUT') {
+    assertPerm(user, PERMISSIONS.PRODUCT_MANAGE);
+    const id = pathname.split('/')[2];
+    const docId = toDocId(id, uid);
+    const existing = snap.products.find((p) => p.id === docId);
+    if (!existing) throw new Error('Product not found');
+
+    const { basePrice, packagingCost, directLaborCost, targetFoodCostPct, prepInstructions, ingredients } = body || {};
+    const mappedIngs = (ingredients || []).map((ing: any) => ({
+      id: ing.id || crypto.randomUUID(),
+      inventoryItemId: toDocId(String(ing.inventoryItemId), uid),
+      quantity: Number(ing.quantity),
+      uomId: String(ing.uomId),
+      wasteFactorPct: Number(ing.wasteFactorPct || 0),
+    }));
+
+    try {
+      await updateDoc(doc(db, 'products', docId), {
+        basePrice: Number(basePrice ?? existing.basePrice),
+        packagingCost: Number(packagingCost ?? existing.packagingCost ?? 0),
+        directLaborCost: Number(directLaborCost ?? existing.directLaborCost ?? 0),
+        targetFoodCostPct: Number(targetFoodCostPct ?? existing.targetFoodCostPct ?? 35),
+        prepInstructions: String(prepInstructions || ''),
+        ingredients: mappedIngs,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `products/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_RECIPE', 'Product', id);
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if (pathname.startsWith('/products/') && pathname.endsWith('/availability') && method === 'PATCH') {
+    assertPerm(user, PERMISSIONS.PRODUCT_MANAGE);
+    const id = pathname.split('/')[2];
+    const docId = toDocId(id, uid);
+    try {
+      await updateDoc(doc(db, 'products', docId), {
+        isAvailable: Boolean(body.isAvailable),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `products/${docId}`);
+    }
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if (pathname.startsWith('/products/') && method === 'PUT') {
+    assertPerm(user, PERMISSIONS.PRODUCT_MANAGE);
+    const id = pathname.split('/')[2];
+    const docId = toDocId(id, uid);
+    const existing = snap.products.find((p) => p.id === docId);
+    if (!existing) throw new Error('Product not found');
+
+    const {
+      sku,
+      name,
+      description,
+      imageUrl,
+      categoryId,
+      basePrice,
+      packagingCost,
+      directLaborCost,
+      targetFoodCostPct,
+      taxConfigId,
+      expiryDate,
+      isAvailable,
+      variants,
+      modifiers,
+    } = body || {};
+
+    const cleanName = String(name || '').trim();
+    const cleanSku = String(sku || '').trim();
+    if (!cleanName) throw new Error('Product name is required');
+    if (!cleanSku) throw new Error('SKU is required');
+    if (!categoryId) throw new Error('Category is required');
+    if (snap.products.some((p) => String(p.sku).toLowerCase() === cleanSku.toLowerCase() && p.id !== docId)) {
+      throw new Error(`SKU "${cleanSku}" is already used by another product`);
+    }
+
+    const catDocId = toDocId(String(categoryId), uid);
+    const mappedVariants = Array.isArray(variants)
+      ? variants
+          .filter((v: any) => String(v.name || '').trim())
+          .map((v: any) => ({
+            id: v.id || crypto.randomUUID(),
+            name: String(v.name).trim(),
+            priceDelta: Number(v.priceDelta || 0),
+            portionMultiplier: Number(v.portionMultiplier || 1),
+          }))
+      : existing.variants || [];
+
+    const mappedModifiers = Array.isArray(modifiers)
+      ? modifiers
+          .filter((m: any) => String(m.name || '').trim())
+          .map((m: any) => ({
+            id: m.id || crypto.randomUUID(),
+            groupName: String(m.groupName || 'Add-ons').trim() || 'Add-ons',
+            name: String(m.name).trim(),
+            priceDelta: Number(m.priceDelta || 0),
+          }))
+      : existing.modifiers || [];
+
+    const nextImageUrl =
+      imageUrl !== undefined ? (imageUrl ? String(imageUrl).trim() || null : null) : existing.imageUrl ?? null;
+    if (nextImageUrl && nextImageUrl.length > 250000) {
+      throw new Error('Product photo is too large. Please upload a smaller image.');
+    }
+
+    try {
+      await updateDoc(doc(db, 'products', docId), {
+        sku: cleanSku,
+        name: cleanName,
+        description: description ?? existing.description ?? '',
+        imageUrl: nextImageUrl,
+        categoryId: catDocId,
+        basePrice: Number(basePrice),
+        packagingCost: Number(packagingCost || 0),
+        directLaborCost: Number(directLaborCost || 0),
+        targetFoodCostPct: Number(targetFoodCostPct || 35),
+        taxConfigId: taxConfigId ? toDocId(String(taxConfigId), uid) : existing.taxConfigId ?? toDocId('tax_ph_vat', uid),
+        expiryDate: expiryDate !== undefined ? String(expiryDate).trim() || null : existing.expiryDate ?? null,
+        isAvailable: isAvailable === undefined ? Boolean(existing.isAvailable) : Boolean(isAvailable),
+        variants: mappedVariants,
+        modifiers: mappedModifiers,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `products/${docId}`);
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_PRODUCT', 'Product', id, { name: cleanName, sku: cleanSku, basePrice: Number(basePrice) });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  // 5. INVENTORY
+  if (pathname === '/inventory' && method === 'GET') {
+    assertPerm(user, PERMISSIONS.INVENTORY_VIEW);
+    const locFilter = qs.get('locationId') ? toDocId(qs.get('locationId')!, uid) : '';
+    const itemMap = new Map(snap.inventoryItems.map((i) => [i.id, i]));
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+
+    const items = [...snap.inventoryItems]
+      .sort((a, b) => String(a.name).localeCompare(String(b.name)))
+      .map((i) => {
+        const relBatches = snap.stockBatches.filter((b) => b.inventoryItemId === i.id && (!locFilter || b.locationId === locFilter));
+        const onHandQty = round2(relBatches.reduce((s, b) => s + Number(b.remainingQty || 0), 0));
+        const stockValue = round2(relBatches.reduce((s, b) => s + Number(b.remainingQty || 0) * Number(b.unitCost || 0), 0));
+        return {
+          id: toLogicalId(i.id, uid),
+          sku: i.sku,
+          name: i.name,
+          item_type: i.itemType,
+          base_uom_id: i.baseUomId,
+          uom_code: i.uomCode,
+          costing_method: i.costingMethod,
+          min_stock_level: i.minStockLevel,
+          reorder_point: i.reorderPoint,
+          last_unit_cost: i.lastUnitCost,
+          weighted_avg_cost: i.weightedAvgCost,
+          on_hand_qty: onHandQty,
+          stock_value: stockValue,
+        };
+      });
+
+    const batches = snap.stockBatches
+      .filter((b) => Number(b.remainingQty) > 0 && (!locFilter || b.locationId === locFilter))
+      .sort((a, b) => String(a.expiryDate || '9999').localeCompare(String(b.expiryDate || '9999')) || String(a.receivedAt).localeCompare(String(b.receivedAt)))
+      .map((b) => ({
+        id: toLogicalId(b.id, uid),
+        inventory_item_id: toLogicalId(b.inventoryItemId, uid),
+        location_id: toLogicalId(b.locationId, uid),
+        batch_number: b.batchNumber,
+        initial_qty: b.initialQty,
+        remaining_qty: b.remainingQty,
+        unit_cost: b.unitCost,
+        expiry_date: b.expiryDate,
+        received_at: b.receivedAt,
+        item_name: itemMap.get(b.inventoryItemId)?.name || 'Item',
+        uom_code: itemMap.get(b.inventoryItemId)?.uomCode || '',
+        location_name: locMap.get(b.locationId)?.name || '',
+      }));
+
+    const movements = snap.inventoryTxns
+      .filter((t) => !locFilter || t.locationId === locFilter)
+      .sort((a, b) => String(b.txnDate || tsToIso(b.createdAt)).localeCompare(String(a.txnDate || tsToIso(a.createdAt))))
+      .slice(0, 60)
+      .map((t) => ({
+        id: toLogicalId(t.id, uid),
+        inventory_item_id: toLogicalId(t.inventoryItemId, uid),
+        location_id: toLogicalId(t.locationId, uid),
+        batch_id: t.batchId ? toLogicalId(t.batchId, uid) : null,
+        txn_type: t.txnType,
+        quantity_delta: t.quantityDelta,
+        unit_cost: t.unitCost,
+        total_cost: t.totalCost,
+        reference_type: t.referenceType,
+        reference_id: t.referenceId,
+        notes: t.notes,
+        created_at: t.txnDate || tsToIso(t.createdAt),
+        item_name: itemMap.get(t.inventoryItemId)?.name || 'Item',
+        uom_code: itemMap.get(t.inventoryItemId)?.uomCode || '',
+        location_name: locMap.get(t.locationId)?.name || '',
+      }));
+
+    return { items, batches, movements, uoms: snap.meta?.uoms || [] } as T;
+  }
+
+  if (pathname === '/inventory/items' && method === 'POST') {
+    assertAnyPerm(user, PERMISSIONS.INVENTORY_ADJUST, PERMISSIONS.PRODUCT_MANAGE);
+    const { sku, name, itemType, baseUomId, costingMethod, minStockLevel, reorderPoint, lastUnitCost } = body || {};
+    const cleanName = String(name || '').trim();
+    if (!cleanName) throw new Error('Ingredient name is required');
+    if (!baseUomId) throw new Error('Base unit (UOM) is required');
+
+    const cleanSku = String(sku || '').trim() || `ING-${Date.now().toString().slice(-4)}`;
+    if (snap.inventoryItems.some((i) => String(i.sku).toLowerCase() === cleanSku.toLowerCase())) {
+      throw new Error(`SKU "${cleanSku}" is already used by another ingredient`);
+    }
+    if (snap.inventoryItems.some((i) => String(i.name).toLowerCase() === cleanName.toLowerCase())) {
+      throw new Error(`Ingredient "${cleanName}" already exists`);
+    }
+    const cost = Number(lastUnitCost || 0);
+    if (!Number.isFinite(cost) || cost < 0) throw new Error('Unit cost cannot be negative');
+
+    const uom = (snap.meta?.uoms || []).find((u: any) => u.id === baseUomId);
+    const logicalId = crypto.randomUUID();
+    const docId = toDocId(logicalId, uid);
+
+    try {
+      await setDoc(doc(db, 'inventory_items', docId), {
+        id: docId,
+        ownerUid: uid,
+        sku: cleanSku,
+        name: cleanName,
+        itemType: itemType || 'RAW_MATERIAL',
+        baseUomId,
+        uomCode: uom?.code || 'pcs',
+        costingMethod: costingMethod || 'FIFO',
+        minStockLevel: Number(minStockLevel || 0),
+        reorderPoint: Number(reorderPoint || 0),
+        lastUnitCost: cost,
+        weightedAvgCost: cost,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `inventory_items/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'CREATE_INGREDIENT', 'InventoryItem', logicalId, { name: cleanName, sku: cleanSku });
+    invalidateWorkspaceCache();
+    return {
+      id: logicalId,
+      sku: cleanSku,
+      name: cleanName,
+      item_type: itemType || 'RAW_MATERIAL',
+      base_uom_id: baseUomId,
+      uom_code: uom?.code || 'pcs',
+      costing_method: costingMethod || 'FIFO',
+      min_stock_level: Number(minStockLevel || 0),
+      reorder_point: Number(reorderPoint || 0),
+      last_unit_cost: cost,
+      weighted_avg_cost: cost,
+    } as T;
+  }
+
+  if (pathname.startsWith('/inventory/items/') && method === 'PUT') {
+    assertAnyPerm(user, PERMISSIONS.INVENTORY_ADJUST, PERMISSIONS.PRODUCT_MANAGE);
+    const id = pathname.split('/')[3];
+    const docId = toDocId(id, uid);
+    const existing = snap.inventoryItems.find((i) => i.id === docId);
+    if (!existing) throw new Error('Ingredient not found');
+
+    const { sku, name, itemType, baseUomId, costingMethod, minStockLevel, reorderPoint, lastUnitCost } = body || {};
+    const cleanName = String(name || '').trim();
+    const cleanSku = String(sku || '').trim();
+    if (!cleanName) throw new Error('Ingredient name is required');
+    if (!cleanSku) throw new Error('SKU is required');
+    if (!baseUomId) throw new Error('Base unit (UOM) is required');
+
+    if (snap.inventoryItems.some((i) => String(i.sku).toLowerCase() === cleanSku.toLowerCase() && i.id !== docId)) {
+      throw new Error(`SKU "${cleanSku}" is already used by another ingredient`);
+    }
+    if (snap.inventoryItems.some((i) => String(i.name).toLowerCase() === cleanName.toLowerCase() && i.id !== docId)) {
+      throw new Error(`Ingredient "${cleanName}" already exists`);
+    }
+
+    if (baseUomId !== existing.baseUomId) {
+      const usedInHistory =
+        snap.stockBatches.some((b) => b.inventoryItemId === docId) ||
+        snap.inventoryTxns.some((t) => t.inventoryItemId === docId) ||
+        snap.products.some((p) => (p.ingredients || []).some((ri: any) => ri.inventoryItemId === docId));
+      if (usedInHistory) {
+        throw new Error('Cannot change base unit (UOM) because this ingredient is already used in recipes or stock history');
+      }
+    }
+
+    const cost = Number(lastUnitCost ?? existing.lastUnitCost ?? 0);
+    if (!Number.isFinite(cost) || cost < 0) throw new Error('Unit cost cannot be negative');
+    const hasBatches = snap.stockBatches.some((b) => b.inventoryItemId === docId && Number(b.remainingQty) > 0);
+    const nextWeightedAvg = hasBatches ? Number(existing.weightedAvgCost) : cost;
+    const uom = (snap.meta?.uoms || []).find((u: any) => u.id === baseUomId);
+
+    try {
+      await updateDoc(doc(db, 'inventory_items', docId), {
+        sku: cleanSku,
+        name: cleanName,
+        itemType: itemType || existing.itemType || 'RAW_MATERIAL',
+        baseUomId,
+        uomCode: uom?.code || existing.uomCode,
+        costingMethod: costingMethod || existing.costingMethod || 'FIFO',
+        minStockLevel: Number(minStockLevel ?? existing.minStockLevel ?? 0),
+        reorderPoint: Number(reorderPoint ?? existing.reorderPoint ?? 0),
+        lastUnitCost: cost,
+        weightedAvgCost: nextWeightedAvg,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `inventory_items/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_INGREDIENT', 'InventoryItem', id, { name: cleanName, sku: cleanSku, cost });
+    invalidateWorkspaceCache();
+    return {
+      id,
+      sku: cleanSku,
+      name: cleanName,
+      item_type: itemType || existing.itemType,
+      base_uom_id: baseUomId,
+      uom_code: uom?.code || existing.uomCode,
+      costing_method: costingMethod || existing.costingMethod,
+      min_stock_level: Number(minStockLevel ?? existing.minStockLevel ?? 0),
+      reorder_point: Number(reorderPoint ?? existing.reorderPoint ?? 0),
+      last_unit_cost: cost,
+      weighted_avg_cost: nextWeightedAvg,
+    } as T;
+  }
+
+  if (pathname.startsWith('/inventory/items/') && method === 'DELETE') {
+    assertAnyPerm(user, PERMISSIONS.INVENTORY_ADJUST, PERMISSIONS.PRODUCT_MANAGE);
+    const id = pathname.split('/')[3];
+    const docId = toDocId(id, uid);
+    const existing = snap.inventoryItems.find((i) => i.id === docId);
+    if (!existing) throw new Error('Ingredient not found');
+
+    const recipeCount = snap.products.filter((p) => (p.ingredients || []).some((ri: any) => ri.inventoryItemId === docId)).length;
+    if (recipeCount > 0) {
+      throw new Error(`Cannot delete "${existing.name}" because it is used in ${recipeCount} product recipe(s). Remove it from BOM first.`);
+    }
+    if (snap.stockBatches.some((b) => b.inventoryItemId === docId) || snap.inventoryTxns.some((t) => t.inventoryItemId === docId)) {
+      throw new Error(`Cannot delete "${existing.name}" because it has stock batches or movement history.`);
+    }
+    const poUsed = snap.purchaseOrders.some((po) => (po.items || []).some((pi: any) => pi.inventoryItemId === docId));
+    const modUsed = snap.products.some((p) => (p.modifiers || []).some((m: any) => m.inventoryItemId === docId));
+    if (poUsed || modUsed) {
+      throw new Error(`Cannot delete "${existing.name}" because it is linked to purchase orders or menu modifiers.`);
+    }
+
+    try {
+      await deleteDoc(doc(db, 'inventory_items', docId));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `inventory_items/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'DELETE_INGREDIENT', 'InventoryItem', id, { name: existing.name });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if (pathname === '/inventory/transfers' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.INVENTORY_ADJUST);
+    const { fromLocationId, toLocationId, inventoryItemId, quantity, notes } = body;
+    if (fromLocationId === toLocationId) throw new Error('Source and destination locations must differ');
+    const qty = Number(quantity);
+    const trfId = toDocId(crypto.randomUUID(), uid);
+    const trfNo = `TRF-${Date.now().toString().slice(-6)}`;
+
+    const deducted = await deductStockFirestore(snap, {
+      inventoryItemId,
+      locationId: fromLocationId,
+      quantity: qty,
+      txnType: 'OUT_TRANSFER',
+      referenceType: 'TRANSFER',
+      referenceId: trfId,
+      userId: user.id,
+      notes: notes || `Transfer to ${toLocationId}`,
+      allowNegative: false,
+    });
+
+    for (const b of deducted.consumedBatches) {
+      await receiveStockFirestore(snap, {
+        inventoryItemId,
+        locationId: toLocationId,
+        quantity: b.qty,
+        unitCost: b.unitCost,
+        batchNumber: trfNo,
+        txnType: 'IN_TRANSFER',
+        referenceType: 'TRANSFER',
+        referenceId: trfId,
+        userId: user.id,
+        notes: `Received from ${fromLocationId}`,
+      });
+    }
+
+    try {
+      await setDoc(doc(db, 'stock_transfers', trfId), {
+        id: trfId,
+        ownerUid: uid,
+        transferNumber: trfNo,
+        fromLocationId: toDocId(fromLocationId, uid),
+        toLocationId: toDocId(toLocationId, uid),
+        status: 'RECEIVED',
+        notes: notes || '',
+        items: [{ id: crypto.randomUUID(), inventoryItemId: toDocId(inventoryItemId, uid), quantity: qty, totalCost: deducted.totalCogs }],
+        createdBy: user.id,
+        transferDate: new Date().toISOString(),
+        createdAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `stock_transfers/${trfId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'STOCK_TRANSFER', 'StockTransfer', toLogicalId(trfId, uid), { trfNo, qty });
+    invalidateWorkspaceCache();
+    return { trfId: toLogicalId(trfId, uid), trfNo, totalCost: deducted.totalCogs } as T;
+  }
+
+  if (pathname === '/inventory/waste' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.INVENTORY_ADJUST);
+    const { inventoryItemId, locationId, quantity, reason, txnType } = body;
+    const d = await deductStockFirestore(snap, {
+      inventoryItemId,
+      locationId,
+      quantity: Number(quantity),
+      txnType: txnType === 'OUT_SPOILAGE' ? 'OUT_SPOILAGE' : 'OUT_WASTE',
+      referenceType: 'WASTE_LOG',
+      referenceId: `WST-${Date.now()}`,
+      userId: user.id,
+      notes: reason || 'Spoilage / Kitchen waste',
+    });
+    await addAuditLog(uid, user.id, user.fullName, 'RECORD_WASTE', 'InventoryItem', inventoryItemId, {
+      locationId: toLogicalId(toDocId(locationId, uid), uid),
+      quantity,
+      reason,
+    });
+    invalidateWorkspaceCache();
+    return d as T;
+  }
+
+  if (pathname === '/inventory/reconcile' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.INVENTORY_ADJUST);
+    const { inventoryItemId, locationId, countedQty, notes } = body;
+    const itemDocId = toDocId(inventoryItemId, uid);
+    const locDocId = toDocId(locationId, uid);
+    const item = snap.inventoryItems.find((i) => i.id === itemDocId);
+    if (!item) throw new Error('Inventory item not found');
+
+    const sysQty = snap.stockBatches
+      .filter((b) => b.inventoryItemId === itemDocId && b.locationId === locDocId)
+      .reduce((s, b) => s + Number(b.remainingQty || 0), 0);
+    const variance = round2(Number(countedQty) - sysQty);
+    if (variance === 0) return { variance: 0, status: 'MATCHED' } as T;
+
+    if (variance > 0) {
+      await receiveStockFirestore(snap, {
+        inventoryItemId: itemDocId,
+        locationId: locDocId,
+        quantity: variance,
+        unitCost: Number(item.lastUnitCost || 0),
+        batchNumber: `CNT-${Date.now().toString().slice(-5)}`,
+        txnType: 'IN_ADJUSTMENT',
+        referenceType: 'STOCK_COUNT',
+        referenceId: crypto.randomUUID(),
+        userId: user.id,
+        notes: notes || 'Physical stock count surplus',
+      });
+    } else {
+      await deductStockFirestore(snap, {
+        inventoryItemId: itemDocId,
+        locationId: locDocId,
+        quantity: Math.abs(variance),
+        txnType: 'OUT_ADJUSTMENT',
+        referenceType: 'STOCK_COUNT',
+        referenceId: crypto.randomUUID(),
+        userId: user.id,
+        notes: notes || 'Physical stock count shrinkage',
+      });
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'STOCK_RECONCILE', 'InventoryItem', inventoryItemId, {
+      locationId: toLogicalId(locDocId, uid),
+      sysQty,
+      countedQty,
+      variance,
+    });
+    invalidateWorkspaceCache();
+    return { sysQty, countedQty: Number(countedQty), variance, status: 'ADJUSTED' } as T;
+  }
+
+  // 6. PROCUREMENT & AP
+  if (pathname === '/procurement' && method === 'GET') {
+    assertAnyPerm(user, PERMISSIONS.PO_CREATE, PERMISSIONS.PO_APPROVE);
+    const supMap = new Map(snap.suppliers.map((s) => [s.id, s]));
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const itemMap = new Map(snap.inventoryItems.map((i) => [i.id, i]));
+
+    const suppliers = snap.suppliers
+      .filter((s) => s.isActive)
+      .sort((a, b) => String(a.name).localeCompare(String(b.name)))
+      .map((s) => ({
+        id: toLogicalId(s.id, uid),
+        code: s.code,
+        name: s.name,
+        contact_person: s.contactPerson,
+        phone: s.phone,
+        email: s.email,
+        address: s.address,
+        tin: s.tin,
+        payment_terms: s.paymentTerms,
+      }));
+
+    const seedPricePairs = [
+      ['si_1', 'sup_1', 'ing_pork', 0.34, 1],
+      ['si_2', 'sup_1', 'ing_beef', 0.58, 1],
+      ['si_3', 'sup_3', 'ing_pork', 0.36, 2],
+      ['si_4', 'sup_2', 'ing_bun', 14.0, 1],
+      ['si_5', 'sup_2', 'ing_tortilla', 8.5, 1],
+      ['si_6', 'sup_3', 'ing_potato', 0.14, 1],
+      ['si_7', 'sup_3', 'ing_mango', 0.16, 2],
+    ] as const;
+    const priceComparison = seedPricePairs
+      .map(([id, sId, iId, price, lead]) => {
+        const s = supMap.get(toDocId(sId, uid));
+        const item = itemMap.get(toDocId(iId, uid));
+        if (!s || !item) return null;
+        return {
+          id,
+          supplier_id: sId,
+          inventory_item_id: iId,
+          unit_price: price,
+          lead_time_days: lead,
+          supplier_name: s.name,
+          item_name: item.name,
+          uom_code: item.uomCode,
+        };
+      })
+      .filter(Boolean);
+
+    const purchaseOrders = [...snap.purchaseOrders]
+      .sort((a, b) => String(b.orderedAt).localeCompare(String(a.orderedAt)))
+      .map((po) => ({
+        id: toLogicalId(po.id, uid),
+        po_number: po.poNumber,
+        supplier_id: toLogicalId(po.supplierId, uid),
+        location_id: toLogicalId(po.locationId, uid),
+        status: po.status,
+        total_amount: po.totalAmount,
+        approved_by: po.approvedBy ? toLogicalId(po.approvedBy, uid) : null,
+        notes: po.notes,
+        ordered_at: po.orderedAt,
+        expected_at: po.expectedAt,
+        supplier_name: supMap.get(po.supplierId)?.name || 'Supplier',
+        location_name: locMap.get(po.locationId)?.name || 'Location',
+        items: (po.items || []).map((pi: any) => {
+          const item = itemMap.get(pi.inventoryItemId);
+          return {
+            id: pi.id,
+            purchase_order_id: toLogicalId(po.id, uid),
+            inventory_item_id: toLogicalId(pi.inventoryItemId, uid),
+            ordered_qty: pi.orderedQty,
+            received_qty: pi.receivedQty,
+            unit_cost: pi.unitCost,
+            item_name: item?.name || 'Item',
+            uom_code: item?.uomCode || '',
+          };
+        }),
+      }));
+
+    const poMap = new Map(snap.purchaseOrders.map((p) => [p.id, p]));
+    const grnByInvNoMap = new Map(snap.goodsReceipts.map((g) => [`SI-${g.grnNumber}`, g]));
+
+    const invoices = [...snap.supplierInvoices]
+      .sort((a, b) => String(a.dueDate).localeCompare(String(b.dueDate)))
+      .map((inv) => {
+        const supplier = supMap.get(inv.supplierId);
+        const po = inv.purchaseOrderId ? poMap.get(inv.purchaseOrderId) : null;
+        const grn = grnByInvNoMap.get(inv.invoiceNumber) || null;
+        const grnItems = (grn?.items || []).filter((gi: any) => Number(gi.receivedQty || 0) > 0);
+        const rawItems = grnItems.length > 0 ? grnItems : po?.items || [];
+        const items = rawItems.map((line: any) => {
+          const item = itemMap.get(line.inventoryItemId);
+          const qty = grnItems.length > 0 ? Number(line.receivedQty || 0) : Number(line.orderedQty || 0);
+          const unitCost = Number(line.unitCost || 0);
+          return {
+            id: line.id,
+            item_name: item?.name || 'Item',
+            uom_code: item?.uomCode || '',
+            quantity: qty,
+            unit_cost: unitCost,
+            line_total: round2(qty * unitCost),
+            batch_number: line.batchNumber || null,
+          };
+        });
+        const payments = (inv.payments || []).map((p: any) => ({
+          id: p.id,
+          payment_number: p.paymentNumber || p.payment_number || '',
+          amount: Number(p.amount || 0),
+          method: p.method || 'BANK_TRANSFER',
+          reference_no: p.referenceNo || p.reference_no || '',
+          paid_at: p.paidAt || p.paid_at || '',
+        }));
+
+        return {
+          id: toLogicalId(inv.id, uid),
+          invoice_number: inv.invoiceNumber,
+          supplier_id: toLogicalId(inv.supplierId, uid),
+          purchase_order_id: inv.purchaseOrderId ? toLogicalId(inv.purchaseOrderId, uid) : null,
+          location_id: po?.locationId ? toLogicalId(po.locationId, uid) : null,
+          total_amount: inv.totalAmount,
+          paid_amount: inv.paidAmount,
+          due_date: inv.dueDate,
+          created_at: grn?.receivedAt || inv.dueDate,
+          status: inv.status,
+          supplier_name: supplier?.name || 'Supplier',
+          supplier_code: supplier?.code || '',
+          supplier_tin: supplier?.tin || '',
+          supplier_contact: supplier?.contactPerson || '',
+          supplier_phone: supplier?.phone || '',
+          supplier_email: supplier?.email || '',
+          supplier_address: supplier?.address || '',
+          payment_terms: supplier?.paymentTerms ?? 0,
+          po_number: po?.poNumber || null,
+          grn_number: grn?.grnNumber || null,
+          location_name: po ? locMap.get(po.locationId)?.name || null : null,
+          items,
+          payments,
+        };
+      });
+
+    return { suppliers, priceComparison, purchaseOrders, invoices } as T;
+  }
+
+  if (pathname === '/procurement/suppliers' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.PO_CREATE);
+    const { code, name, contactPerson, phone, email, address, tin, paymentTerms } = body || {};
+    const cleanName = String(name || '').trim().slice(0, 160);
+    if (!cleanName) throw new Error('Supplier name is required');
+    const cleanCode = String(code || `SUP-${Date.now().toString().slice(-4)}`).trim().slice(0, 40);
+    if (!cleanCode) throw new Error('Supplier code is required');
+
+    const logicalId = crypto.randomUUID();
+    const docId = toDocId(logicalId, uid);
+    try {
+      await setDoc(doc(db, 'suppliers', docId), {
+        id: docId,
+        ownerUid: uid,
+        code: cleanCode,
+        name: cleanName,
+        contactPerson: String(contactPerson || '').trim().slice(0, 120),
+        phone: String(phone || '').trim().slice(0, 40),
+        email: String(email || '').trim().slice(0, 160),
+        address: String(address || '').trim().slice(0, 300),
+        tin: String(tin || '').trim().slice(0, 40),
+        paymentTerms: Math.max(0, Math.round(Number(paymentTerms || 0))),
+        isActive: true,
+        createdAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `suppliers/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'CREATE_SUPPLIER', 'Supplier', logicalId, { code: cleanCode, name: cleanName });
+    invalidateWorkspaceCache();
+    return { id: logicalId } as T;
+  }
+
+  if (pathname.startsWith('/procurement/suppliers/') && method === 'PUT') {
+    assertPerm(user, PERMISSIONS.PO_CREATE);
+    const rawId = pathname.split('/')[3];
+    const docId = toDocId(rawId, uid);
+    const existingSup = snap.suppliers.find((s) => s.id === docId);
+    if (!existingSup) throw new Error('Supplier not found');
+
+    const { code, name, contactPerson, phone, email, address, tin, paymentTerms } = body || {};
+    const cleanName = String(name ?? existingSup.name ?? '').trim().slice(0, 160);
+    const cleanCode = String(code ?? existingSup.code ?? '').trim().slice(0, 40);
+    if (!cleanName) throw new Error('Supplier name is required');
+    if (!cleanCode) throw new Error('Supplier code is required');
+
+    try {
+      await updateDoc(doc(db, 'suppliers', existingSup.id), {
+        code: cleanCode,
+        name: cleanName,
+        contactPerson: String(contactPerson ?? existingSup.contactPerson ?? '').trim().slice(0, 120),
+        phone: String(phone ?? existingSup.phone ?? '').trim().slice(0, 40),
+        email: String(email ?? existingSup.email ?? '').trim().slice(0, 160),
+        address: String(address ?? existingSup.address ?? '').trim().slice(0, 300),
+        tin: String(tin ?? existingSup.tin ?? '').trim().slice(0, 40),
+        paymentTerms: Math.max(0, Math.round(Number(paymentTerms ?? existingSup.paymentTerms ?? 0))),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `suppliers/${existingSup.id}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_SUPPLIER', 'Supplier', toLogicalId(existingSup.id, uid), {
+      code: cleanCode,
+      name: cleanName,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true, id: toLogicalId(existingSup.id, uid) } as T;
+  }
+
+  if (pathname.startsWith('/procurement/suppliers/') && method === 'DELETE') {
+    assertPerm(user, PERMISSIONS.PO_CREATE);
+    const rawId = pathname.split('/')[3];
+    const docId = toDocId(rawId, uid);
+    const existingSup = snap.suppliers.find((s) => s.id === docId);
+    if (!existingSup) throw new Error('Supplier not found');
+
+    const hasHistory =
+      snap.purchaseOrders.some((p) => p.supplierId === existingSup.id) ||
+      snap.supplierInvoices.some((inv) => inv.supplierId === existingSup.id);
+
+    try {
+      if (hasHistory) {
+        await updateDoc(doc(db, 'suppliers', existingSup.id), { isActive: false });
+      } else {
+        await deleteDoc(doc(db, 'suppliers', existingSup.id));
+      }
+    } catch (err) {
+      handleFirestoreError(err, hasHistory ? OperationType.UPDATE : OperationType.DELETE, `suppliers/${existingSup.id}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'DELETE_SUPPLIER', 'Supplier', toLogicalId(existingSup.id, uid), {
+      name: existingSup.name,
+      archived: hasHistory,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true, archived: hasHistory } as T;
+  }
+
+  if (pathname === '/procurement/purchase-orders' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.PO_CREATE);
+    const { supplierId, locationId, expectedAt, notes, items } = body || {};
+    if (!items?.length) throw new Error('PO requires at least one item');
+    const logicalId = crypto.randomUUID();
+    const poDocId = toDocId(logicalId, uid);
+    const poNumber = `PO-${Date.now().toString().slice(-6)}`;
+    const totalAmount = round2(items.reduce((s: number, i: any) => s + Number(i.orderedQty) * Number(i.unitCost), 0));
+
+    try {
+      await setDoc(doc(db, 'purchase_orders', poDocId), {
+        id: poDocId,
+        ownerUid: uid,
+        poNumber,
+        supplierId: toDocId(supplierId, uid),
+        locationId: toDocId(locationId, uid),
+        status: 'PENDING_APPROVAL',
+        totalAmount,
+        approvedBy: null,
+        notes: notes || '',
+        items: items.map((i: any) => ({
+          id: crypto.randomUUID(),
+          inventoryItemId: toDocId(i.inventoryItemId, uid),
+          orderedQty: Number(i.orderedQty),
+          receivedQty: 0,
+          unitCost: Number(i.unitCost),
+        })),
+        orderedAt: new Date().toISOString(),
+        expectedAt: expectedAt || null,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `purchase_orders/${poDocId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'CREATE_PO', 'PurchaseOrder', logicalId, { poNumber, totalAmount });
+    invalidateWorkspaceCache();
+    return { id: logicalId, poNumber } as T;
+  }
+
+  if (pathname.startsWith('/procurement/purchase-orders/') && method === 'PUT') {
+    assertAnyPerm(user, PERMISSIONS.PO_CREATE, PERMISSIONS.PO_APPROVE);
+    const id = pathname.split('/')[3];
+    const poDocId = toDocId(id, uid);
+    const po = snap.purchaseOrders.find((p) => p.id === poDocId);
+    if (!po) throw new Error('Purchase order not found');
+    if (po.status !== 'PENDING_APPROVAL') {
+      throw new Error('Only pending purchase orders can be edited');
+    }
+
+    const { supplierId, locationId, expectedAt, notes, items, approve } = body || {};
+    if (!supplierId || !locationId) throw new Error('Supplier and delivery location are required');
+    if (!Array.isArray(items) || items.length === 0) throw new Error('PO requires at least one item');
+
+    const normalizedItems = items.map((i: any) => {
+      const qty = Number(i.orderedQty);
+      const cost = Number(i.unitCost);
+      if (!i.inventoryItemId || !Number.isFinite(qty) || qty <= 0) {
+        throw new Error('Every PO line item requires an ingredient and positive quantity');
+      }
+      if (!Number.isFinite(cost) || cost < 0) {
+        throw new Error('Unit cost cannot be negative');
+      }
+      return {
+        id: String(i.id || crypto.randomUUID()),
+        inventoryItemId: toDocId(i.inventoryItemId, uid),
+        orderedQty: qty,
+        receivedQty: 0,
+        unitCost: cost,
+      };
+    });
+
+    if (approve) {
+      assertPerm(user, PERMISSIONS.PO_APPROVE);
+    }
+
+    const totalAmount = round2(normalizedItems.reduce((s: number, i: any) => s + i.orderedQty * i.unitCost, 0));
+    const nextStatus = approve ? 'APPROVED' : 'PENDING_APPROVAL';
+    const updates: Record<string, any> = {
+      supplierId: toDocId(supplierId, uid),
+      locationId: toDocId(locationId, uid),
+      expectedAt: expectedAt ? String(expectedAt).slice(0, 40) : null,
+      notes: String(notes || '').slice(0, 500),
+      items: normalizedItems,
+      totalAmount,
+      updatedAt: serverTimestamp(),
+    };
+    if (approve) {
+      updates.status = 'APPROVED';
+      updates.approvedBy = toDocId(user.id, uid);
+    }
+
+    try {
+      await updateDoc(doc(db, 'purchase_orders', poDocId), updates);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `purchase_orders/${poDocId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, approve ? 'REVIEW_AND_APPROVE_PO' : 'EDIT_PO', 'PurchaseOrder', id, {
+      poNumber: po.poNumber,
+      totalAmount,
+      status: nextStatus,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true, id, poNumber: po.poNumber, status: nextStatus, totalAmount } as T;
+  }
+
+  if (pathname.startsWith('/procurement/purchase-orders/') && pathname.endsWith('/approve') && method === 'POST') {
+    assertPerm(user, PERMISSIONS.PO_APPROVE);
+    const id = pathname.split('/')[3];
+    const poDocId = toDocId(id, uid);
+    const po = snap.purchaseOrders.find((p) => p.id === poDocId);
+    if (!po) throw new Error('Purchase order not found');
+    if (po.status !== 'PENDING_APPROVAL') {
+      throw new Error('Only pending purchase orders can be approved');
+    }
+    try {
+      await updateDoc(doc(db, 'purchase_orders', poDocId), {
+        status: 'APPROVED',
+        approvedBy: toDocId(user.id, uid),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `purchase_orders/${poDocId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'APPROVE_PO', 'PurchaseOrder', id, { poNumber: po.poNumber });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if (pathname.startsWith('/procurement/purchase-orders/') && pathname.endsWith('/cancel') && method === 'POST') {
+    assertAnyPerm(user, PERMISSIONS.PO_CREATE, PERMISSIONS.PO_APPROVE);
+    const id = pathname.split('/')[3];
+    const poDocId = toDocId(id, uid);
+    const po = snap.purchaseOrders.find((p) => p.id === poDocId);
+    if (!po) throw new Error('Purchase order not found');
+    if (po.status !== 'PENDING_APPROVAL' && po.status !== 'APPROVED') {
+      throw new Error('Only pending or unreceived approved purchase orders can be cancelled');
+    }
+    const hasReceived = (po.items || []).some((pi: any) => Number(pi.receivedQty || 0) > 0);
+    if (hasReceived) {
+      throw new Error('Cannot cancel a purchase order that already has received goods');
+    }
+
+    const reason = String(body?.reason || '').trim();
+    const prevNotes = String(po.notes || '').trim();
+    const cancelNote = reason ? `Cancelled: ${reason}` : 'Cancelled by user';
+    const nextNotes = (prevNotes ? `${prevNotes} | ${cancelNote}` : cancelNote).slice(0, 500);
+
+    try {
+      await updateDoc(doc(db, 'purchase_orders', poDocId), {
+        status: 'CANCELLED',
+        notes: nextNotes,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `purchase_orders/${poDocId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'CANCEL_PO', 'PurchaseOrder', id, {
+      poNumber: po.poNumber,
+      reason: reason || null,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true, id, status: 'CANCELLED' } as T;
+  }
+
+  if (pathname.startsWith('/procurement/purchase-orders/') && pathname.endsWith('/receive') && method === 'POST') {
+    assertPerm(user, PERMISSIONS.GRN_RECEIVE);
+    const id = pathname.split('/')[3];
+    const poDocId = toDocId(id, uid);
+    const po = snap.purchaseOrders.find((p) => p.id === poDocId);
+    if (!po) throw new Error('PO not found');
+    if (po.status !== 'APPROVED' && po.status !== 'PARTIAL' && po.status !== 'PARTIALLY_RECEIVED') {
+      throw new Error('PO must be APPROVED or PARTIAL to receive');
+    }
+
+    const { items, notes } = body || {};
+    const grnId = toDocId(crypto.randomUUID(), uid);
+    const grnNumber = `GRN-${Date.now().toString().slice(-6)}`;
+    let totalRecvValue = 0;
+    const grnItems: any[] = [];
+    const updatedPoItems = (po.items || []).map((pi: any) => ({ ...pi }));
+
+    for (const line of items || []) {
+      const poItem = updatedPoItems.find((x: any) => x.id === line.poItemId);
+      if (!poItem) continue;
+      const recvQty = Number(line.receivedQty || 0);
+      const rejQty = Number(line.rejectedQty || 0);
+      const unitCost = Number(line.unitCost ?? poItem.unitCost);
+      const batchNo = line.batchNumber || `${grnNumber}-${String(poItem.inventoryItemId).slice(-4)}`;
+
+      grnItems.push({
+        id: crypto.randomUUID(),
+        inventoryItemId: poItem.inventoryItemId,
+        orderedQty: poItem.orderedQty,
+        receivedQty: recvQty,
+        rejectedQty: rejQty,
+        unitCost,
+        batchNumber: batchNo,
+        expiryDate: line.expiryDate || null,
+        discrepancyNotes: line.discrepancyNotes || null,
+      });
+
+      if (recvQty > 0) {
+        await receiveStockFirestore(snap, {
+          inventoryItemId: poItem.inventoryItemId,
+          locationId: po.locationId,
+          quantity: recvQty,
+          unitCost,
+          batchNumber: batchNo,
+          expiryDate: line.expiryDate || null,
+          txnType: 'IN_PURCHASE',
+          referenceType: 'GRN',
+          referenceId: grnId,
+          userId: user.id,
+          notes: `GRN ${grnNumber} (${po.poNumber})`,
+        });
+        totalRecvValue += round2(recvQty * unitCost);
+        poItem.receivedQty = Number(poItem.receivedQty || 0) + recvQty;
+      }
+    }
+
+    const allDone = updatedPoItems.every((x: any) => Number(x.receivedQty) >= Number(x.orderedQty));
+    const nextStatus = allDone ? 'RECEIVED' : 'PARTIAL';
+
+    const batch = writeBatch(db);
+    batch.set(doc(db, 'goods_receipts', grnId), {
+      id: grnId,
+      ownerUid: uid,
+      grnNumber,
+      purchaseOrderId: poDocId,
+      receivedBy: user.id,
+      notes: notes || '',
+      items: grnItems,
+      receivedAt: new Date().toISOString(),
+      createdAt: serverTimestamp(),
+    });
+
+    batch.update(doc(db, 'purchase_orders', poDocId), {
+      status: nextStatus,
+      items: updatedPoItems,
+      updatedAt: serverTimestamp(),
+    });
+
+    if (totalRecvValue > 0) {
+      const invId = toDocId(crypto.randomUUID(), uid);
+      batch.set(doc(db, 'supplier_invoices', invId), {
+        id: invId,
+        ownerUid: uid,
+        invoiceNumber: `SI-${grnNumber}`,
+        supplierId: po.supplierId,
+        purchaseOrderId: poDocId,
+        totalAmount: round2(totalRecvValue),
+        paidAmount: 0,
+        dueDate: new Date(Date.now() + 15 * 86400000).toISOString(),
+        status: 'UNPAID',
+        payments: [],
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      const jeId = toDocId(crypto.randomUUID(), uid);
+      batch.set(doc(db, 'journal_entries', jeId), {
+        id: jeId,
+        ownerUid: uid,
+        entryNumber: `JE-${grnNumber}`,
+        entryDate: new Date().toISOString(),
+        description: `Goods Receipt ${grnNumber}`,
+        referenceType: 'GRN',
+        referenceId: grnId,
+        isReversed: false,
+        lines: [
+          { id: crypto.randomUUID(), accountId: toDocId('acc_1200', uid), debit: round2(totalRecvValue), credit: 0, memo: 'Inventory Received' },
+          { id: crypto.randomUUID(), accountId: toDocId('acc_2000', uid), debit: 0, credit: round2(totalRecvValue), memo: 'Supplier Payable' },
+        ],
+        createdAt: serverTimestamp(),
+      });
+    }
+
+    try {
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `purchase_orders/${poDocId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'RECEIVE_GRN', 'GoodsReceipt', toLogicalId(grnId, uid), {
+      poNumber: po.poNumber,
+      totalRecvValue: round2(totalRecvValue),
+    });
+    invalidateWorkspaceCache();
+    return { grnId: toLogicalId(grnId, uid), grnNumber, totalRecvValue: round2(totalRecvValue) } as T;
+  }
+
+  if (pathname.startsWith('/procurement/invoices/') && pathname.endsWith('/pay') && method === 'POST') {
+    assertPerm(user, PERMISSIONS.FINANCE_VIEW);
+    const id = pathname.split('/')[3];
+    const invDocId = toDocId(id, uid);
+    const inv = snap.supplierInvoices.find((x) => x.id === invDocId);
+    if (!inv) throw new Error('Invoice not found');
+
+    const payAmt = round2(Number(body.amount));
+    const newPaid = round2(Number(inv.paidAmount || 0) + payAmt);
+    if (newPaid > Number(inv.totalAmount) + 0.01) throw new Error('Payment exceeds invoice balance');
+    const payNo = `PAY-${Date.now().toString().slice(-6)}`;
+    const nextPayments = [
+      ...(inv.payments || []),
+      {
+        id: crypto.randomUUID(),
+        paymentNumber: payNo,
+        amount: payAmt,
+        method: body.method || 'BANK_TRANSFER',
+        referenceNo: body.referenceNo || '',
+        paidBy: user.id,
+        paidAt: new Date().toISOString(),
+      },
+    ];
+
+    const batch = writeBatch(db);
+    batch.update(doc(db, 'supplier_invoices', invDocId), {
+      paidAmount: newPaid,
+      status: newPaid >= Number(inv.totalAmount) ? 'PAID' : 'PARTIAL',
+      payments: nextPayments,
+      updatedAt: serverTimestamp(),
+    });
+
+    const jeId = toDocId(crypto.randomUUID(), uid);
+    batch.set(doc(db, 'journal_entries', jeId), {
+      id: jeId,
+      ownerUid: uid,
+      entryNumber: `JE-${payNo}`,
+      entryDate: new Date().toISOString(),
+      description: `Supplier Payment ${inv.invoiceNumber}`,
+      referenceType: 'AP_PAYMENT',
+      referenceId: invDocId,
+      isReversed: false,
+      lines: [
+        { id: crypto.randomUUID(), accountId: toDocId('acc_2000', uid), debit: payAmt, credit: 0, memo: 'Accounts Payable Settled' },
+        { id: crypto.randomUUID(), accountId: toDocId('acc_1010', uid), debit: 0, credit: payAmt, memo: 'Bank/Cash Disbursement' },
+      ],
+      createdAt: serverTimestamp(),
+    });
+
+    try {
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `supplier_invoices/${invDocId}`);
+    }
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  // 7. FINANCE, STATEMENTS & FOOD COSTING
+  if (pathname === '/finance/overview' && method === 'GET') {
+    assertPerm(user, PERMISSIONS.FINANCE_VIEW);
+    const from = qs.get('from') || '2000-01-01';
+    const to = qs.get('to') || '2099-12-31';
+    const rawLoc = (qs.get('locationId') || '').trim();
+    const locFilter = rawLoc && rawLoc !== 'ALL' ? toDocId(rawLoc, uid) : '';
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const accMap = new Map(snap.accounts.map((a) => [a.id, a]));
+    const userMap = new Map(snap.erpUsers.map((u) => [u.id, u]));
+
+    const saleMap = new Map(snap.sales.map((s) => [s.id, s]));
+    const expMap = new Map(snap.expenses.map((e) => [e.id, e]));
+    const grnMap = new Map(snap.goodsReceipts.map((g) => [g.id, g]));
+    const poMap = new Map(snap.purchaseOrders.map((p) => [p.id, p]));
+    const invMap = new Map(snap.supplierInvoices.map((i) => [i.id, i]));
+    const trfMap = new Map(snap.stockTransfers.map((t) => [t.id, t]));
+    const empMap = new Map(snap.employees.map((e) => [e.id, e]));
+    const prMap = new Map(snap.payrollRuns.map((pr) => [pr.id, pr]));
+
+    const resolveJeLocations = (je: any): string[] => {
+      const refType = String(je.referenceType || '');
+      const refId = String(je.referenceId || '');
+      const refDocId = refId ? toDocId(refId, uid) : '';
+      if (refType === 'SALE' || refType === 'SALE_REFUND') {
+        const s = saleMap.get(refDocId) || saleMap.get(refId);
+        return s?.locationId ? [s.locationId] : [];
+      }
+      if (refType === 'EXPENSE') {
+        const ex = expMap.get(refDocId) || expMap.get(refId);
+        return ex?.locationId ? [ex.locationId] : [];
+      }
+      if (refType === 'GRN') {
+        const grn = grnMap.get(refDocId) || grnMap.get(refId);
+        const po = grn ? poMap.get(grn.purchaseOrderId) : null;
+        return po?.locationId ? [po.locationId] : [];
+      }
+      if (refType === 'AP_PAYMENT') {
+        const inv = invMap.get(refDocId) || invMap.get(refId);
+        const po = inv?.purchaseOrderId ? poMap.get(inv.purchaseOrderId) : null;
+        return po?.locationId ? [po.locationId] : [];
+      }
+      if (refType === 'TRANSFER') {
+        const trf = trfMap.get(refDocId) || trfMap.get(refId);
+        return [trf?.fromLocationId, trf?.toLocationId].filter(Boolean) as string[];
+      }
+      if (refType === 'WASTE_LOG' || refType === 'WASTE' || refType === 'STOCK_COUNT' || refType === 'RECONCILE') {
+        const matched = snap.inventoryTxns.filter(
+          (t) => t.referenceId === refDocId || t.referenceId === refId || toDocId(String(t.referenceId || ''), uid) === refDocId,
+        );
+        return Array.from(new Set(matched.map((t) => t.locationId).filter(Boolean))) as string[];
+      }
+      if (refType === 'PAYROLL') {
+        const pr = prMap.get(refDocId) || prMap.get(refId);
+        const locs = (pr?.items || [])
+          .map((pi: any) => empMap.get(pi.employeeId)?.locationId)
+          .filter(Boolean) as string[];
+        return Array.from(new Set(locs));
+      }
+      return [];
+    };
+
+    const jeMatchesLoc = (je: any) => !locFilter || resolveJeLocations(je).includes(locFilter);
+
+    const expenses = [...snap.expenses]
+      .filter((e) => !locFilter || e.locationId === locFilter)
+      .sort((a, b) => String(b.expenseDate).localeCompare(String(a.expenseDate)))
+      .slice(0, 60)
+      .map((e) => ({
+        id: toLogicalId(e.id, uid),
+        location_id: toLogicalId(e.locationId, uid),
+        account_id: toLogicalId(e.accountId, uid),
+        category: e.category,
+        amount: e.amount,
+        description: e.description,
+        is_recurring: e.isRecurring ? 1 : 0,
+        paid_from_petty_cash: e.paidFromPettyCash ? 1 : 0,
+        expense_date: e.expenseDate,
+        location_name: locMap.get(e.locationId)?.name || '',
+        account_name: accMap.get(e.accountId)?.name || '',
+      }));
+
+    const closings = [...snap.dailyClosings]
+      .filter((dc) => !locFilter || dc.locationId === locFilter)
+      .sort((a, b) => String(b.businessDate).localeCompare(String(a.businessDate)))
+      .slice(0, 30)
+      .map((dc) => ({
+        id: toLogicalId(dc.id, uid),
+        location_id: toLogicalId(dc.locationId, uid),
+        business_date: dc.businessDate,
+        opening_float: dc.openingFloat,
+        expected_cash: dc.expectedCash,
+        actual_cash: dc.actualCash,
+        variance: dc.variance,
+        total_sales: dc.totalSales,
+        gross_profit: dc.grossProfit,
+        closed_by: toLogicalId(dc.closedBy, uid),
+        notes: dc.notes,
+        closed_at: dc.closedAt,
+        location_name: locMap.get(dc.locationId)?.name || '',
+        closed_by_name: userMap.get(dc.closedBy)?.fullName || 'Manager',
+      }));
+
+    const journals = [...snap.journalEntries]
+      .filter(jeMatchesLoc)
+      .sort((a, b) => String(b.entryDate).localeCompare(String(a.entryDate)))
+      .slice(0, 40)
+      .map((je) => ({
+        id: toLogicalId(je.id, uid),
+        entry_number: je.entryNumber,
+        entry_date: je.entryDate,
+        description: je.description,
+        reference_type: je.referenceType,
+        reference_id: je.referenceId,
+        is_reversed: je.isReversed ? 1 : 0,
+        lines: (je.lines || []).map((l: any) => ({
+          id: l.id,
+          account_id: toLogicalId(l.accountId, uid),
+          account_code: accMap.get(l.accountId)?.code || '',
+          account_name: accMap.get(l.accountId)?.name || '',
+          debit: Number(l.debit || 0),
+          credit: Number(l.credit || 0),
+          memo: l.memo || '',
+        })),
+      }));
+
+    const accounts = [...snap.accounts]
+      .sort((a, b) => String(a.code).localeCompare(String(b.code)))
+      .map((a) => ({ id: toLogicalId(a.id, uid), code: a.code, name: a.name, type: a.type, is_system: a.isSystem ? 1 : 0 }));
+
+    const pettyCash = (snap.meta?.pettyCashFunds || [])
+      .filter((pc: any) => !locFilter || toDocId(String(pc.location_id || ''), uid) === locFilter)
+      .map((pc: any) => ({
+        ...pc,
+        location_name: locMap.get(toDocId(pc.location_id, uid))?.name || '',
+      }));
+
+    const periods = [...(snap.meta?.financialPeriods || [])].sort((a: any, b: any) => String(b.period_start).localeCompare(String(a.period_start)));
+
+    // Financial statements
+    const jeInRange = snap.journalEntries.filter((je) => je.entryDate >= from && je.entryDate <= to && jeMatchesLoc(je));
+    const accBalances = accounts.map((a) => {
+      const docAccId = toDocId(a.id, uid);
+      let totalDebit = 0;
+      let totalCredit = 0;
+      for (const je of jeInRange) {
+        for (const l of je.lines || []) {
+          if (l.accountId === docAccId) {
+            totalDebit += Number(l.debit || 0);
+            totalCredit += Number(l.credit || 0);
+          }
+        }
+      }
+      return { ...a, total_debit: round2(totalDebit), total_credit: round2(totalCredit) };
+    });
+
+    const revenues = accBalances.filter((a) => a.type === 'REVENUE').map((a) => ({ ...a, balance: round2(a.total_credit - a.total_debit) }));
+    const expSt = accBalances.filter((a) => a.type === 'EXPENSE').map((a) => ({ ...a, balance: round2(a.total_debit - a.total_credit) }));
+    const assets = accBalances.filter((a) => a.type === 'ASSET').map((a) => ({ ...a, balance: round2(a.total_debit - a.total_credit) }));
+    const liabilities = accBalances.filter((a) => a.type === 'LIABILITY').map((a) => ({ ...a, balance: round2(a.total_credit - a.total_debit) }));
+    const equity = accBalances.filter((a) => a.type === 'EQUITY').map((a) => ({ ...a, balance: round2(a.total_credit - a.total_debit) }));
+
+    const totalRevenue = round2(revenues.reduce((s, r) => s + r.balance, 0));
+    const totalExp = round2(expSt.reduce((s, e) => s + e.balance, 0));
+    const netIncome = round2(totalRevenue - totalExp);
+
+    const taxConfigs = snap.taxConfigs.map((t) => ({
+      id: toLogicalId(t.id, uid),
+      code: t.code,
+      name: t.name,
+      rate_percent: t.ratePercent,
+      is_inclusive: t.isInclusive ? 1 : 0,
+      is_active: t.isActive ? 1 : 0,
+    }));
+    const salesInRange = snap.sales.filter(
+      (s) => s.status === 'COMPLETED' && s.soldAt >= from && s.soldAt <= to && (!locFilter || s.locationId === locFilter),
+    );
+    const vatableSales = round2(salesInRange.reduce((s, r) => s + Number(r.subtotal || 0), 0));
+    const outputTax = round2(salesInRange.reduce((s, r) => s + Number(r.taxAmount || 0), 0));
+
+    return {
+      expenses,
+      closings,
+      journals,
+      accounts,
+      pettyCash,
+      periods,
+      statements: {
+        trialBalance: accBalances,
+        profitAndLoss: { revenues, expenses: expSt, totalRevenue, totalExpenses: totalExp, netIncome },
+        balanceSheet: {
+          assets,
+          liabilities,
+          equity,
+          retainedEarningsCurrent: netIncome,
+          totalAssets: round2(assets.reduce((s, a) => s + a.balance, 0)),
+          totalLiabilitiesAndEquity: round2(liabilities.reduce((s, l) => s + l.balance, 0) + equity.reduce((s, e) => s + e.balance, 0) + netIncome),
+        },
+        taxSummary: { taxConfigs, vatableSales, outputTax },
+      },
+    } as T;
+  }
+
+  if (pathname === '/finance/expenses' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.FINANCE_VIEW);
+    const { locationId, accountId, category, amount, description, expenseDate, paidFromPettyCash, isRecurring } = body || {};
+    const amt = round2(Number(amount));
+    if (!Number.isFinite(amt) || amt <= 0) throw new Error('Amount must be positive');
+    const cleanDesc = String(description || '').trim();
+    if (!cleanDesc) throw new Error('Description is required');
+
+    const expId = toDocId(crypto.randomUUID(), uid);
+    const locDocId = toDocId(locationId, uid);
+    const accDocId = toDocId(accountId, uid);
+    const rawExpDate = String(expenseDate || '').trim();
+    const expDate = /^\d{4}-\d{2}-\d{2}$/.test(rawExpDate)
+      ? `${rawExpDate}T12:00:00.000Z`
+      : rawExpDate || new Date().toISOString();
+
+    const batch = writeBatch(db);
+    if (paidFromPettyCash) {
+      const funds = [...(snap.meta?.pettyCashFunds || [])];
+      const fIdx = funds.findIndex((f: any) => f.location_id === locationId || toDocId(f.location_id, uid) === locDocId);
+      if (fIdx < 0 || Number(funds[fIdx].current_balance) < amt) {
+        throw new Error('Insufficient petty cash balance');
+      }
+      funds[fIdx] = { ...funds[fIdx], current_balance: round2(Number(funds[fIdx].current_balance) - amt) };
+      batch.update(doc(db, 'workspace_meta', `ws_${uid}`), { pettyCashFunds: funds, updatedAt: serverTimestamp() });
+    }
+
+    batch.set(doc(db, 'expenses', expId), {
+      id: expId,
+      ownerUid: uid,
+      locationId: locDocId,
+      accountId: accDocId,
+      category: String(category || 'GENERAL'),
+      amount: amt,
+      description: cleanDesc,
+      isRecurring: Boolean(isRecurring),
+      paidFromPettyCash: Boolean(paidFromPettyCash),
+      expenseDate: expDate,
+      createdAt: serverTimestamp(),
+    });
+
+    const jeId = toDocId(crypto.randomUUID(), uid);
+    batch.set(doc(db, 'journal_entries', jeId), {
+      id: jeId,
+      ownerUid: uid,
+      entryNumber: `JE-EXP-${Date.now().toString().slice(-6)}`,
+      entryDate: expDate,
+      description: `${category}: ${cleanDesc}`,
+      referenceType: 'EXPENSE',
+      referenceId: expId,
+      isReversed: false,
+      lines: [
+        { id: crypto.randomUUID(), accountId: accDocId, debit: amt, credit: 0, memo: cleanDesc },
+        { id: crypto.randomUUID(), accountId: toDocId('acc_1000', uid), debit: 0, credit: amt, memo: paidFromPettyCash ? 'Petty Cash Disbursement' : 'Cash Disbursement' },
+      ],
+      createdAt: serverTimestamp(),
+    });
+
+    try {
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `expenses/${expId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'RECORD_EXPENSE', 'Expense', toLogicalId(expId, uid), { category, amt });
+    invalidateWorkspaceCache();
+    return { id: toLogicalId(expId, uid) } as T;
+  }
+
+  if (pathname === '/finance/daily-closing' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.DAILY_CLOSE);
+    const { locationId, businessDate, openingFloat, actualCash, notes } = body || {};
+    const dateStr = businessDate || new Date().toISOString().slice(0, 10);
+    const locDocId = toDocId(locationId, uid);
+
+    if (snap.dailyClosings.some((dc) => dc.locationId === locDocId && dc.businessDate === dateStr)) {
+      throw new Error(`Business day ${dateStr} is already closed for this location`);
+    }
+
+    const daySales = snap.sales.filter((s) => s.locationId === locDocId && s.status === 'COMPLETED' && String(s.soldAt).slice(0, 10) === dateStr);
+    const totalSales = round2(daySales.reduce((s, r) => s + Number(r.totalAmount || 0), 0));
+    const totalCogs = round2(daySales.reduce((s, r) => s + Number(r.totalCogs || 0), 0));
+    const cashSales = round2(
+      daySales.reduce(
+        (s, r) => s + (r.payments || []).filter((p: any) => p.method === 'CASH').reduce((ps: number, p: any) => ps + Number(p.amount || 0), 0),
+        0,
+      ),
+    );
+    const pettyOut = round2(
+      snap.expenses
+        .filter((e) => e.locationId === locDocId && e.paidFromPettyCash && String(e.expenseDate).slice(0, 10) === dateStr)
+        .reduce((s, e) => s + Number(e.amount || 0), 0),
+    );
+
+    const expectedCash = round2(Number(openingFloat || 0) + cashSales - pettyOut);
+    const actual = round2(Number(actualCash));
+    const variance = round2(actual - expectedCash);
+    const grossProfit = round2(totalSales - totalCogs);
+    const id = toDocId(crypto.randomUUID(), uid);
+    const closedAt = new Date().toISOString();
+
+    try {
+      await setDoc(doc(db, 'daily_closings', id), {
+        id,
+        ownerUid: uid,
+        locationId: locDocId,
+        businessDate: dateStr,
+        openingFloat: Number(openingFloat || 0),
+        expectedCash,
+        actualCash: actual,
+        variance,
+        totalSales,
+        grossProfit,
+        closedBy: toDocId(user.id, uid),
+        notes: notes || '',
+        closedAt,
+        createdAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `daily_closings/${id}`);
+    }
+
+    if (variance !== 0) {
+      const locName = snap.locations.find((l) => l.id === locDocId)?.name || 'Location';
+      await addNotificationIfMissing(
+        snap,
+        'CASH_VARIANCE',
+        Math.abs(variance) > 200 ? 'CRITICAL' : 'WARNING',
+        `Cash Reconciliation Variance (${dateStr})`,
+        `${locName}: Variance of PHP ${variance.toFixed(2)} recorded on closing.`,
+        locDocId,
+      );
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'DAILY_CLOSE', 'DailyClosing', toLogicalId(id, uid), { dateStr, expectedCash, actual, variance });
+    invalidateWorkspaceCache();
+    return {
+      id: toLogicalId(id, uid),
+      business_date: dateStr,
+      expected_cash: expectedCash,
+      actual_cash: actual,
+      variance,
+      total_sales: totalSales,
+      gross_profit: grossProfit,
+    } as T;
+  }
+
+  if (pathname.startsWith('/finance/tax/') && method === 'PATCH') {
+    assertPerm(user, PERMISSIONS.FINANCE_VIEW);
+    const id = pathname.split('/')[3];
+    const docId = toDocId(id, uid);
+    const { ratePercent, isInclusive, isActive } = body || {};
+    try {
+      await updateDoc(doc(db, 'tax_configs', docId), {
+        ratePercent: Number(ratePercent),
+        isInclusive: Boolean(isInclusive),
+        isActive: Boolean(isActive),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `tax_configs/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_TAX_CONFIG', 'TaxConfiguration', id, { ratePercent, isActive });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if (pathname === '/food-costing' && method === 'GET') {
+    assertPerm(user, PERMISSIONS.DASHBOARD_VIEW);
+    const rawLoc = (qs.get('locationId') || '').trim();
+    const locFilter = rawLoc && rawLoc !== 'ALL' ? toDocId(rawLoc, uid) : '';
+    const products = getProductCostingList(snap);
+    const completedSales = snap.sales.filter((s) => s.status === 'COMPLETED' && (!locFilter || s.locationId === locFilter));
+    const soldStats = new Map<string, { units_sold: number; revenue: number; actual_cogs: number }>();
+
+    for (const s of completedSales) {
+      for (const it of s.items || []) {
+        const lid = toLogicalId(it.productId, uid);
+        const prev = soldStats.get(lid) || { units_sold: 0, revenue: 0, actual_cogs: 0 };
+        prev.units_sold += Number(it.quantity || 0);
+        prev.revenue = round2(prev.revenue + Number(it.lineTotal || 0));
+        prev.actual_cogs = round2(prev.actual_cogs + Number(it.cogsAmount || 0));
+        soldStats.set(lid, prev);
+      }
+    }
+
+    const rows = products.map((p) => {
+      const st = soldStats.get(p.id) || { units_sold: 0, revenue: 0, actual_cogs: 0 };
+      return {
+        id: p.id,
+        name: p.name,
+        sellingPrice: p.base_price,
+        theoreticalCost: p.costing.directCost,
+        foodCostPct: p.costing.foodCostPct,
+        targetFoodCostPct: p.target_food_cost_pct,
+        grossProfitPerUnit: p.costing.grossProfit,
+        unitsSold: st.units_sold,
+        totalContribution: round2(st.units_sold * p.costing.grossProfit),
+        isMarginAlert: p.costing.isMarginAlert,
+      };
+    });
+
+    const avgPopularity = rows.length ? rows.reduce((s, r) => s + r.unitsSold, 0) / rows.length : 0;
+    const avgMargin = rows.length ? rows.reduce((s, r) => s + r.grossProfitPerUnit, 0) / rows.length : 0;
+    const menuEngineering = rows.map((r) => {
+      const highPop = r.unitsSold >= avgPopularity;
+      const highMargin = r.grossProfitPerUnit >= avgMargin;
+      const quadrant = highPop && highMargin ? 'Star' : highPop ? 'Plowhorse' : highMargin ? 'Puzzle' : 'Dog';
+      return { ...r, quadrant };
+    });
+
+    const theoMap = new Map<string, number>();
+    const prodMap = new Map(snap.products.map((p) => [p.id, p]));
+    const itemMap = new Map(snap.inventoryItems.map((i) => [i.id, i]));
+    for (const s of completedSales) {
+      for (const ci of s.items || []) {
+        const prod = prodMap.get(ci.productId);
+        if (!prod) continue;
+        const variant = ci.variantId ? (prod.variants || []).find((v: any) => v.id === ci.variantId) : null;
+        const mult = Number(variant?.portionMultiplier || 1);
+        for (const ing of prod.ingredients || []) {
+          const invItem = itemMap.get(ing.inventoryItemId);
+          if (!invItem) continue;
+          try {
+            const theoQty = convertQty(
+              ((Number(ing.quantity) * (1 + Number(ing.wasteFactorPct || 0) / 100)) / Number(prod.recipeYieldQty || 1)) *
+                mult *
+                Number(ci.quantity),
+              ing.uomId,
+              invItem.baseUomId,
+              snap,
+            );
+            theoMap.set(invItem.id, (theoMap.get(invItem.id) || 0) + theoQty);
+          } catch {
+            // ignore conversion errors
+          }
+        }
+      }
+    }
+
+    const avtReport = snap.inventoryItems.map((item) => {
+      const outTxns = snap.inventoryTxns.filter(
+        (t) =>
+          t.inventoryItemId === item.id &&
+          (!locFilter || t.locationId === locFilter) &&
+          ['OUT_SALE', 'OUT_WASTE', 'OUT_SPOILAGE', 'OUT_ADJUSTMENT'].includes(t.txnType),
+      );
+      const actualOut = round2(outTxns.reduce((s, t) => s + Math.abs(Number(t.quantityDelta || 0)), 0));
+      const wasteCost = round2(
+        snap.inventoryTxns
+          .filter(
+            (t) =>
+              t.inventoryItemId === item.id &&
+              (!locFilter || t.locationId === locFilter) &&
+              ['OUT_WASTE', 'OUT_SPOILAGE'].includes(t.txnType),
+          )
+          .reduce((s, t) => s + Number(t.totalCost || 0), 0),
+      );
+      const theo = round2(theoMap.get(item.id) || 0);
+      const varianceQty = round2(actualOut - theo);
+      return {
+        id: toLogicalId(item.id, uid),
+        name: item.name,
+        uom: item.uomCode,
+        theoreticalQty: theo,
+        actualQty: actualOut,
+        varianceQty,
+        varianceCost: round2(varianceQty * Number(item.lastUnitCost || 0)),
+        wasteCost,
+      };
+    });
+
+    return { menuEngineering, avtReport } as T;
+  }
+
+  // 8. FLEET
+  if (pathname === '/fleet' && method === 'GET') {
+    assertPerm(user, PERMISSIONS.FLEET_MANAGE);
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const trkMap = new Map(snap.foodTrucks.map((t) => [t.id, t]));
+    const trkByLocId = new Map(snap.foodTrucks.map((t) => [t.locationId, t]));
+
+    const assignmentsDesc = snap.fleetLogs
+      .filter((fl) => fl.logType === 'ASSIGNMENT')
+      .sort(
+        (a, b) =>
+          String(b.assignedDate || '').localeCompare(String(a.assignedDate || '')) ||
+          tsToIso(b.createdAt).localeCompare(tsToIso(a.createdAt)),
+      );
+    const latestAssignByTruck = new Map<string, any>();
+    for (const fl of assignmentsDesc) {
+      if (!latestAssignByTruck.has(fl.truckId)) {
+        latestAssignByTruck.set(fl.truckId, fl);
+      }
+    }
+
+    const trucks = snap.foodTrucks
+      .filter((ft) => {
+        const loc = locMap.get(ft.locationId);
+        return !loc || loc.isActive !== false;
+      })
+      .map((ft) => {
+        const loc = locMap.get(ft.locationId);
+        const latestAssign = latestAssignByTruck.get(ft.id);
+        const completed = snap.sales.filter((s) => s.locationId === ft.locationId && s.status === 'COMPLETED');
+        const totalSales = round2(completed.reduce((s, r) => s + Number(r.totalAmount || 0), 0));
+        const totalCogs = round2(completed.reduce((s, r) => s + Number(r.totalCogs || 0), 0));
+        const totalExpenses = round2(snap.expenses.filter((e) => e.locationId === ft.locationId).reduce((s, e) => s + Number(e.amount || 0), 0));
+        return {
+          id: toLogicalId(ft.id, uid),
+          location_id: toLogicalId(ft.locationId, uid),
+          plate_number: ft.plateNumber,
+          make_model: ft.makeModel,
+          status: ft.status,
+          current_site: ft.currentSite || latestAssign?.siteName || '',
+          latest_shift_notes: latestAssign?.shiftNotes || '',
+          latest_assigned_date: latestAssign?.assignedDate || '',
+          odometer_km: ft.odometerKm,
+          location_name: loc?.name || '',
+          location_code: loc?.code || '',
+          location_address: loc?.address || '',
+          kds_enabled: isLocationKdsEnabled(loc) ? 1 : 0,
+          total_sales: totalSales,
+          total_cogs: totalCogs,
+          total_expenses: totalExpenses,
+        };
+      });
+
+    const locations = snap.locations
+      .filter((l) => l.isActive !== false)
+      .sort((a, b) => String(a.type).localeCompare(String(b.type)) || String(a.name).localeCompare(String(b.name)))
+      .map((l) => {
+        const trk = trkByLocId.get(l.id);
+        return {
+          id: toLogicalId(l.id, uid),
+          code: l.code,
+          name: l.name,
+          type: l.type,
+          address: l.address || '',
+          is_active: l.isActive ? 1 : 0,
+          kds_enabled: isLocationKdsEnabled(l) ? 1 : 0,
+          truck_id: trk ? toLogicalId(trk.id, uid) : null,
+          plate_number: trk?.plateNumber || '',
+          make_model: trk?.makeModel || '',
+          status: trk?.status || 'ACTIVE',
+          current_site: trk?.currentSite || '',
+          odometer_km: trk?.odometerKm ?? 0,
+        };
+      });
+
+    const assignments = assignmentsDesc
+      .slice(0, 20)
+      .map((fl) => {
+        const trk = trkMap.get(fl.truckId);
+        return {
+          id: toLogicalId(fl.id, uid),
+          truck_id: toLogicalId(fl.truckId, uid),
+          location_id: trk?.locationId ? toLogicalId(trk.locationId, uid) : null,
+          site_name: fl.siteName,
+          assigned_date: fl.assignedDate,
+          shift_notes: fl.shiftNotes,
+          plate_number: trk?.plateNumber || '',
+          truck_name: (trk && locMap.get(trk.locationId)?.name) || '',
+        };
+      });
+
+    const fuelLogs = snap.fleetLogs
+      .filter((fl) => fl.logType === 'FUEL')
+      .sort((a, b) => String(b.assignedDate || '').localeCompare(String(a.assignedDate || '')))
+      .slice(0, 20)
+      .map((fl) => {
+        const trk = trkMap.get(fl.truckId);
+        return {
+          id: toLogicalId(fl.id, uid),
+          truck_id: toLogicalId(fl.truckId, uid),
+          location_id: trk?.locationId ? toLogicalId(trk.locationId, uid) : null,
+          liters: fl.liters,
+          total_cost: fl.totalCost,
+          odometer_km: fl.odometerKm,
+          fueled_at: fl.assignedDate,
+          plate_number: trk?.plateNumber || '',
+          truck_name: (trk && locMap.get(trk.locationId)?.name) || '',
+        };
+      });
+
+    const maintenanceLogs = snap.fleetLogs
+      .filter((fl) => fl.logType === 'MAINTENANCE')
+      .sort((a, b) => String(b.serviceDate || '').localeCompare(String(a.serviceDate || '')))
+      .slice(0, 20)
+      .map((fl) => {
+        const trk = trkMap.get(fl.truckId);
+        return {
+          id: toLogicalId(fl.id, uid),
+          truck_id: toLogicalId(fl.truckId, uid),
+          location_id: trk?.locationId ? toLogicalId(trk.locationId, uid) : null,
+          title: fl.title,
+          description: fl.description,
+          cost: fl.totalCost,
+          service_date: fl.serviceDate,
+          next_due_date: fl.nextDueDate,
+          plate_number: trk?.plateNumber || '',
+          truck_name: (trk && locMap.get(trk.locationId)?.name) || '',
+        };
+      });
+
+    return { trucks, locations, assignments, fuelLogs, maintenanceLogs } as T;
+  }
+
+  if (pathname === '/fleet/trucks' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.FLEET_MANAGE);
+    const { name, code, type, address, plateNumber, makeModel, currentSite, odometerKm, status, kdsEnabled } = body || {};
+    const cleanName = String(name || '').trim().slice(0, 140);
+    const locType = type === 'COMMISSARY' ? 'COMMISSARY' : 'FOOD_TRUCK';
+    const nextPrefix = locType === 'COMMISSARY' ? 'COM' : 'TRK';
+    const cleanCode = String(code || `${nextPrefix}-${Date.now().toString().slice(-3)}`).trim().slice(0, 40);
+    const cleanAddress = String(address || '').trim().slice(0, 240);
+    const nextKdsEnabled = kdsEnabled !== undefined ? Boolean(kdsEnabled) : locType === 'FOOD_TRUCK';
+
+    if (!cleanName) throw new Error('Truck / Location name is required');
+    if (!cleanCode) throw new Error('Location code is required');
+    if (snap.locations.some((l) => l.isActive !== false && String(l.code).toLowerCase() === cleanCode.toLowerCase())) {
+      throw new Error(`Location code "${cleanCode}" already exists`);
+    }
+
+    const locLogicalId = crypto.randomUUID();
+    const locDocId = toDocId(locLogicalId, uid);
+    const batch = writeBatch(db);
+    batch.set(doc(db, 'locations', locDocId), {
+      id: locDocId,
+      ownerUid: uid,
+      code: cleanCode,
+      name: cleanName,
+      type: locType,
+      address: cleanAddress || null,
+      isActive: true,
+      kdsEnabled: nextKdsEnabled,
+      createdAt: serverTimestamp(),
+    });
+
+    let trkLogicalId: string | null = null;
+    if (locType === 'FOOD_TRUCK') {
+      const cleanPlate = String(plateNumber || '').trim().slice(0, 32);
+      const cleanModel = String(makeModel || '').trim().slice(0, 140);
+      if (!cleanPlate) throw new Error('Plate number is required for a food truck');
+      if (!cleanModel) throw new Error('Make / Model is required for a food truck');
+      const cleanSite = String(currentSite || cleanAddress || '').trim().slice(0, 160);
+      const nextStatus = status === 'MAINTENANCE' || status === 'INACTIVE' ? status : 'ACTIVE';
+      const nextOdo = Math.max(0, Number(odometerKm || 0));
+
+      trkLogicalId = crypto.randomUUID();
+      const trkDocId = toDocId(trkLogicalId, uid);
+      batch.set(doc(db, 'food_trucks', trkDocId), {
+        id: trkDocId,
+        ownerUid: uid,
+        locationId: locDocId,
+        plateNumber: cleanPlate,
+        makeModel: cleanModel,
+        status: nextStatus,
+        currentSite: cleanSite || null,
+        odometerKm: nextOdo,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    try {
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `locations/${locDocId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'CREATE_LOCATION_TRUCK', 'Location', locLogicalId, {
+      code: cleanCode,
+      name: cleanName,
+      type: locType,
+    });
+    invalidateWorkspaceCache();
+    return { id: trkLogicalId || locLogicalId, locationId: locLogicalId } as T;
+  }
+
+  if (pathname.startsWith('/fleet/locations/') && method === 'PUT') {
+    assertPerm(user, PERMISSIONS.FLEET_MANAGE);
+    const rawId = pathname.split('/')[3];
+    const maybeDocId = toDocId(rawId, uid);
+    const existingLoc =
+      snap.locations.find((l) => l.id === maybeDocId) ||
+      (() => {
+        const trk = snap.foodTrucks.find((t) => t.id === maybeDocId);
+        return trk ? snap.locations.find((l) => l.id === trk.locationId) : undefined;
+      })();
+    if (!existingLoc) throw new Error('Location not found');
+
+    const { name, code, type, address, plateNumber, makeModel, currentSite, odometerKm, status, kdsEnabled } = body || {};
+    const cleanName = String(name ?? existingLoc.name).trim().slice(0, 140);
+    const cleanCode = String(code ?? existingLoc.code).trim().slice(0, 40);
+    const nextType = type === 'COMMISSARY' || type === 'FOOD_TRUCK' ? type : existingLoc.type;
+    const cleanAddress = address !== undefined ? String(address || '').trim().slice(0, 240) : existingLoc.address || '';
+    const nextKdsEnabled =
+      kdsEnabled !== undefined
+        ? Boolean(kdsEnabled)
+        : existingLoc.kdsEnabled !== undefined
+          ? Boolean(existingLoc.kdsEnabled)
+          : nextType === 'FOOD_TRUCK';
+
+    if (!cleanName) throw new Error('Truck / Location name is required');
+    if (!cleanCode) throw new Error('Location code is required');
+    if (
+      snap.locations.some(
+        (l) => l.id !== existingLoc.id && l.isActive !== false && String(l.code).toLowerCase() === cleanCode.toLowerCase(),
+      )
+    ) {
+      throw new Error(`Location code "${cleanCode}" already exists`);
+    }
+
+    const batch = writeBatch(db);
+    batch.update(doc(db, 'locations', existingLoc.id), {
+      code: cleanCode,
+      name: cleanName,
+      type: nextType,
+      address: cleanAddress || null,
+      isActive: existingLoc.isActive !== false,
+      kdsEnabled: nextKdsEnabled,
+    });
+
+    const existingTruck = snap.foodTrucks.find((t) => t.locationId === existingLoc.id);
+    if (nextType === 'FOOD_TRUCK') {
+      const cleanPlate = String(plateNumber ?? existingTruck?.plateNumber ?? '').trim().slice(0, 32);
+      const cleanModel = String(makeModel ?? existingTruck?.makeModel ?? '').trim().slice(0, 140);
+      if (!cleanPlate) throw new Error('Plate number is required for a food truck');
+      if (!cleanModel) throw new Error('Make / Model is required for a food truck');
+      const cleanSite =
+        currentSite !== undefined
+          ? String(currentSite || '').trim().slice(0, 160)
+          : String(existingTruck?.currentSite || cleanAddress || '').trim().slice(0, 160);
+      const nextStatus =
+        status === 'ACTIVE' || status === 'MAINTENANCE' || status === 'INACTIVE'
+          ? status
+          : existingTruck?.status || 'ACTIVE';
+      const nextOdo = Math.max(0, Number(odometerKm !== undefined ? odometerKm : existingTruck?.odometerKm || 0));
+
+      if (existingTruck) {
+        batch.update(doc(db, 'food_trucks', existingTruck.id), {
+          plateNumber: cleanPlate,
+          makeModel: cleanModel,
+          status: nextStatus,
+          currentSite: cleanSite || null,
+          odometerKm: nextOdo,
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        const trkDocId = toDocId(crypto.randomUUID(), uid);
+        batch.set(doc(db, 'food_trucks', trkDocId), {
+          id: trkDocId,
+          ownerUid: uid,
+          locationId: existingLoc.id,
+          plateNumber: cleanPlate,
+          makeModel: cleanModel,
+          status: nextStatus,
+          currentSite: cleanSite || null,
+          odometerKm: nextOdo,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+    }
+
+    try {
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `locations/${existingLoc.id}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_LOCATION_TRUCK', 'Location', toLogicalId(existingLoc.id, uid), {
+      code: cleanCode,
+      name: cleanName,
+      type: nextType,
+      kdsEnabled: nextKdsEnabled,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if (pathname.startsWith('/fleet/locations/') && pathname.endsWith('/kds') && method === 'PATCH') {
+    assertPerm(user, PERMISSIONS.FLEET_MANAGE);
+    const rawId = pathname.split('/')[3];
+    const maybeDocId = toDocId(rawId, uid);
+    const existingLoc =
+      snap.locations.find((l) => l.id === maybeDocId) ||
+      (() => {
+        const trk = snap.foodTrucks.find((t) => t.id === maybeDocId);
+        return trk ? snap.locations.find((l) => l.id === trk.locationId) : undefined;
+      })();
+    if (!existingLoc) throw new Error('Location not found');
+
+    const nextKdsEnabled = Boolean(body?.kdsEnabled);
+    try {
+      await updateDoc(doc(db, 'locations', existingLoc.id), {
+        kdsEnabled: nextKdsEnabled,
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `locations/${existingLoc.id}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'TOGGLE_LOCATION_KDS', 'Location', toLogicalId(existingLoc.id, uid), {
+      name: existingLoc.name,
+      kdsEnabled: nextKdsEnabled,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true, id: toLogicalId(existingLoc.id, uid), kds_enabled: nextKdsEnabled ? 1 : 0 } as T;
+  }
+
+  if (pathname.startsWith('/fleet/locations/') && method === 'DELETE') {
+    assertPerm(user, PERMISSIONS.FLEET_MANAGE);
+    const rawId = pathname.split('/')[3];
+    const maybeDocId = toDocId(rawId, uid);
+    const existingLoc =
+      snap.locations.find((l) => l.id === maybeDocId) ||
+      (() => {
+        const trk = snap.foodTrucks.find((t) => t.id === maybeDocId);
+        return trk ? snap.locations.find((l) => l.id === trk.locationId) : undefined;
+      })();
+    if (!existingLoc) throw new Error('Location not found');
+
+    const activeLocations = snap.locations.filter((l) => l.isActive !== false);
+    if (activeLocations.length <= 1 && existingLoc.isActive !== false) {
+      throw new Error('Cannot delete the last active location');
+    }
+
+    const existingTruck = snap.foodTrucks.find((t) => t.locationId === existingLoc.id);
+    const hasFleetLogs = existingTruck ? snap.fleetLogs.some((fl) => fl.truckId === existingTruck.id) : false;
+    const hasHistory =
+      hasFleetLogs ||
+      snap.sales.some((s) => s.locationId === existingLoc.id) ||
+      snap.expenses.some((e) => e.locationId === existingLoc.id) ||
+      snap.stockBatches.some((b) => b.locationId === existingLoc.id) ||
+      snap.inventoryTxns.some((t) => t.locationId === existingLoc.id) ||
+      snap.purchaseOrders.some((p) => p.locationId === existingLoc.id) ||
+      snap.dailyClosings.some((d) => d.locationId === existingLoc.id) ||
+      snap.stockTransfers.some((t) => t.fromLocationId === existingLoc.id || t.toLocationId === existingLoc.id);
+
+    const batch = writeBatch(db);
+    if (hasHistory) {
+      batch.update(doc(db, 'locations', existingLoc.id), {
+        isActive: false,
+      });
+      if (existingTruck && !hasFleetLogs) {
+        batch.delete(doc(db, 'food_trucks', existingTruck.id));
+      } else if (existingTruck) {
+        batch.update(doc(db, 'food_trucks', existingTruck.id), {
+          status: 'INACTIVE',
+          updatedAt: serverTimestamp(),
+        });
+      }
+    } else {
+      if (existingTruck) {
+        batch.delete(doc(db, 'food_trucks', existingTruck.id));
+      }
+      batch.delete(doc(db, 'locations', existingLoc.id));
+    }
+
+    try {
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, hasHistory ? OperationType.UPDATE : OperationType.DELETE, `locations/${existingLoc.id}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'DELETE_LOCATION_TRUCK', 'Location', toLogicalId(existingLoc.id, uid), {
+      code: existingLoc.code,
+      name: existingLoc.name,
+      archived: hasHistory,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true, archived: hasHistory } as T;
+  }
+
+  if (pathname === '/fleet/assignments' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.FLEET_MANAGE);
+    const { truckId, siteName, assignedDate, shiftNotes } = body || {};
+    const trkDocId = toDocId(truckId, uid);
+    const logId = toDocId(crypto.randomUUID(), uid);
+    const batch = writeBatch(db);
+    batch.set(doc(db, 'fleet_logs', logId), {
+      id: logId,
+      ownerUid: uid,
+      logType: 'ASSIGNMENT',
+      truckId: trkDocId,
+      siteName: String(siteName || ''),
+      assignedDate: assignedDate || new Date().toISOString().slice(0, 10),
+      shiftNotes: shiftNotes || '',
+      liters: null,
+      totalCost: null,
+      odometerKm: null,
+      title: null,
+      description: null,
+      serviceDate: null,
+      nextDueDate: null,
+      createdAt: serverTimestamp(),
+    });
+    batch.update(doc(db, 'food_trucks', trkDocId), {
+      currentSite: String(siteName || ''),
+      updatedAt: serverTimestamp(),
+    });
+    try {
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, 'fleet_assignments');
+    }
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if (pathname === '/fleet/fuel' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.FLEET_MANAGE);
+    const { truckId, liters, totalCost, odometerKm } = body || {};
+    const trkDocId = toDocId(truckId, uid);
+    const trk = snap.foodTrucks.find((t) => t.id === trkDocId);
+    if (!trk) throw new Error('Food truck not found');
+    const cost = round2(Number(totalCost));
+    const nowIso = new Date().toISOString();
+    const expId = toDocId(crypto.randomUUID(), uid);
+    const logId = toDocId(crypto.randomUUID(), uid);
+
+    const batch = writeBatch(db);
+    if (cost > 0) {
+      batch.set(doc(db, 'expenses', expId), {
+        id: expId,
+        ownerUid: uid,
+        locationId: trk.locationId,
+        accountId: toDocId('acc_6100', uid),
+        category: 'FUEL',
+        amount: cost,
+        description: `Fuel log (${liters}L @ ${odometerKm}km)`,
+        isRecurring: false,
+        paidFromPettyCash: false,
+        expenseDate: nowIso,
+        createdAt: serverTimestamp(),
+      });
+    }
+    batch.set(doc(db, 'fleet_logs', logId), {
+      id: logId,
+      ownerUid: uid,
+      logType: 'FUEL',
+      truckId: trkDocId,
+      siteName: null,
+      assignedDate: nowIso,
+      shiftNotes: null,
+      liters: Number(liters),
+      totalCost: cost,
+      odometerKm: Number(odometerKm || 0),
+      title: null,
+      description: null,
+      serviceDate: null,
+      nextDueDate: null,
+      createdAt: serverTimestamp(),
+    });
+    if (odometerKm) {
+      batch.update(doc(db, 'food_trucks', trkDocId), {
+        odometerKm: Number(odometerKm),
+        updatedAt: serverTimestamp(),
+      });
+    }
+    try {
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, 'fleet_fuel');
+    }
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  // 9. HR & PAYROLL
+  if (pathname === '/hr' && method === 'GET') {
+    assertPerm(user, PERMISSIONS.HR_MANAGE);
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const empMap = new Map(snap.employees.map((e) => [e.id, e]));
+
+    const employees = [...snap.employees]
+      .sort((a, b) => String(a.employeeCode).localeCompare(String(b.employeeCode)))
+      .map((e) => ({
+        id: toLogicalId(e.id, uid),
+        employee_code: e.employeeCode,
+        full_name: e.fullName,
+        department: e.department,
+        position: e.position,
+        location_id: e.locationId ? toLogicalId(e.locationId, uid) : null,
+        location_name: e.locationId ? locMap.get(e.locationId)?.name || '' : '',
+        pay_type: e.payType,
+        base_rate: e.baseRate,
+        avatar_url: e.avatarUrl || null,
+        is_active: e.isActive ? 1 : 0,
+      }));
+
+    const attendance = [...snap.attendanceLogs]
+      .sort((a, b) => String(b.clockIn).localeCompare(String(a.clockIn)))
+      .slice(0, 40)
+      .map((a) => {
+        const emp = empMap.get(a.employeeId);
+        return {
+          id: toLogicalId(a.id, uid),
+          employee_id: toLogicalId(a.employeeId, uid),
+          clock_in: a.clockIn,
+          clock_out: a.clockOut,
+          overtime_hours: a.overtimeHours,
+          status: a.status,
+          full_name: emp?.fullName || '',
+          employee_code: emp?.employeeCode || '',
+          location_id: emp?.locationId ? toLogicalId(emp.locationId, uid) : null,
+          location_name: emp?.locationId ? locMap.get(emp.locationId)?.name || '' : '',
+        };
+      });
+
+    const payrollRuns = [...snap.payrollRuns]
+      .sort((a, b) => tsToIso(b.createdAt).localeCompare(tsToIso(a.createdAt)))
+      .slice(0, 10)
+      .map((pr) => ({
+        id: toLogicalId(pr.id, uid),
+        period_start: pr.periodStart,
+        period_end: pr.periodEnd,
+        status: pr.status,
+        total_gross: pr.totalGross,
+        total_deductions: pr.totalDeductions,
+        total_net: pr.totalNet,
+        created_at: tsToIso(pr.createdAt),
+        items: (pr.items || []).map((pi: any) => {
+          const emp = empMap.get(pi.employeeId);
+          return {
+            ...pi,
+            full_name: emp?.fullName || pi.full_name || '',
+            employee_code: emp?.employeeCode || pi.employee_code || '',
+            location_id: emp?.locationId ? toLogicalId(emp.locationId, uid) : null,
+          };
+        }),
+      }));
+
+    return { employees, attendance, payrollRules: snap.meta?.payrollRule || null, payrollRuns } as T;
+  }
+
+  if (pathname === '/hr/attendance/clock' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.HR_MANAGE);
+    const { employeeId, action, overtimeHours } = body || {};
+    const empDocId = toDocId(employeeId, uid);
+    if (action === 'CLOCK_IN') {
+      const id = toDocId(crypto.randomUUID(), uid);
+      try {
+        await setDoc(doc(db, 'attendance_logs', id), {
+          id,
+          ownerUid: uid,
+          employeeId: empDocId,
+          clockIn: new Date().toISOString(),
+          clockOut: null,
+          overtimeHours: 0,
+          status: 'PRESENT',
+          notes: null,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.CREATE, `attendance_logs/${id}`);
+      }
+      invalidateWorkspaceCache();
+      return { id: toLogicalId(id, uid) } as T;
+    }
+
+    const openLog = [...snap.attendanceLogs]
+      .filter((a) => a.employeeId === empDocId && !a.clockOut)
+      .sort((a, b) => String(b.clockIn).localeCompare(String(a.clockIn)))[0];
+    if (!openLog) throw new Error('No active clock-in found for employee');
+    try {
+      await updateDoc(doc(db, 'attendance_logs', openLog.id), {
+        clockOut: new Date().toISOString(),
+        overtimeHours: Number(overtimeHours || 0),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `attendance_logs/${openLog.id}`);
+    }
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if (pathname === '/hr/payroll-rules' && method === 'PUT') {
+    assertPerm(user, PERMISSIONS.PAYROLL_RUN);
+    const nextRule = { ...(snap.meta?.payrollRule || {}), config: body.config };
+    try {
+      await updateDoc(doc(db, 'workspace_meta', `ws_${uid}`), {
+        payrollRule: nextRule,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `workspace_meta/ws_${uid}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_PAYROLL_RULES', 'PayrollRule', 'PH_STATUTORY_2026');
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if (pathname === '/hr/payroll/run' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.PAYROLL_RUN);
+    const { periodStart, periodEnd, daysPerEmployee } = body || {};
+    const cfg = snap.meta?.payrollRule?.config || {};
+    const activeEmployees = snap.employees.filter((e) => e.isActive);
+    const runId = toDocId(crypto.randomUUID(), uid);
+    let totalGross = 0;
+    let totalDed = 0;
+    let totalNet = 0;
+    const items: any[] = [];
+
+    for (const emp of activeEmployees) {
+      const days = Number(daysPerEmployee ?? 13);
+      const otHours = snap.attendanceLogs
+        .filter((a) => a.employeeId === emp.id)
+        .reduce((s, a) => s + Number(a.overtimeHours || 0), 0);
+      const dailyRate = emp.payType === 'MONTHLY' ? Number(emp.baseRate) / 26 : Number(emp.baseRate);
+      const hourlyRate = dailyRate / 8;
+      const otPay = round2(otHours * hourlyRate * (cfg.overtimeMultiplier || 1.25));
+      const gross = round2(days * dailyRate + otPay);
+      const sss = round2(gross * ((cfg.sssEmployeeRatePct || 4.5) / 100));
+      const phic = round2(gross * ((cfg.philhealthEmployeeRatePct || 2.5) / 100));
+      const pagibig = round2((cfg.pagibigFixedEmployeePhp || 200) / 2);
+      const semiMonthlyCeiling = (cfg.taxExemptMonthlyCeilingPhp || 20833) / 2;
+      const taxableExcess = Math.max(0, gross - (sss + phic + pagibig) - semiMonthlyCeiling);
+      const tax = round2(taxableExcess * ((cfg.withholdingRateAboveCeilingPct || 15) / 100));
+      const ded = round2(sss + phic + pagibig + tax);
+      const net = round2(gross - ded);
+
+      totalGross += gross;
+      totalDed += ded;
+      totalNet += net;
+      items.push({
+        id: crypto.randomUUID(),
+        employeeId: emp.id,
+        days_worked: days,
+        overtime_pay: otPay,
+        gross_pay: gross,
+        sss_deduction: sss,
+        philhealth_deduction: phic,
+        pagibig_deduction: pagibig,
+        tax_deduction: tax,
+        net_pay: net,
+      });
+    }
+
+    const batch = writeBatch(db);
+    batch.set(doc(db, 'payroll_runs', runId), {
+      id: runId,
+      ownerUid: uid,
+      periodStart: String(periodStart),
+      periodEnd: String(periodEnd),
+      status: 'APPROVED',
+      totalGross: round2(totalGross),
+      totalDeductions: round2(totalDed),
+      totalNet: round2(totalNet),
+      items,
+      createdAt: serverTimestamp(),
+    });
+
+    const jeId = toDocId(crypto.randomUUID(), uid);
+    const lines: any[] = [
+      { id: crypto.randomUUID(), accountId: toDocId('acc_6300', uid), debit: round2(totalGross), credit: 0, memo: 'Salaries & Wages' },
+      { id: crypto.randomUUID(), accountId: toDocId('acc_1010', uid), debit: 0, credit: round2(totalNet), memo: 'Net Payroll Disbursement' },
+    ];
+    if (totalDed > 0) {
+      lines.push({ id: crypto.randomUUID(), accountId: toDocId('acc_2000', uid), debit: 0, credit: round2(totalDed), memo: 'Statutory & Tax Remittances Payable' });
+    }
+    batch.set(doc(db, 'journal_entries', jeId), {
+      id: jeId,
+      ownerUid: uid,
+      entryNumber: `JE-PAY-${Date.now().toString().slice(-6)}`,
+      entryDate: new Date().toISOString(),
+      description: `Payroll ${periodStart} to ${periodEnd}`,
+      referenceType: 'PAYROLL',
+      referenceId: runId,
+      isReversed: false,
+      lines,
+      createdAt: serverTimestamp(),
+    });
+
+    try {
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `payroll_runs/${runId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'RUN_PAYROLL', 'PayrollRun', toLogicalId(runId, uid), { totalGross: round2(totalGross), totalNet: round2(totalNet) });
+    invalidateWorkspaceCache();
+    return { runId: toLogicalId(runId, uid), totalGross: round2(totalGross), totalNet: round2(totalNet) } as T;
+  }
+
+  // 10. CRM, REPORTS & GOVERNANCE
+  if (pathname === '/crm/customers' && method === 'GET') {
+    assertPerm(user, PERMISSIONS.CRM_MANAGE);
+    const rawLoc = (qs.get('locationId') || '').trim();
+    const locFilter = rawLoc && rawLoc !== 'ALL' ? toDocId(rawLoc, uid) : '';
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const rows = snap.customers
+      .filter((c) => !locFilter || c.locationId === locFilter)
+      .map((c) => {
+        const custSales = snap.sales.filter((s) => s.customerId === c.id && s.status === 'COMPLETED');
+        const lifetimeSpend = round2(custSales.reduce((sum, s) => sum + Number(s.totalAmount || 0), 0));
+        const regRaw = String(c.registeredAt || tsToIso(c.createdAt) || '').slice(0, 10);
+        return {
+          id: toLogicalId(c.id, uid),
+          full_name: c.fullName,
+          phone: c.phone,
+          email: c.email,
+          loyalty_points: c.loyaltyPoints,
+          tier: c.tier,
+          preferences: c.preferences,
+          registered_at: regRaw,
+          location_id: c.locationId ? toLogicalId(c.locationId, uid) : null,
+          location_name: c.locationId ? locMap.get(c.locationId)?.name || '' : '',
+          total_orders: custSales.length,
+          lifetime_spend: lifetimeSpend,
+        };
+      })
+      .sort((a, b) => b.lifetime_spend - a.lifetime_spend);
+    return rows as T;
+  }
+
+  if (pathname === '/crm/customers' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.CRM_MANAGE);
+    const { fullName, phone, email, preferences, registeredAt, locationId } = body || {};
+    const cleanName = String(fullName || '').trim();
+    if (!cleanName) throw new Error('Customer full name is required');
+
+    const cleanRegisteredAt = String(registeredAt || '').trim().slice(0, 40) || new Date().toISOString().slice(0, 10);
+    const cleanLocId = locationId && String(locationId).trim() && String(locationId).trim() !== 'ALL'
+      ? toDocId(String(locationId).trim(), uid)
+      : null;
+
+    const logicalId = crypto.randomUUID();
+    const docId = toDocId(logicalId, uid);
+    try {
+      await setDoc(doc(db, 'customers', docId), {
+        id: docId,
+        ownerUid: uid,
+        fullName: cleanName,
+        phone: phone ? String(phone).trim().slice(0, 40) : null,
+        email: email ? String(email).trim().slice(0, 160) : null,
+        loyaltyPoints: 0,
+        tier: 'STANDARD',
+        preferences: preferences ? String(preferences).trim().slice(0, 300) : '',
+        feedbackNotes: null,
+        registeredAt: cleanRegisteredAt,
+        locationId: cleanLocId,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `customers/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'CREATE_CUSTOMER', 'Customer', logicalId, {
+      fullName: cleanName,
+      registeredAt: cleanRegisteredAt,
+      locationId: cleanLocId ? toLogicalId(cleanLocId, uid) : null,
+    });
+    invalidateWorkspaceCache();
+    return {
+      id: logicalId,
+      registered_at: cleanRegisteredAt,
+      location_id: cleanLocId ? toLogicalId(cleanLocId, uid) : null,
+    } as T;
+  }
+
+  if (pathname.startsWith('/reports/') && method === 'GET') {
+    assertPerm(user, PERMISSIONS.REPORTS_VIEW);
+    const type = pathname.split('/')[2];
+    const from = (qs.get('from') || '').trim().slice(0, 10);
+    const to = (qs.get('to') || '').trim().slice(0, 10);
+    const rawLoc = (qs.get('locationId') || '').trim();
+    const locFilter = rawLoc && rawLoc !== 'ALL' ? toDocId(rawLoc, uid) : '';
+    const inRange = (isoDate: string) => {
+      const d = String(isoDate || '').slice(0, 10);
+      if (from && d < from) return false;
+      if (to && d > to) return false;
+      return true;
+    };
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const itemMap = new Map(snap.inventoryItems.map((i) => [i.id, i]));
+
+    if (type === 'sales') {
+      return snap.sales
+        .filter((s) => (!locFilter || s.locationId === locFilter) && inRange(s.soldAt))
+        .sort((a, b) => String(b.soldAt).localeCompare(String(a.soldAt)))
+        .map((s) => ({
+          receipt_number: s.receiptNumber,
+          sold_at: String(s.soldAt).slice(0, 19),
+          truck: locMap.get(s.locationId)?.name || '',
+          channel: s.channel,
+          status: s.status,
+          subtotal: s.subtotal,
+          tax_amount: s.taxAmount,
+          total_amount: s.totalAmount,
+          total_cogs: s.totalCogs,
+          gross_profit: round2(Number(s.totalAmount) - Number(s.totalCogs)),
+        })) as T;
+    }
+    if (type === 'inventory') {
+      return snap.inventoryItems
+        .map((i) => {
+          const batches = snap.stockBatches.filter(
+            (b) => b.inventoryItemId === i.id && (!locFilter || b.locationId === locFilter) && inRange(b.receivedAt),
+          );
+          if ((locFilter || from || to) && batches.length === 0) return null;
+          return {
+            sku: i.sku,
+            name: i.name,
+            location: locFilter ? locMap.get(locFilter)?.name || '' : 'All Branches',
+            uom: i.uomCode,
+            costing_method: i.costingMethod,
+            reorder_point: i.reorderPoint,
+            on_hand: round2(batches.reduce((s, b) => s + Number(b.remainingQty || 0), 0)),
+            total_value: round2(batches.reduce((s, b) => s + Number(b.remainingQty || 0) * Number(b.unitCost || 0), 0)),
+          };
+        })
+        .filter(Boolean) as T;
+    }
+    if (type === 'expenses') {
+      return snap.expenses
+        .filter((e) => (!locFilter || e.locationId === locFilter) && inRange(e.expenseDate))
+        .sort((a, b) => String(b.expenseDate).localeCompare(String(a.expenseDate)))
+        .map((e) => ({
+          date: String(e.expenseDate).slice(0, 10),
+          location: locMap.get(e.locationId)?.name || '',
+          category: e.category,
+          description: e.description,
+          amount: e.amount,
+        })) as T;
+    }
+    if (type === 'waste') {
+      return snap.inventoryTxns
+        .filter(
+          (t) =>
+            ['OUT_WASTE', 'OUT_SPOILAGE'].includes(t.txnType) &&
+            (!locFilter || t.locationId === locFilter) &&
+            inRange(t.txnDate || tsToIso(t.createdAt)),
+        )
+        .sort((a, b) => String(b.txnDate || tsToIso(b.createdAt)).localeCompare(String(a.txnDate || tsToIso(a.createdAt))))
+        .map((t) => ({
+          date: String(t.txnDate || tsToIso(t.createdAt)).slice(0, 19),
+          location: locMap.get(t.locationId)?.name || '',
+          ingredient: itemMap.get(t.inventoryItemId)?.name || '',
+          qty: Math.abs(Number(t.quantityDelta || 0)),
+          uom: itemMap.get(t.inventoryItemId)?.uomCode || '',
+          cost_php: t.totalCost,
+          reason: t.notes || '',
+        })) as T;
+    }
+    return [] as T;
+  }
+
+  if (pathname === '/admin/governance' && method === 'GET') {
+    assertPerm(user, PERMISSIONS.DASHBOARD_VIEW);
+    const from = (qs.get('from') || '').trim().slice(0, 10);
+    const to = (qs.get('to') || '').trim().slice(0, 10);
+    const rawLoc = (qs.get('locationId') || '').trim();
+    const locFilter = rawLoc && rawLoc !== 'ALL' ? toDocId(rawLoc, uid) : '';
+    const inDateRange = (isoDate: string) => {
+      const d = String(isoDate || '').slice(0, 10);
+      if (from && d < from) return false;
+      if (to && d > to) return false;
+      return true;
+    };
+
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const erpUserByDocId = new Map(snap.erpUsers.map((u) => [u.id, u]));
+
+    const resolveAuditLocations = (l: any): string[] => {
+      const entityDocId = toDocId(String(l.entityId || ''), uid);
+      const entityType = String(l.entityType || '');
+      if (entityType === 'Sale') {
+        const sale = snap.sales.find((s) => s.id === entityDocId);
+        if (sale?.locationId) return [sale.locationId];
+      }
+      if (entityType === 'Expense') {
+        const exp = snap.expenses.find((e) => e.id === entityDocId);
+        if (exp?.locationId) return [exp.locationId];
+      }
+      if (entityType === 'DailyClosing') {
+        const dc = snap.dailyClosings.find((c) => c.id === entityDocId);
+        if (dc?.locationId) return [dc.locationId];
+      }
+      if (entityType === 'PurchaseOrder') {
+        const po = snap.purchaseOrders.find((p) => p.id === entityDocId);
+        if (po?.locationId) return [po.locationId];
+      }
+      if (entityType === 'GoodsReceipt') {
+        const grn = snap.goodsReceipts.find((g) => g.id === entityDocId);
+        const po = grn ? snap.purchaseOrders.find((p) => p.id === grn.purchaseOrderId) : null;
+        if (po?.locationId) return [po.locationId];
+      }
+      if (entityType === 'StockTransfer') {
+        const trf = snap.stockTransfers.find((t) => t.id === entityDocId);
+        const locs = [trf?.fromLocationId, trf?.toLocationId].filter(Boolean) as string[];
+        if (locs.length > 0) return Array.from(new Set(locs));
+      }
+      if (entityType === 'Employee') {
+        const emp = snap.employees.find((e) => e.id === entityDocId);
+        if (emp?.locationId) return [emp.locationId];
+      }
+      if (entityType === 'User') {
+        const targetUser = snap.erpUsers.find((u) => u.id === entityDocId);
+        if (targetUser?.assignedLocationId) return [targetUser.assignedLocationId];
+      }
+      if (l.details) {
+        const detailStr = String(l.details);
+        const locMatch = detailStr.match(/locationId:\s*([a-zA-Z0-9_\-]+)/);
+        if (locMatch?.[1]) return [toDocId(locMatch[1], uid)];
+      }
+      if (entityType === 'InventoryItem') {
+        const logMinute = String(l.loggedAt || tsToIso(l.createdAt)).slice(0, 16);
+        const txn = snap.inventoryTxns.find(
+          (t) =>
+            t.inventoryItemId === entityDocId &&
+            String(t.txnDate || tsToIso(t.createdAt)).slice(0, 16) === logMinute,
+        );
+        if (txn?.locationId) return [txn.locationId];
+      }
+      if (l.userId) {
+        const actor = erpUserByDocId.get(toDocId(String(l.userId), uid));
+        if (actor?.assignedLocationId) return [actor.assignedLocationId];
+      }
+      return [];
+    };
+
+    const filteredLogs = snap.auditLogs
+      .map((l) => {
+        const locIds = resolveAuditLocations(l);
+        return { raw: l, locIds };
+      })
+      .filter(({ raw, locIds }) => {
+        if (!inDateRange(raw.loggedAt || tsToIso(raw.createdAt))) return false;
+        if (locFilter && !locIds.includes(locFilter)) return false;
+        return true;
+      })
+      .sort((a, b) =>
+        String(b.raw.loggedAt || tsToIso(b.raw.createdAt)).localeCompare(String(a.raw.loggedAt || tsToIso(a.raw.createdAt))),
+      );
+
+    const activeUserDocIdsInLogs = new Set(
+      filteredLogs
+        .map(({ raw }) => (raw.userId ? toDocId(String(raw.userId), uid) : ''))
+        .filter(Boolean),
+    );
+
+    const logCountByRoleId = new Map<string, number>();
+    for (const { raw } of filteredLogs) {
+      const actor = raw.userId ? erpUserByDocId.get(toDocId(String(raw.userId), uid)) : null;
+      const roleId = actor?.roleId;
+      if (roleId) {
+        logCountByRoleId.set(roleId, (logCountByRoleId.get(roleId) || 0) + 1);
+      }
+      if (raw.entityType === 'User' && raw.entityId) {
+        const target = erpUserByDocId.get(toDocId(String(raw.entityId), uid));
+        if (target?.roleId && target.roleId !== roleId) {
+          logCountByRoleId.set(target.roleId, (logCountByRoleId.get(target.roleId) || 0) + 1);
+        }
+      }
+    }
+
+    const allRoles = [...(snap.meta?.roles || [])].sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)));
+    const roles = allRoles
+      .map((r: any) => {
+        const assignedUsers = snap.erpUsers
+          .filter((u) => {
+            if (u.roleId !== r.id) return false;
+            if (locFilter && u.assignedLocationId !== locFilter) return false;
+            if (from || to) {
+              return inDateRange(tsToIso(u.createdAt)) || activeUserDocIdsInLogs.has(u.id);
+            }
+            return true;
+          })
+          .map((u) => ({
+            id: toLogicalId(u.id, uid),
+            full_name: u.fullName,
+            email: u.email,
+            is_active: u.isActive ? 1 : 0,
+            location_name: u.assignedLocationId ? locMap.get(u.assignedLocationId)?.name || 'Branch' : 'HQ / All Branches',
+          }));
+        const activityCount = logCountByRoleId.get(r.id) || 0;
+        return {
+          ...r,
+          assigned_users: assignedUsers,
+          activity_count: activityCount,
+        };
+      })
+      .filter((r: any) => (!locFilter && !from && !to) || r.assigned_users.length > 0 || r.activity_count > 0);
+
+    const auditLogs = filteredLogs.slice(0, from || to || locFilter ? 200 : 100).map(({ raw: l, locIds }) => ({
+      id: toLogicalId(l.id, uid),
+      user_id: l.userId,
+      user_name: l.userName,
+      action: l.action,
+      entity_type: l.entityType,
+      entity_id: l.entityId,
+      location_name: locIds.length > 0 ? locIds.map((id) => locMap.get(id)?.name || id).join(', ') : 'HQ / Global',
+      details: l.details,
+      created_at: l.loggedAt || tsToIso(l.createdAt),
+    }));
+    return { roles, auditLogs } as T;
+  }
+
+  // 11. USER CONTROL SETTINGS (OWNER & SUPER_ADMIN ONLY)
+  if (pathname === '/settings/users-control' && method === 'GET') {
+    assertOwnerOrSuperAdmin(user);
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const users = [...snap.erpUsers]
+      .sort((a, b) => Number(b.isActive) - Number(a.isActive) || String(a.fullName).localeCompare(String(b.fullName)))
+      .map((u) => ({
+        id: toLogicalId(u.id, uid),
+        email: u.email,
+        full_name: u.fullName,
+        role_id: u.roleId,
+        assigned_location_id: u.assignedLocationId ? toLogicalId(u.assignedLocationId, uid) : null,
+        avatar_url: u.avatarUrl || null,
+        is_active: u.isActive ? 1 : 0,
+        created_at: tsToIso(u.createdAt),
+        role_code: u.roleCode,
+        role_name: u.roleName,
+        location_name: u.assignedLocationId ? locMap.get(u.assignedLocationId)?.name || null : null,
+      }));
+
+    const employees = [...snap.employees]
+      .sort((a, b) => Number(b.isActive) - Number(a.isActive) || String(a.employeeCode).localeCompare(String(b.employeeCode)))
+      .map((e) => ({
+        id: toLogicalId(e.id, uid),
+        employee_code: e.employeeCode,
+        full_name: e.fullName,
+        department: e.department,
+        position: e.position,
+        location_id: e.locationId ? toLogicalId(e.locationId, uid) : null,
+        pay_type: e.payType,
+        base_rate: e.baseRate,
+        avatar_url: e.avatarUrl || null,
+        is_active: e.isActive ? 1 : 0,
+        location_name: e.locationId ? locMap.get(e.locationId)?.name || null : null,
+      }));
+
+    const roles = [...(snap.meta?.roles || [])].sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)));
+    const locations = snap.locations
+      .filter((l) => l.isActive)
+      .sort((a, b) => String(a.type).localeCompare(String(b.type)) || String(a.name).localeCompare(String(b.name)))
+      .map((l) => ({ id: toLogicalId(l.id, uid), code: l.code, name: l.name, type: l.type }));
+
+    return { users, employees, roles, locations } as T;
+  }
+
+  if (pathname === '/settings/users' && method === 'POST') {
+    assertOwnerOrSuperAdmin(user);
+    const { email, password, fullName, roleId, assignedLocationId, avatarUrl, isActive } = body || {};
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    const cleanName = String(fullName || '').trim();
+    if (!cleanEmail) throw new Error('Email is required');
+    if (!cleanName) throw new Error('Full name is required');
+    if (!password || String(password).length < 6) throw new Error('Password must be at least 6 characters');
+    if (!roleId) throw new Error('Role is required');
+    if (snap.erpUsers.some((u) => String(u.email).toLowerCase() === cleanEmail)) {
+      throw new Error(`A user with email "${cleanEmail}" already exists`);
+    }
+    const roleRow = (snap.meta?.roles || []).find((r: any) => r.id === roleId);
+    if (!roleRow) throw new Error('Selected role does not exist');
+
+    const logicalId = crypto.randomUUID();
+    const docId = toDocId(logicalId, uid);
+    const pwdHash = await hashPassword(String(password));
+
+    try {
+      await setDoc(doc(db, 'erp_users', docId), {
+        id: docId,
+        ownerUid: uid,
+        email: cleanEmail,
+        fullName: cleanName,
+        roleId: roleRow.id,
+        roleCode: roleRow.code,
+        roleName: roleRow.name,
+        assignedLocationId: assignedLocationId ? toDocId(String(assignedLocationId), uid) : null,
+        avatarUrl: avatarUrl || null,
+        passwordHash: pwdHash,
+        isActive: isActive !== false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `erp_users/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'CREATE_USER', 'User', logicalId, { email: cleanEmail, fullName: cleanName, roleCode: roleRow.code });
+    invalidateWorkspaceCache();
+    return { id: logicalId } as T;
+  }
+
+  if (pathname.startsWith('/settings/users/') && method === 'PUT') {
+    assertOwnerOrSuperAdmin(user);
+    const targetId = pathname.split('/')[3];
+    const docId = toDocId(targetId, uid);
+    const existing = snap.erpUsers.find((u) => u.id === docId);
+    if (!existing) throw new Error('User not found');
+
+    const { email, password, fullName, roleId, assignedLocationId, avatarUrl, isActive } = body || {};
+    const cleanEmail = String(email ?? existing.email).trim().toLowerCase();
+    const cleanName = String(fullName ?? existing.fullName).trim();
+    const nextRoleId = roleId || existing.roleId;
+    const nextActive = isActive === undefined ? Boolean(existing.isActive) : Boolean(isActive);
+
+    if (!cleanEmail) throw new Error('Email is required');
+    if (!cleanName) throw new Error('Full name is required');
+    if (snap.erpUsers.some((u) => String(u.email).toLowerCase() === cleanEmail && u.id !== docId)) {
+      throw new Error(`Email "${cleanEmail}" is already used by another account`);
+    }
+    const nextRole = (snap.meta?.roles || []).find((r: any) => r.id === nextRoleId);
+    if (!nextRole) throw new Error('Selected role does not exist');
+
+    if (targetId === user.id) {
+      if (!nextActive) throw new Error('You cannot deactivate your own active session account');
+      if (nextRole.code !== 'SUPER_ADMIN' && nextRole.code !== 'BUSINESS_OWNER') {
+        throw new Error('You cannot remove your own Owner/Super Admin access while signed in');
+      }
+    }
+
+    const nextAvatar = avatarUrl !== undefined ? (avatarUrl ? String(avatarUrl) : null) : existing.avatarUrl ?? null;
+    const updatePayload: Record<string, unknown> = {
+      email: cleanEmail,
+      fullName: cleanName,
+      roleId: nextRole.id,
+      roleCode: nextRole.code,
+      roleName: nextRole.name,
+      assignedLocationId: assignedLocationId ? toDocId(String(assignedLocationId), uid) : null,
+      avatarUrl: nextAvatar,
+      isActive: nextActive,
+      updatedAt: serverTimestamp(),
+    };
+
+    if (password && String(password).trim().length > 0) {
+      if (String(password).length < 6) throw new Error('New password must be at least 6 characters');
+      updatePayload.passwordHash = await hashPassword(String(password));
+    }
+
+    try {
+      await updateDoc(doc(db, 'erp_users', docId), updatePayload);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `erp_users/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_USER', 'User', targetId, { email: cleanEmail, fullName: cleanName, roleCode: nextRole.code, isActive: nextActive });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if ((pathname === '/settings/employees' || pathname === '/hr/employees') && method === 'POST') {
+    if (pathname.startsWith('/settings')) assertOwnerOrSuperAdmin(user);
+    else assertPerm(user, PERMISSIONS.HR_MANAGE);
+
+    const { employeeCode, fullName, department, position, locationId, payType, baseRate, avatarUrl, isActive } = body || {};
+    const cleanName = String(fullName || '').trim();
+    if (!cleanName) throw new Error('Employee full name is required');
+    const code = String(employeeCode || `EMP-${Date.now().toString().slice(-3)}`).trim();
+    if (snap.employees.some((e) => String(e.employeeCode).toLowerCase() === code.toLowerCase())) {
+      throw new Error(`Employee code "${code}" already exists`);
+    }
+
+    const logicalId = crypto.randomUUID();
+    const docId = toDocId(logicalId, uid);
+    try {
+      await setDoc(doc(db, 'employees', docId), {
+        id: docId,
+        ownerUid: uid,
+        employeeCode: code,
+        fullName: cleanName,
+        department: String(department || 'Operations').trim(),
+        position: String(position || 'Crew').trim(),
+        locationId: locationId ? toDocId(String(locationId), uid) : null,
+        payType: payType || 'DAILY',
+        baseRate: Number(baseRate || 650),
+        avatarUrl: avatarUrl || null,
+        isActive: isActive !== false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `employees/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'CREATE_EMPLOYEE', 'Employee', logicalId, { code, fullName: cleanName });
+    invalidateWorkspaceCache();
+    return { id: logicalId } as T;
+  }
+
+  if ((pathname.startsWith('/settings/employees/') || pathname.startsWith('/hr/employees/')) && method === 'PUT') {
+    if (pathname.startsWith('/settings')) assertOwnerOrSuperAdmin(user);
+    else assertPerm(user, PERMISSIONS.HR_MANAGE);
+    const empId = pathname.split('/')[3];
+    const docId = toDocId(empId, uid);
+    const existing = snap.employees.find((e) => e.id === docId);
+    if (!existing) throw new Error('Employee not found');
+
+    const { employeeCode, fullName, department, position, locationId, payType, baseRate, avatarUrl, isActive } = body || {};
+    const cleanName = String(fullName ?? existing.fullName).trim();
+    const cleanCode = String(employeeCode ?? existing.employeeCode).trim();
+    if (!cleanName) throw new Error('Employee full name is required');
+    if (!cleanCode) throw new Error('Employee code is required');
+    if (snap.employees.some((e) => String(e.employeeCode).toLowerCase() === cleanCode.toLowerCase() && e.id !== docId)) {
+      throw new Error(`Employee code "${cleanCode}" is already used by another employee`);
+    }
+
+    const nextAvatar = avatarUrl !== undefined ? (avatarUrl ? String(avatarUrl) : null) : existing.avatarUrl ?? null;
+    const nextActive = isActive === undefined ? Boolean(existing.isActive) : Boolean(isActive);
+
+    try {
+      await updateDoc(doc(db, 'employees', docId), {
+        employeeCode: cleanCode,
+        fullName: cleanName,
+        department: String(department ?? existing.department).trim(),
+        position: String(position ?? existing.position).trim(),
+        locationId: locationId !== undefined ? (locationId ? toDocId(String(locationId), uid) : null) : existing.locationId ?? null,
+        payType: payType || existing.payType,
+        baseRate: Number(baseRate ?? existing.baseRate),
+        avatarUrl: nextAvatar,
+        isActive: nextActive,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `employees/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_EMPLOYEE', 'Employee', empId, { code: cleanCode, fullName: cleanName, isActive: nextActive });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  throw new Error(`Unsupported operation: ${method} ${pathname}`);
+}

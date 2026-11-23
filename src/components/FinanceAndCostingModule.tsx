@@ -6,9 +6,15 @@ import { LocationRow } from '../types/erp.ts';
 interface Props {
   mode: 'finance' | 'costing';
   locations: LocationRow[];
+  activeLocationId?: string;
 }
 
-export function FinanceAndCostingModule({ mode, locations }: Props) {
+const getTodayLocalDate = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+export function FinanceAndCostingModule({ mode, locations, activeLocationId = 'ALL' }: Props) {
   const [finTab, setFinTab] = useState<'expenses' | 'closing' | 'ledger' | 'statements' | 'tax'>('expenses');
   const [finData, setFinData] = useState<any>(null);
   const [costData, setCostData] = useState<any>(null);
@@ -17,6 +23,7 @@ export function FinanceAndCostingModule({ mode, locations }: Props) {
     locationId: 'loc_truck_1',
     accountId: 'acc_6100',
     category: 'LPG',
+    expenseDate: getTodayLocalDate(),
     amount: '',
     description: '',
     paidFromPettyCash: false,
@@ -31,10 +38,12 @@ export function FinanceAndCostingModule({ mode, locations }: Props) {
   const [msg, setMsg] = useState('');
   const [err, setErr] = useState('');
 
+  const locQuery = activeLocationId && activeLocationId !== 'ALL' ? `?locationId=${encodeURIComponent(activeLocationId)}` : '';
+
   const loadFinance = async () => {
     try {
       setErr('');
-      const res = await apiFetch('/finance/overview');
+      const res = await apiFetch(`/finance/overview${locQuery}`);
       setFinData(res);
     } catch (e: any) {
       setErr(e.message || 'Unable to load financial data');
@@ -44,7 +53,7 @@ export function FinanceAndCostingModule({ mode, locations }: Props) {
   const loadCosting = async () => {
     try {
       setErr('');
-      const res = await apiFetch('/food-costing');
+      const res = await apiFetch(`/food-costing${locQuery}`);
       setCostData(res);
     } catch (e: any) {
       setErr(e.message || 'Unable to load food costing data');
@@ -54,18 +63,30 @@ export function FinanceAndCostingModule({ mode, locations }: Props) {
   useEffect(() => {
     if (mode === 'finance') loadFinance();
     else loadCosting();
-  }, [mode]);
+  }, [mode, activeLocationId]);
+
+  useEffect(() => {
+    if (activeLocationId && activeLocationId !== 'ALL') {
+      if (locations.some((l) => l.id === activeLocationId)) {
+        setExpForm((f) => ({ ...f, locationId: activeLocationId }));
+      }
+      if (locations.some((l) => l.id === activeLocationId && l.type === 'FOOD_TRUCK')) {
+        setClosingForm((f) => ({ ...f, locationId: activeLocationId }));
+      }
+    }
+  }, [activeLocationId, locations]);
 
   const submitExpense = async (e: React.FormEvent) => {
     e.preventDefault();
     setErr('');
     try {
+      const datePart = expForm.expenseDate || getTodayLocalDate();
       await apiFetch('/finance/expenses', {
         method: 'POST',
-        body: JSON.stringify({ ...expForm, expenseDate: new Date().toISOString() }),
+        body: JSON.stringify({ ...expForm, expenseDate: `${datePart}T12:00:00.000Z` }),
       });
       setShowExpModal(false);
-      setExpForm({ ...expForm, amount: '', description: '' });
+      setExpForm({ ...expForm, expenseDate: getTodayLocalDate(), amount: '', description: '' });
       setMsg('Expense recorded and balanced Journal Entry posted.');
       await loadFinance();
     } catch (e: any) {
@@ -218,7 +239,20 @@ export function FinanceAndCostingModule({ mode, locations }: Props) {
           <p className="text-sm text-slate-500">Expenses, petty cash, Workflow C cash reconciliation, double-entry ledger, and configurable PH tax</p>
         </div>
         <button
-          onClick={() => setShowExpModal(true)}
+          onClick={() => {
+            setErr('');
+            setExpForm((f) => ({
+              ...f,
+              locationId:
+                activeLocationId !== 'ALL' && locations.some((l) => l.id === activeLocationId)
+                  ? activeLocationId
+                  : locations.some((l) => l.id === f.locationId)
+                    ? f.locationId
+                    : locations[0]?.id || f.locationId,
+              expenseDate: f.expenseDate || getTodayLocalDate(),
+            }));
+            setShowExpModal(true);
+          }}
           className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 whitespace-nowrap shrink-0"
         >
           <Plus className="w-4 h-4" /> Record Expense
@@ -226,7 +260,7 @@ export function FinanceAndCostingModule({ mode, locations }: Props) {
       </div>
 
       {msg && <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 font-medium">{msg}</div>}
-      {err && <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{err}</div>}
+      {err && !showExpModal && <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{err}</div>}
 
       <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-lg border border-slate-200 w-fit">
         {([
@@ -278,7 +312,13 @@ export function FinanceAndCostingModule({ mode, locations }: Props) {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {expenses.map((ex: any) => (
+                {expenses.length === 0 ? (
+                  <tr>
+                    <td colSpan={6} className="p-6 text-center text-slate-400">
+                      No operating expenses found for the selected truck / location.
+                    </td>
+                  </tr>
+                ) : expenses.map((ex: any) => (
                   <tr key={ex.id}>
                     <td className="p-3 font-mono text-slate-500">{String(ex.expense_date).slice(0, 10)}</td>
                     <td className="p-3">{ex.location_name}</td>
@@ -320,7 +360,10 @@ export function FinanceAndCostingModule({ mode, locations }: Props) {
               <label className="block text-xs font-medium text-slate-600 mb-1">Actual Counted Cash in Drawer (PHP)</label>
               <input type="number" required placeholder="e.g. 5450" value={closingForm.actualCash} onChange={(e) => setClosingForm({ ...closingForm, actualCash: e.target.value })} className="w-full rounded border px-3 py-2 text-xs font-mono" />
             </div>
-            <input type="text" placeholder="Closing remarks" value={closingForm.notes} onChange={(e) => setClosingForm({ ...closingForm, notes: e.target.value })} className="w-full rounded border px-3 py-2 text-xs" />
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Closing Remarks / Notes</label>
+              <input type="text" placeholder="Closing remarks" value={closingForm.notes} onChange={(e) => setClosingForm({ ...closingForm, notes: e.target.value })} className="w-full rounded border px-3 py-2 text-xs" />
+            </div>
             <button type="submit" className="w-full rounded-lg bg-slate-900 py-2.5 text-xs font-semibold text-white hover:bg-slate-800">
               Reconcile &amp; Close Business Day
             </button>
@@ -432,7 +475,13 @@ export function FinanceAndCostingModule({ mode, locations }: Props) {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {journals.map((je: any) => (
+              {journals.length === 0 ? (
+                <tr>
+                  <td colSpan={4} className="p-6 text-center text-slate-400">
+                    No journal entries match the selected truck / location.
+                  </td>
+                </tr>
+              ) : journals.map((je: any) => (
                 <tr key={je.id} className={je.is_reversed ? 'opacity-50' : ''}>
                   <td className="p-3 font-mono font-semibold text-slate-900">{je.entry_number}</td>
                   <td className="p-3 font-mono text-slate-500">{String(je.entry_date).slice(0, 10)}</td>
@@ -492,35 +541,72 @@ export function FinanceAndCostingModule({ mode, locations }: Props) {
       {showExpModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
           <form onSubmit={submitExpense} className="w-full max-w-md rounded-xl bg-white p-5 space-y-3 border border-slate-200">
-            <h3 className="font-display text-base font-semibold">Record Operating Expense</h3>
-            <select value={expForm.locationId} onChange={(e) => setExpForm({ ...expForm, locationId: e.target.value })} className="w-full rounded border px-3 py-2 text-xs">
-              {locations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
-            </select>
-            <div className="grid grid-cols-2 gap-2">
-              <select value={expForm.category} onChange={(e) => setExpForm({ ...expForm, category: e.target.value })} className="rounded border px-3 py-2 text-xs">
-                <option value="FUEL">Fuel</option>
-                <option value="LPG">LPG</option>
-                <option value="ELECTRICITY">Electricity / Water</option>
-                <option value="PACKAGING">Packaging</option>
-                <option value="MAINTENANCE">Vehicle Repairs</option>
-                <option value="PERMITS">Permits &amp; Licenses</option>
-                <option value="RENT_PARKING">Rent &amp; Parking</option>
-                <option value="MARKETING">Marketing</option>
-              </select>
-              <select value={expForm.accountId} onChange={(e) => setExpForm({ ...expForm, accountId: e.target.value })} className="rounded border px-3 py-2 text-xs">
-                {accounts.filter((a: any) => a.type === 'EXPENSE').map((a: any) => (
-                  <option key={a.id} value={a.id}>{a.code} {a.name}</option>
-                ))}
+            <h3 className="font-display text-base font-semibold text-slate-900">Record Operating Expense</h3>
+            {err && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{err}</div>}
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Branch / Location</label>
+              <select value={expForm.locationId} onChange={(e) => setExpForm({ ...expForm, locationId: e.target.value })} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs">
+                {locations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
               </select>
             </div>
-            <input type="number" required placeholder="Amount (PHP)" value={expForm.amount} onChange={(e) => setExpForm({ ...expForm, amount: e.target.value })} className="w-full rounded border px-3 py-2 text-xs font-mono" />
-            <input type="text" required placeholder="Description (e.g. 2x Solane LPG)" value={expForm.description} onChange={(e) => setExpForm({ ...expForm, description: e.target.value })} className="w-full rounded border px-3 py-2 text-xs" />
-            <label className="flex items-center gap-2 text-xs text-slate-700">
+            <div className="grid grid-cols-2 gap-2.5">
+              <div>
+                <label className="block text-xs font-medium text-slate-600 mb-1">Expense Category</label>
+                <select value={expForm.category} onChange={(e) => setExpForm({ ...expForm, category: e.target.value })} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs">
+                  <option value="FUEL">Fuel</option>
+                  <option value="LPG">LPG</option>
+                  <option value="ELECTRICITY">Electricity / Water</option>
+                  <option value="PACKAGING">Packaging</option>
+                  <option value="MAINTENANCE">Vehicle Repairs</option>
+                  <option value="PERMITS">Permits &amp; Licenses</option>
+                  <option value="RENT_PARKING">Rent &amp; Parking</option>
+                  <option value="MARKETING">Marketing</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-600 mb-1">GL Expense Account</label>
+                <select value={expForm.accountId} onChange={(e) => setExpForm({ ...expForm, accountId: e.target.value })} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs">
+                  {accounts.filter((a: any) => a.type === 'EXPENSE').map((a: any) => (
+                    <option key={a.id} value={a.id}>{a.code} {a.name}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              <div>
+                <label className="block text-xs font-medium text-slate-600 mb-1">Expense Date *</label>
+                <input
+                  type="date"
+                  required
+                  value={expForm.expenseDate}
+                  onChange={(e) => setExpForm({ ...expForm, expenseDate: e.target.value })}
+                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-600 mb-1">Amount (PHP) *</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0.01"
+                  required
+                  placeholder="e.g. 1850"
+                  value={expForm.amount}
+                  onChange={(e) => setExpForm({ ...expForm, amount: e.target.value })}
+                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                />
+              </div>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Description *</label>
+              <input type="text" required placeholder="e.g. 2x Solane LPG" value={expForm.description} onChange={(e) => setExpForm({ ...expForm, description: e.target.value })} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs" />
+            </div>
+            <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
               <input type="checkbox" checked={expForm.paidFromPettyCash} onChange={(e) => setExpForm({ ...expForm, paidFromPettyCash: e.target.checked })} />
               Deduct from Truck Petty Cash Float
             </label>
             <div className="flex justify-end gap-2 pt-2">
-              <button type="button" onClick={() => setShowExpModal(false)} className="px-4 py-2 rounded-lg border text-xs">Cancel</button>
+              <button type="button" onClick={() => { setErr(''); setShowExpModal(false); }} className="px-4 py-2 rounded-lg border text-xs">Cancel</button>
               <button type="submit" className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold">Post Expense &amp; GL</button>
             </div>
           </form>

@@ -280,7 +280,7 @@ apiRouter.get('/kds/orders', requirePerm(PERMISSIONS.KDS_MANAGE), (req, res) => 
       SELECT s.*, l.name AS location_name
       FROM sales s
       JOIN locations l ON l.id = s.location_id
-      WHERE s.status = 'COMPLETED' AND s.kds_status != 'COMPLETED'
+      WHERE s.status = 'COMPLETED' AND s.kds_status != 'COMPLETED' AND l.kds_enabled = 1
       ${locationId ? 'AND s.location_id = ?' : ''}
       ORDER BY s.sold_at ASC
     `)
@@ -360,14 +360,41 @@ apiRouter.put('/categories/:id', requirePerm(PERMISSIONS.PRODUCT_MANAGE), (req, 
 
 apiRouter.post('/products', requirePerm(PERMISSIONS.PRODUCT_MANAGE), (req, res) => {
   try {
-    const { sku, name, description, categoryId, basePrice, packagingCost, directLaborCost, targetFoodCostPct, taxConfigId, ingredients } = req.body;
+    const { sku, name, description, categoryId, basePrice, packagingCost, directLaborCost, targetFoodCostPct, taxConfigId, expiryDate, ingredients } = req.body || {};
+    const cleanName = String(name || '').trim();
+    if (!cleanName) throw new Error('Product name is required');
+    const cleanCategoryId = String(categoryId || '').trim();
+    if (!cleanCategoryId) throw new Error('Category is required');
+    const catRow = db.prepare('SELECT id FROM categories WHERE id = ?').get(cleanCategoryId);
+    if (!catRow) throw new Error('Selected category does not exist');
+
+    const parsedPrice = Number(basePrice);
+    if (!Number.isFinite(parsedPrice) || parsedPrice < 0) throw new Error('Valid base price is required');
+
+    const cleanSku = String(sku || '').trim() || `MNU-${Date.now().toString().slice(-5)}`;
+    const dupSku = db.prepare('SELECT id FROM products WHERE lower(sku) = lower(?)').get(cleanSku);
+    if (dupSku) throw new Error(`SKU "${cleanSku}" is already used by another product`);
+
     const prodId = randomUUID();
     const recId = randomUUID();
+    const cleanExpiry = expiryDate ? String(expiryDate).trim() || null : null;
     db.transaction(() => {
       db.prepare(`
-        INSERT INTO products (id, sku, name, description, category_id, base_price, packaging_cost, direct_labor_cost, target_food_cost_pct, tax_config_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(prodId, sku || `MNU-${Date.now().toString().slice(-4)}`, name, description || '', categoryId, Number(basePrice), Number(packagingCost || 0), Number(directLaborCost || 0), Number(targetFoodCostPct || 35), taxConfigId || 'tax_ph_vat');
+        INSERT INTO products (id, sku, name, description, category_id, base_price, packaging_cost, direct_labor_cost, target_food_cost_pct, tax_config_id, expiry_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        prodId,
+        cleanSku,
+        cleanName,
+        description ? String(description).trim() : '',
+        cleanCategoryId,
+        parsedPrice,
+        Number(packagingCost || 0),
+        Number(directLaborCost || 0),
+        Number(targetFoodCostPct || 35),
+        taxConfigId || 'tax_ph_vat',
+        cleanExpiry,
+      );
 
       db.prepare('INSERT INTO recipes (id, product_id, yield_qty) VALUES (?, ?, 1)').run(recId, prodId);
       const insIng = db.prepare('INSERT INTO recipe_ingredients (id, recipe_id, inventory_item_id, quantity, uom_id, waste_factor_pct) VALUES (?, ?, ?, ?, ?, ?)');
@@ -375,7 +402,7 @@ apiRouter.post('/products', requirePerm(PERMISSIONS.PRODUCT_MANAGE), (req, res) 
         insIng.run(randomUUID(), recId, ing.inventoryItemId, Number(ing.quantity), ing.uomId, Number(ing.wasteFactorPct || 0));
       }
     })();
-    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'CREATE_PRODUCT', 'Product', prodId, { name, basePrice });
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'CREATE_PRODUCT', 'Product', prodId, { name: cleanName, sku: cleanSku, basePrice: parsedPrice, expiryDate: cleanExpiry });
     res.status(201).json({ id: prodId });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -402,6 +429,7 @@ apiRouter.put('/products/:id', requirePerm(PERMISSIONS.PRODUCT_MANAGE), (req, re
       directLaborCost,
       targetFoodCostPct,
       taxConfigId,
+      expiryDate,
       isAvailable,
       variants,
       modifiers,
@@ -421,7 +449,7 @@ apiRouter.put('/products/:id', requirePerm(PERMISSIONS.PRODUCT_MANAGE), (req, re
         UPDATE products
         SET sku = ?, name = ?, description = ?, image_url = ?, category_id = ?,
             base_price = ?, packaging_cost = ?, direct_labor_cost = ?,
-            target_food_cost_pct = ?, tax_config_id = ?, is_available = ?
+            target_food_cost_pct = ?, tax_config_id = ?, expiry_date = ?, is_available = ?
         WHERE id = ?
       `).run(
         cleanSku,
@@ -434,6 +462,7 @@ apiRouter.put('/products/:id', requirePerm(PERMISSIONS.PRODUCT_MANAGE), (req, re
         Number(directLaborCost || 0),
         Number(targetFoodCostPct || 35),
         taxConfigId || existing.tax_config_id || 'tax_ph_vat',
+        expiryDate !== undefined ? (String(expiryDate).trim() || null) : existing.expiry_date,
         isAvailable === undefined ? existing.is_available : isAvailable ? 1 : 0,
         productId,
       );
@@ -892,10 +921,73 @@ apiRouter.get('/procurement', requirePerm(PERMISSIONS.PO_CREATE), (_req, res) =>
 apiRouter.post('/procurement/suppliers', requirePerm(PERMISSIONS.PO_CREATE), (req, res) => {
   try {
     const { code, name, contactPerson, phone, email, address, tin, paymentTerms } = req.body;
+    const cleanName = String(name || '').trim();
+    if (!cleanName) throw new Error('Supplier name is required');
     const id = randomUUID();
+    const cleanCode = String(code || `SUP-${Date.now().toString().slice(-4)}`).trim();
     db.prepare('INSERT INTO suppliers (id, code, name, contact_person, phone, email, address, tin, payment_terms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(id, code || `SUP-${Date.now().toString().slice(-4)}`, name, contactPerson || '', phone || '', email || '', address || '', tin || '', Number(paymentTerms || 0));
+      .run(id, cleanCode, cleanName, contactPerson || '', phone || '', email || '', address || '', tin || '', Math.max(0, Math.round(Number(paymentTerms || 0))));
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'CREATE_SUPPLIER', 'Supplier', id, { code: cleanCode, name: cleanName });
     res.status(201).json({ id });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.put('/procurement/suppliers/:id', requirePerm(PERMISSIONS.PO_CREATE), (req, res) => {
+  try {
+    const existing = db.prepare('SELECT * FROM suppliers WHERE id = ?').get(req.params.id) as any;
+    if (!existing) {
+      res.status(404).json({ error: 'Supplier not found' });
+      return;
+    }
+    const { code, name, contactPerson, phone, email, address, tin, paymentTerms } = req.body || {};
+    const cleanName = String(name ?? existing.name ?? '').trim();
+    const cleanCode = String(code ?? existing.code ?? '').trim();
+    if (!cleanName) throw new Error('Supplier name is required');
+    if (!cleanCode) throw new Error('Supplier code is required');
+
+    db.prepare(`
+      UPDATE suppliers
+      SET code = ?, name = ?, contact_person = ?, phone = ?, email = ?, address = ?, tin = ?, payment_terms = ?
+      WHERE id = ?
+    `).run(
+      cleanCode,
+      cleanName,
+      contactPerson ?? existing.contact_person ?? '',
+      phone ?? existing.phone ?? '',
+      email ?? existing.email ?? '',
+      address ?? existing.address ?? '',
+      tin ?? existing.tin ?? '',
+      Math.max(0, Math.round(Number(paymentTerms ?? existing.payment_terms ?? 0))),
+      existing.id,
+    );
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'UPDATE_SUPPLIER', 'Supplier', existing.id, { code: cleanCode, name: cleanName });
+    res.json({ ok: true, id: existing.id });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.delete('/procurement/suppliers/:id', requirePerm(PERMISSIONS.PO_CREATE), (req, res) => {
+  try {
+    const existing = db.prepare('SELECT * FROM suppliers WHERE id = ?').get(req.params.id) as any;
+    if (!existing) {
+      res.status(404).json({ error: 'Supplier not found' });
+      return;
+    }
+    const poRef = db.prepare('SELECT COUNT(*) AS cnt FROM purchase_orders WHERE supplier_id = ?').get(existing.id) as { cnt: number };
+    const invRef = db.prepare('SELECT COUNT(*) AS cnt FROM supplier_invoices WHERE supplier_id = ?').get(existing.id) as { cnt: number };
+    const hasHistory = (poRef?.cnt || 0) > 0 || (invRef?.cnt || 0) > 0;
+
+    if (hasHistory) {
+      db.prepare('UPDATE suppliers SET is_active = 0 WHERE id = ?').run(existing.id);
+    } else {
+      db.prepare('DELETE FROM supplier_items WHERE supplier_id = ?').run(existing.id);
+      db.prepare('DELETE FROM suppliers WHERE id = ?').run(existing.id);
+    }
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'DELETE_SUPPLIER', 'Supplier', existing.id, { name: existing.name, archived: hasHistory });
+    res.json({ ok: true, archived: hasHistory });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
@@ -1215,12 +1307,22 @@ apiRouter.get('/food-costing', requirePerm(PERMISSIONS.DASHBOARD_VIEW), (_req, r
 apiRouter.get('/fleet', requirePerm(PERMISSIONS.FLEET_MANAGE), (_req, res) => {
   const trucks = db
     .prepare(`
-      SELECT ft.*, l.name AS location_name, l.code AS location_code,
+      SELECT ft.*, l.name AS location_name, l.code AS location_code, l.address AS location_address, l.kds_enabled AS kds_enabled,
         COALESCE((SELECT SUM(s.total_amount) FROM sales s WHERE s.location_id = l.id AND s.status = 'COMPLETED'), 0) AS total_sales,
         COALESCE((SELECT SUM(s.total_cogs) FROM sales s WHERE s.location_id = l.id AND s.status = 'COMPLETED'), 0) AS total_cogs,
         COALESCE((SELECT SUM(e.amount) FROM expenses e WHERE e.location_id = l.id), 0) AS total_expenses
       FROM food_trucks ft
       JOIN locations l ON l.id = ft.location_id
+      WHERE l.is_active = 1
+    `)
+    .all();
+  const locations = db
+    .prepare(`
+      SELECT l.*, ft.id AS truck_id, ft.plate_number, ft.make_model, ft.status, ft.current_site, ft.odometer_km
+      FROM locations l
+      LEFT JOIN food_trucks ft ON ft.location_id = l.id
+      WHERE l.is_active = 1
+      ORDER BY l.type ASC, l.name ASC
     `)
     .all();
   const assignments = db
@@ -1232,23 +1334,81 @@ apiRouter.get('/fleet', requirePerm(PERMISSIONS.FLEET_MANAGE), (_req, res) => {
   const maintenanceLogs = db
     .prepare('SELECT ml.*, ft.plate_number, l.name AS truck_name FROM maintenance_logs ml JOIN food_trucks ft ON ft.id = ml.truck_id JOIN locations l ON l.id = ft.location_id ORDER BY ml.service_date DESC LIMIT 20')
     .all();
-  res.json({ trucks, assignments, fuelLogs, maintenanceLogs });
+  res.json({ trucks, locations, assignments, fuelLogs, maintenanceLogs });
 });
 
 apiRouter.post('/fleet/trucks', requirePerm(PERMISSIONS.FLEET_MANAGE), (req, res) => {
   try {
-    const { code, name, plateNumber, makeModel, currentSite } = req.body;
+    const { code, name, type, address, plateNumber, makeModel, currentSite, odometerKm, status, kdsEnabled } = req.body;
+    const locType = type === 'COMMISSARY' ? 'COMMISSARY' : 'FOOD_TRUCK';
+    const nextKds = kdsEnabled !== undefined ? (kdsEnabled ? 1 : 0) : (locType === 'FOOD_TRUCK' ? 1 : 0);
     const locId = randomUUID();
-    const trkId = randomUUID();
+    const trkId = locType === 'FOOD_TRUCK' ? randomUUID() : null;
     db.transaction(() => {
-      db.prepare('INSERT INTO locations (id, code, name, type, address) VALUES (?, ?, ?, ?, ?)').run(locId, code, name, 'FOOD_TRUCK', currentSite || '');
-      db.prepare('INSERT INTO food_trucks (id, location_id, plate_number, make_model, current_site) VALUES (?, ?, ?, ?, ?)').run(trkId, locId, plateNumber, makeModel, currentSite || '');
+      db.prepare('INSERT INTO locations (id, code, name, type, address, kds_enabled) VALUES (?, ?, ?, ?, ?, ?)').run(locId, code, name, locType, address || currentSite || '', nextKds);
+      if (locType === 'FOOD_TRUCK' && trkId) {
+        db.prepare('INSERT INTO food_trucks (id, location_id, plate_number, make_model, status, current_site, odometer_km) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
+          trkId,
+          locId,
+          plateNumber,
+          makeModel,
+          status || 'ACTIVE',
+          currentSite || address || '',
+          Number(odometerKm || 0),
+        );
+      }
       db.prepare('INSERT INTO petty_cash_funds (id, location_id, fund_name, float_amount, current_balance) VALUES (?, ?, ?, 5000, 5000)').run(randomUUID(), locId, `${name} Petty Cash`);
     })();
-    res.status(201).json({ id: trkId, locationId: locId });
+    res.status(201).json({ id: trkId || locId, locationId: locId });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
+});
+
+apiRouter.put('/fleet/locations/:id', requirePerm(PERMISSIONS.FLEET_MANAGE), (req, res) => {
+  try {
+    const existingLoc = db.prepare('SELECT * FROM locations WHERE id = ?').get(req.params.id) as any;
+    if (!existingLoc) {
+      res.status(404).json({ error: 'Location not found' });
+      return;
+    }
+    const { code, name, type, address, plateNumber, makeModel, currentSite, odometerKm, status, kdsEnabled } = req.body || {};
+    const nextType = type === 'COMMISSARY' || type === 'FOOD_TRUCK' ? type : existingLoc.type;
+    const nextKds = kdsEnabled !== undefined ? (kdsEnabled ? 1 : 0) : existingLoc.kds_enabled;
+    db.transaction(() => {
+      db.prepare('UPDATE locations SET code = ?, name = ?, type = ?, address = ?, kds_enabled = ? WHERE id = ?')
+        .run(code ?? existingLoc.code, name ?? existingLoc.name, nextType, address ?? existingLoc.address ?? '', nextKds, existingLoc.id);
+      if (nextType === 'FOOD_TRUCK') {
+        const existingTrk = db.prepare('SELECT * FROM food_trucks WHERE location_id = ?').get(existingLoc.id) as any;
+        if (existingTrk) {
+          db.prepare('UPDATE food_trucks SET plate_number = ?, make_model = ?, status = ?, current_site = ?, odometer_km = ? WHERE id = ?')
+            .run(
+              plateNumber ?? existingTrk.plate_number,
+              makeModel ?? existingTrk.make_model,
+              status ?? existingTrk.status,
+              currentSite ?? existingTrk.current_site ?? '',
+              odometerKm !== undefined ? Number(odometerKm) : existingTrk.odometer_km,
+              existingTrk.id,
+            );
+        }
+      }
+    })();
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.patch('/fleet/locations/:id/kds', requirePerm(PERMISSIONS.FLEET_MANAGE), (req, res) => {
+  const existingLoc = db.prepare('SELECT * FROM locations WHERE id = ?').get(req.params.id) as any;
+  if (!existingLoc) {
+    res.status(404).json({ error: 'Location not found' });
+    return;
+  }
+  const nextKds = req.body?.kdsEnabled ? 1 : 0;
+  db.prepare('UPDATE locations SET kds_enabled = ? WHERE id = ?').run(nextKds, existingLoc.id);
+  writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'TOGGLE_LOCATION_KDS', 'Location', existingLoc.id, { kdsEnabled: Boolean(nextKds) });
+  res.json({ ok: true, id: existingLoc.id, kds_enabled: nextKds });
 });
 
 apiRouter.post('/fleet/assignments', requirePerm(PERMISSIONS.FLEET_MANAGE), (req, res) => {
@@ -1318,11 +1478,55 @@ apiRouter.get('/hr', requirePerm(PERMISSIONS.HR_MANAGE), (_req, res) => {
 
 apiRouter.post('/hr/employees', requirePerm(PERMISSIONS.HR_MANAGE), (req, res) => {
   try {
-    const { employeeCode, fullName, department, position, locationId, payType, baseRate, avatarUrl } = req.body;
+    const { employeeCode, fullName, department, position, locationId, payType, baseRate, avatarUrl, isActive } = req.body;
     const id = randomUUID();
-    db.prepare('INSERT INTO employees (id, employee_code, full_name, department, position, location_id, pay_type, base_rate, avatar_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(id, employeeCode || `EMP-${Date.now().toString().slice(-3)}`, fullName, department, position, locationId || null, payType || 'DAILY', Number(baseRate), avatarUrl || null);
+    db.prepare('INSERT INTO employees (id, employee_code, full_name, department, position, location_id, pay_type, base_rate, avatar_url, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(id, employeeCode || `EMP-${Date.now().toString().slice(-3)}`, fullName, department, position, locationId || null, payType || 'DAILY', Number(baseRate), avatarUrl || null, isActive !== false ? 1 : 0);
     res.status(201).json({ id });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.put('/hr/employees/:id', requirePerm(PERMISSIONS.HR_MANAGE), (req, res) => {
+  try {
+    const empId = req.params.id;
+    const existing = db.prepare('SELECT * FROM employees WHERE id = ?').get(empId) as any;
+    if (!existing) {
+      res.status(404).json({ error: 'Employee not found' });
+      return;
+    }
+
+    const { employeeCode, fullName, department, position, locationId, payType, baseRate, avatarUrl, isActive } = req.body || {};
+    const cleanName = String(fullName ?? existing.full_name).trim();
+    const cleanCode = String(employeeCode ?? existing.employee_code).trim();
+    if (!cleanName) throw new Error('Employee full name is required');
+    if (!cleanCode) throw new Error('Employee code is required');
+
+    const dup = db.prepare('SELECT id FROM employees WHERE lower(employee_code) = lower(?) AND id != ?').get(cleanCode, empId);
+    if (dup) throw new Error(`Employee code "${cleanCode}" is already used by another employee`);
+
+    const nextAvatar = avatarUrl !== undefined ? (avatarUrl ? String(avatarUrl) : null) : existing.avatar_url;
+    const nextActive = isActive === undefined ? existing.is_active : isActive ? 1 : 0;
+
+    db.prepare(`
+      UPDATE employees
+      SET employee_code = ?, full_name = ?, department = ?, position = ?, location_id = ?, pay_type = ?, base_rate = ?, avatar_url = ?, is_active = ?
+      WHERE id = ?
+    `).run(
+      cleanCode,
+      cleanName,
+      department !== undefined ? String(department).trim() : existing.department,
+      position !== undefined ? String(position).trim() : existing.position,
+      locationId !== undefined ? (locationId || null) : existing.location_id,
+      payType || existing.pay_type,
+      Number(baseRate ?? existing.base_rate),
+      nextAvatar,
+      nextActive,
+      empId,
+    );
+
+    res.json({ ok: true });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
@@ -1457,40 +1661,67 @@ apiRouter.post('/crm/customers', requirePerm(PERMISSIONS.CRM_MANAGE), (req, res)
 
 apiRouter.get('/reports/:type', requirePerm(PERMISSIONS.REPORTS_VIEW), (req, res) => {
   const { type } = req.params;
+  const from = typeof req.query.from === 'string' && req.query.from.trim() ? req.query.from.trim().slice(0, 10) : '';
+  const to = typeof req.query.to === 'string' && req.query.to.trim() ? req.query.to.trim().slice(0, 10) : '';
+
+  const buildDateFilter = (expr: string) => {
+    const clauses: string[] = [];
+    const args: string[] = [];
+    if (from) {
+      clauses.push(`${expr} >= ?`);
+      args.push(from);
+    }
+    if (to) {
+      clauses.push(`${expr} <= ?`);
+      args.push(to);
+    }
+    return { clauses, args };
+  };
+
   if (type === 'sales') {
+    const { clauses, args } = buildDateFilter('substr(s.sold_at, 1, 10)');
+    const whereSql = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
     res.json(
       db.prepare(`
         SELECT s.receipt_number, substr(s.sold_at, 1, 19) AS sold_at, l.name AS truck, s.channel, s.status, s.subtotal, s.tax_amount, s.total_amount, s.total_cogs, (s.total_amount - s.total_cogs) AS gross_profit
         FROM sales s JOIN locations l ON l.id = s.location_id
+        ${whereSql}
         ORDER BY s.sold_at DESC
-      `).all(),
+      `).all(...args),
     );
     return;
   }
   if (type === 'inventory') {
+    const { clauses, args } = buildDateFilter('substr(b.received_at, 1, 10)');
+    const joinFilter = clauses.length ? `AND ${clauses.join(' AND ')}` : '';
     res.json(
       db.prepare(`
         SELECT i.sku, i.name, u.code AS uom, i.costing_method, i.reorder_point,
           COALESCE(SUM(b.remaining_qty), 0) AS on_hand,
           COALESCE(SUM(b.remaining_qty * b.unit_cost), 0) AS total_value
         FROM inventory_items i JOIN uoms u ON u.id = i.base_uom_id
-        LEFT JOIN stock_batches b ON b.inventory_item_id = i.id
+        LEFT JOIN stock_batches b ON b.inventory_item_id = i.id ${joinFilter}
         GROUP BY i.id
-      `).all(),
+      `).all(...args),
     );
     return;
   }
   if (type === 'expenses') {
+    const { clauses, args } = buildDateFilter('substr(e.expense_date, 1, 10)');
+    const whereSql = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
     res.json(
       db.prepare(`
         SELECT substr(e.expense_date, 1, 10) AS date, l.name AS location, e.category, e.description, e.amount
         FROM expenses e JOIN locations l ON l.id = e.location_id
+        ${whereSql}
         ORDER BY e.expense_date DESC
-      `).all(),
+      `).all(...args),
     );
     return;
   }
   if (type === 'waste') {
+    const { clauses, args } = buildDateFilter('substr(t.created_at, 1, 10)');
+    const extraWhere = clauses.length ? `AND ${clauses.join(' AND ')}` : '';
     res.json(
       db.prepare(`
         SELECT substr(t.created_at, 1, 19) AS date, l.name AS location, i.name AS ingredient, ABS(t.quantity_delta) AS qty, u.code AS uom, t.total_cost AS cost_php, t.notes AS reason
@@ -1498,16 +1729,19 @@ apiRouter.get('/reports/:type', requirePerm(PERMISSIONS.REPORTS_VIEW), (req, res
         JOIN inventory_items i ON i.id = t.inventory_item_id
         JOIN uoms u ON u.id = i.base_uom_id
         JOIN locations l ON l.id = t.location_id
-        WHERE t.txn_type IN ('OUT_WASTE', 'OUT_SPOILAGE')
+        WHERE t.txn_type IN ('OUT_WASTE', 'OUT_SPOILAGE') ${extraWhere}
         ORDER BY t.created_at DESC
-      `).all(),
+      `).all(...args),
     );
     return;
   }
   res.json([]);
 });
 
-apiRouter.get('/admin/governance', requirePerm(PERMISSIONS.DASHBOARD_VIEW), (_req, res) => {
+apiRouter.get('/admin/governance', requirePerm(PERMISSIONS.DASHBOARD_VIEW), (req, res) => {
+  const from = typeof req.query.from === 'string' && req.query.from.trim() ? req.query.from.trim().slice(0, 10) : '';
+  const to = typeof req.query.to === 'string' && req.query.to.trim() ? req.query.to.trim().slice(0, 10) : '';
+
   const roles = (db.prepare('SELECT * FROM roles ORDER BY name ASC').all() as any[]).map((r) => ({
     ...r,
     permissions: db
@@ -1515,7 +1749,20 @@ apiRouter.get('/admin/governance', requirePerm(PERMISSIONS.DASHBOARD_VIEW), (_re
       .all(r.id)
       .map((x: any) => x.key),
   }));
-  const auditLogs = db.prepare('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 80').all();
+
+  const clauses: string[] = [];
+  const args: string[] = [];
+  if (from) {
+    clauses.push('substr(created_at, 1, 10) >= ?');
+    args.push(from);
+  }
+  if (to) {
+    clauses.push('substr(created_at, 1, 10) <= ?');
+    args.push(to);
+  }
+  const whereSql = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const limit = clauses.length ? 200 : 100;
+  const auditLogs = db.prepare(`SELECT * FROM audit_logs ${whereSql} ORDER BY created_at DESC LIMIT ${limit}`).all(...args);
   res.json({ roles, auditLogs });
 });
 

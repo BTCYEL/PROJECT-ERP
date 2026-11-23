@@ -6,9 +6,10 @@ import { LocationRow } from '../types/erp.ts';
 interface Props {
   locations: LocationRow[];
   activeLocationId: string;
+  onLocationChange?: (locationId: string) => void;
 }
 
-export function InventoryModule({ locations, activeLocationId }: Props) {
+export function InventoryModule({ locations, activeLocationId, onLocationChange }: Props) {
   const [locFilter, setLocFilter] = useState(activeLocationId === 'ALL' ? '' : activeLocationId);
   const [subTab, setSubTab] = useState<'stock' | 'batches' | 'movements'>('stock');
   const [data, setData] = useState<any>({ items: [], batches: [], movements: [], uoms: [] });
@@ -47,6 +48,15 @@ export function InventoryModule({ locations, activeLocationId }: Props) {
       setErr(e.message || 'Unable to load inventory data');
     }
   };
+
+  useEffect(() => {
+    const nextLoc = activeLocationId === 'ALL' ? '' : activeLocationId;
+    setLocFilter(nextLoc);
+    if (nextLoc) {
+      setWasteForm((f) => ({ ...f, locationId: nextLoc }));
+      setCountForm((f) => ({ ...f, locationId: nextLoc }));
+    }
+  }, [activeLocationId]);
 
   useEffect(() => {
     load();
@@ -185,7 +195,11 @@ export function InventoryModule({ locations, activeLocationId }: Props) {
         <div className="flex flex-wrap items-center gap-2">
           <select
             value={locFilter}
-            onChange={(e) => setLocFilter(e.target.value)}
+            onChange={(e) => {
+              const val = e.target.value;
+              setLocFilter(val);
+              onLocationChange?.(val || 'ALL');
+            }}
             className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium"
           >
             <option value="">All Locations</option>
@@ -380,25 +394,31 @@ export function InventoryModule({ locations, activeLocationId }: Props) {
       {modal === 'transfer' && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
           <form onSubmit={submitTransfer} className="w-full max-w-md rounded-xl bg-white p-5 space-y-3 border border-slate-200">
-            <h3 className="font-display text-base font-semibold">Transfer Stock Between Locations</h3>
-            <div className="grid grid-cols-2 gap-2">
+            <h3 className="font-display text-base font-semibold text-slate-900">Transfer Stock Between Locations</h3>
+            <div className="grid grid-cols-2 gap-2.5">
               <div>
-                <label className="text-xs text-slate-500">From</label>
-                <select value={trfForm.fromLocationId} onChange={(e) => setTrfForm({ ...trfForm, fromLocationId: e.target.value })} className="w-full rounded border px-2.5 py-2 text-xs">
+                <label className="block text-xs font-medium text-slate-600 mb-1">From Location</label>
+                <select value={trfForm.fromLocationId} onChange={(e) => setTrfForm({ ...trfForm, fromLocationId: e.target.value })} className="w-full rounded-lg border border-slate-200 px-2.5 py-2 text-xs">
                   {locations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
                 </select>
               </div>
               <div>
-                <label className="text-xs text-slate-500">To</label>
-                <select value={trfForm.toLocationId} onChange={(e) => setTrfForm({ ...trfForm, toLocationId: e.target.value })} className="w-full rounded border px-2.5 py-2 text-xs">
+                <label className="block text-xs font-medium text-slate-600 mb-1">To Location</label>
+                <select value={trfForm.toLocationId} onChange={(e) => setTrfForm({ ...trfForm, toLocationId: e.target.value })} className="w-full rounded-lg border border-slate-200 px-2.5 py-2 text-xs">
                   {locations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
                 </select>
               </div>
             </div>
-            <select value={trfForm.inventoryItemId} onChange={(e) => setTrfForm({ ...trfForm, inventoryItemId: e.target.value })} className="w-full rounded border px-2.5 py-2 text-xs">
-              {data.items.map((i: any) => <option key={i.id} value={i.id}>{i.name} ({i.uom_code})</option>)}
-            </select>
-            <input type="number" required placeholder="Quantity (base UOM)" value={trfForm.quantity} onChange={(e) => setTrfForm({ ...trfForm, quantity: e.target.value })} className="w-full rounded border px-3 py-2 text-xs font-mono" />
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Ingredient / Item</label>
+              <select value={trfForm.inventoryItemId} onChange={(e) => setTrfForm({ ...trfForm, inventoryItemId: e.target.value })} className="w-full rounded-lg border border-slate-200 px-2.5 py-2 text-xs">
+                {data.items.map((i: any) => <option key={i.id} value={i.id}>{i.name} ({i.uom_code})</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Quantity (Base UOM)</label>
+              <input type="number" required placeholder="e.g. 5000" value={trfForm.quantity} onChange={(e) => setTrfForm({ ...trfForm, quantity: e.target.value })} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono" />
+            </div>
             <div className="flex justify-end gap-2 pt-2">
               <button type="button" onClick={() => setModal(null)} className="px-4 py-2 rounded-lg border text-xs">Cancel</button>
               <button type="submit" className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold">Execute FIFO Transfer</button>
@@ -410,21 +430,36 @@ export function InventoryModule({ locations, activeLocationId }: Props) {
       {modal === 'waste' && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
           <form onSubmit={submitWaste} className="w-full max-w-md rounded-xl bg-white p-5 space-y-3 border border-slate-200">
-            <h3 className="font-display text-base font-semibold">Log Spoilage or Kitchen Waste</h3>
-            <select value={wasteForm.locationId} onChange={(e) => setWasteForm({ ...wasteForm, locationId: e.target.value })} className="w-full rounded border px-2.5 py-2 text-xs">
-              {locations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
-            </select>
-            <select value={wasteForm.inventoryItemId} onChange={(e) => setWasteForm({ ...wasteForm, inventoryItemId: e.target.value })} className="w-full rounded border px-2.5 py-2 text-xs">
-              {data.items.map((i: any) => <option key={i.id} value={i.id}>{i.name} ({i.uom_code})</option>)}
-            </select>
-            <div className="grid grid-cols-2 gap-2">
-              <select value={wasteForm.txnType} onChange={(e) => setWasteForm({ ...wasteForm, txnType: e.target.value })} className="rounded border px-2.5 py-2 text-xs">
-                <option value="OUT_WASTE">Prep Waste</option>
-                <option value="OUT_SPOILAGE">Expired / Spoiled</option>
+            <h3 className="font-display text-base font-semibold text-slate-900">Log Spoilage or Kitchen Waste</h3>
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Branch / Location</label>
+              <select value={wasteForm.locationId} onChange={(e) => setWasteForm({ ...wasteForm, locationId: e.target.value })} className="w-full rounded-lg border border-slate-200 px-2.5 py-2 text-xs">
+                {locations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
               </select>
-              <input type="number" required placeholder="Qty" value={wasteForm.quantity} onChange={(e) => setWasteForm({ ...wasteForm, quantity: e.target.value })} className="rounded border px-3 py-2 text-xs font-mono" />
             </div>
-            <input type="text" required placeholder="Reason" value={wasteForm.reason} onChange={(e) => setWasteForm({ ...wasteForm, reason: e.target.value })} className="w-full rounded border px-3 py-2 text-xs" />
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Ingredient / Item</label>
+              <select value={wasteForm.inventoryItemId} onChange={(e) => setWasteForm({ ...wasteForm, inventoryItemId: e.target.value })} className="w-full rounded-lg border border-slate-200 px-2.5 py-2 text-xs">
+                {data.items.map((i: any) => <option key={i.id} value={i.id}>{i.name} ({i.uom_code})</option>)}
+              </select>
+            </div>
+            <div className="grid grid-cols-2 gap-2.5">
+              <div>
+                <label className="block text-xs font-medium text-slate-600 mb-1">Loss Type</label>
+                <select value={wasteForm.txnType} onChange={(e) => setWasteForm({ ...wasteForm, txnType: e.target.value })} className="w-full rounded-lg border border-slate-200 px-2.5 py-2 text-xs">
+                  <option value="OUT_WASTE">Prep Waste</option>
+                  <option value="OUT_SPOILAGE">Expired / Spoiled</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-600 mb-1">Quantity (Base UOM)</label>
+                <input type="number" required placeholder="Qty" value={wasteForm.quantity} onChange={(e) => setWasteForm({ ...wasteForm, quantity: e.target.value })} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono" />
+              </div>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Reason / Cause</label>
+              <input type="text" required placeholder="e.g. Over-trimmed or expired batch" value={wasteForm.reason} onChange={(e) => setWasteForm({ ...wasteForm, reason: e.target.value })} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs" />
+            </div>
             <div className="flex justify-end gap-2 pt-2">
               <button type="button" onClick={() => setModal(null)} className="px-4 py-2 rounded-lg border text-xs">Cancel</button>
               <button type="submit" className="px-4 py-2 rounded-lg bg-red-600 text-white text-xs font-semibold">Record Loss</button>
@@ -436,15 +471,27 @@ export function InventoryModule({ locations, activeLocationId }: Props) {
       {modal === 'count' && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
           <form onSubmit={submitCount} className="w-full max-w-md rounded-xl bg-white p-5 space-y-3 border border-slate-200">
-            <h3 className="font-display text-base font-semibold">Physical Stock Count Reconciliation</h3>
-            <select value={countForm.locationId} onChange={(e) => setCountForm({ ...countForm, locationId: e.target.value })} className="w-full rounded border px-2.5 py-2 text-xs">
-              {locations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
-            </select>
-            <select value={countForm.inventoryItemId} onChange={(e) => setCountForm({ ...countForm, inventoryItemId: e.target.value })} className="w-full rounded border px-2.5 py-2 text-xs">
-              {data.items.map((i: any) => <option key={i.id} value={i.id}>{i.name} ({i.uom_code})</option>)}
-            </select>
-            <input type="number" required placeholder="Actual Counted Quantity (base UOM)" value={countForm.countedQty} onChange={(e) => setCountForm({ ...countForm, countedQty: e.target.value })} className="w-full rounded border px-3 py-2 text-xs font-mono" />
-            <input type="text" placeholder="Notes" value={countForm.notes} onChange={(e) => setCountForm({ ...countForm, notes: e.target.value })} className="w-full rounded border px-3 py-2 text-xs" />
+            <h3 className="font-display text-base font-semibold text-slate-900">Physical Stock Count Reconciliation</h3>
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Branch / Location</label>
+              <select value={countForm.locationId} onChange={(e) => setCountForm({ ...countForm, locationId: e.target.value })} className="w-full rounded-lg border border-slate-200 px-2.5 py-2 text-xs">
+                {locations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Ingredient / Item</label>
+              <select value={countForm.inventoryItemId} onChange={(e) => setCountForm({ ...countForm, inventoryItemId: e.target.value })} className="w-full rounded-lg border border-slate-200 px-2.5 py-2 text-xs">
+                {data.items.map((i: any) => <option key={i.id} value={i.id}>{i.name} ({i.uom_code})</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Actual Counted Quantity (Base UOM)</label>
+              <input type="number" required placeholder="e.g. 12500" value={countForm.countedQty} onChange={(e) => setCountForm({ ...countForm, countedQty: e.target.value })} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono" />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Reconciliation Notes</label>
+              <input type="text" placeholder="Optional variance remarks" value={countForm.notes} onChange={(e) => setCountForm({ ...countForm, notes: e.target.value })} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs" />
+            </div>
             <div className="flex justify-end gap-2 pt-2">
               <button type="button" onClick={() => setModal(null)} className="px-4 py-2 rounded-lg border text-xs">Cancel</button>
               <button type="submit" className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold">Post Adjustment</button>

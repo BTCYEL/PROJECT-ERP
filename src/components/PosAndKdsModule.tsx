@@ -11,6 +11,7 @@ import {
   RotateCcw,
   ChefHat,
   Utensils,
+  SlidersHorizontal,
 } from 'lucide-react';
 import { apiFetch, formatPHP } from '../lib/api.ts';
 import { AuthUser, LocationRow, PERMISSIONS } from '../types/erp.ts';
@@ -20,6 +21,8 @@ interface Props {
   user: AuthUser;
   locations: LocationRow[];
   activeLocationId: string;
+  onLocationChange?: (locationId: string) => void;
+  onLocationsChanged?: () => Promise<void> | void;
 }
 
 interface CartLine {
@@ -36,13 +39,45 @@ interface CartLine {
 
 const OFFLINE_QUEUE_KEY = 'maximus_bbq_offline_pos_queue';
 
-export function PosAndKdsModule({ mode, user, locations, activeLocationId }: Props) {
-  const truckLocations = useMemo(() => locations.filter((l) => l.type === 'FOOD_TRUCK'), [locations]);
-  const [posLocationId, setPosLocationId] = useState<string>(
-    activeLocationId !== 'ALL' && truckLocations.some((t) => t.id === activeLocationId)
-      ? activeLocationId
-      : truckLocations[0]?.id || '',
+const isLocationKdsEnabled = (loc?: LocationRow | null): boolean => {
+  if (!loc) return true;
+  return loc.kds_enabled === undefined ? loc.type === 'FOOD_TRUCK' : loc.kds_enabled === 1;
+};
+
+export function PosAndKdsModule({ mode, user, locations, activeLocationId, onLocationChange, onLocationsChanged }: Props) {
+  const posSelectableLocations = useMemo(
+    () => locations.filter((l) => l.type === 'FOOD_TRUCK' || isLocationKdsEnabled(l)),
+    [locations],
   );
+  const kdsSelectableLocations = useMemo(
+    () => locations.filter((l) => isLocationKdsEnabled(l)),
+    [locations],
+  );
+  const selectableLocations = mode === 'kds' ? kdsSelectableLocations : posSelectableLocations;
+
+  const [posLocationId, setPosLocationId] = useState<string>(
+    activeLocationId !== 'ALL' && locations.some((t) => t.id === activeLocationId)
+      ? activeLocationId
+      : mode === 'kds'
+        ? ''
+        : posSelectableLocations[0]?.id || '',
+  );
+
+  useEffect(() => {
+    if (activeLocationId !== 'ALL' && locations.some((t) => t.id === activeLocationId)) {
+      if (mode === 'kds' || posSelectableLocations.some((t) => t.id === activeLocationId)) {
+        setPosLocationId(activeLocationId);
+      } else {
+        setPosLocationId((prev) => (posSelectableLocations.some((t) => t.id === prev) ? prev : posSelectableLocations[0]?.id || ''));
+      }
+    } else if (activeLocationId === 'ALL') {
+      if (mode === 'kds') {
+        setPosLocationId('');
+      } else {
+        setPosLocationId((prev) => (posSelectableLocations.some((t) => t.id === prev) ? prev : posSelectableLocations[0]?.id || ''));
+      }
+    }
+  }, [activeLocationId, mode, locations, posSelectableLocations]);
 
   // Catalog & POS state
   const [categories, setCategories] = useState<any[]>([]);
@@ -86,8 +121,13 @@ export function PosAndKdsModule({ mode, user, locations, activeLocationId }: Pro
 
   // KDS state
   const [kdsOrders, setKdsOrders] = useState<any[]>([]);
+  const [showKdsSettings, setShowKdsSettings] = useState(false);
+  const [togglingKdsLocId, setTogglingKdsLocId] = useState<string | null>(null);
 
   const canRefund = user.roleCode === 'SUPER_ADMIN' || user.roleCode === 'BUSINESS_OWNER' || user.permissions.includes(PERMISSIONS.POS_REFUND);
+  const canManageFleet = user.roleCode === 'SUPER_ADMIN' || user.roleCode === 'BUSINESS_OWNER' || user.permissions.includes(PERMISSIONS.FLEET_MANAGE);
+  const selectedLocationObj = useMemo(() => locations.find((l) => l.id === posLocationId) || null, [locations, posLocationId]);
+  const selectedLocKdsEnabled = selectedLocationObj ? isLocationKdsEnabled(selectedLocationObj) : kdsSelectableLocations.length > 0;
 
   const loadPosData = async () => {
     try {
@@ -235,8 +275,38 @@ export function PosAndKdsModule({ mode, user, locations, activeLocationId }: Pro
         const next = [...offlineQueue, payload];
         localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(next));
         setOfflineQueue(next);
+        const activeLoc = locations.find((l) => l.id === posLocationId);
+        let offlineSub = 0;
+        let offlineTax = 0;
+        for (const c of cart) {
+          const prod = products.find((p) => p.id === c.productId);
+          const lineGross = c.unitPrice * c.quantity;
+          const rate = Number(prod?.rate_percent ?? 12);
+          const isInc = prod?.is_inclusive !== 0;
+          if (rate > 0) {
+            const r = rate / 100;
+            if (isInc) {
+              const t = Math.round((lineGross - lineGross / (1 + r)) * 100) / 100;
+              offlineTax += t;
+              offlineSub += Math.round((lineGross - t) * 100) / 100;
+            } else {
+              const t = Math.round(lineGross * r * 100) / 100;
+              offlineTax += t;
+              offlineSub += lineGross;
+            }
+          } else {
+            offlineSub += lineGross;
+          }
+        }
         setReceiptModal({
           receipt_number: `OFFLINE-${payload.clientTxnId.slice(0, 6).toUpperCase()}`,
+          location_id: posLocationId,
+          location_name: activeLoc?.name || 'Food Truck',
+          location_address: activeLoc?.address || '',
+          sold_at: payload.soldAt,
+          subtotal: Math.round(offlineSub * 100) / 100,
+          discount_amount: discountAmount,
+          tax_amount: Math.round(offlineTax * 100) / 100,
           total_amount: cartTotal,
           items: cart.map((c) => ({ product_name: c.name, variant_name: c.variantName, quantity: c.quantity, line_total: c.unitPrice * c.quantity })),
           payments: effectivePayments,
@@ -288,6 +358,26 @@ export function PosAndKdsModule({ mode, user, locations, activeLocationId }: Pro
     }
   };
 
+  const toggleLocationKds = async (loc: LocationRow, nextEnabled: boolean) => {
+    setTogglingKdsLocId(loc.id);
+    setFeedback(null);
+    try {
+      await apiFetch(`/fleet/locations/${loc.id}/kds`, {
+        method: 'PATCH',
+        body: JSON.stringify({ kdsEnabled: nextEnabled }),
+      });
+      await Promise.all([onLocationsChanged?.(), loadKdsOrders()]);
+      setFeedback({
+        type: 'ok',
+        msg: `KDS ${nextEnabled ? 'enabled' : 'disabled'} for ${loc.name}.`,
+      });
+    } catch (err: any) {
+      setFeedback({ type: 'err', msg: err.message || 'Failed to update KDS setting' });
+    } finally {
+      setTogglingKdsLocId(null);
+    }
+  };
+
   // ==========================================
   // KITCHEN DISPLAY SYSTEM (KDS) VIEW
   // ==========================================
@@ -297,6 +387,9 @@ export function PosAndKdsModule({ mode, user, locations, activeLocationId }: Pro
       { key: 'PREPARING', label: 'On the Grill', next: 'READY', btnLabel: 'Mark Ready' },
       { key: 'READY', label: 'Ready for Pickup', next: 'COMPLETED', btnLabel: 'Handed Off' },
     ];
+    const currentLocationKdsDisabled = Boolean(selectedLocationObj && !isLocationKdsEnabled(selectedLocationObj));
+    const allLocationsKdsDisabled = !selectedLocationObj && kdsSelectableLocations.length === 0;
+
     return (
       <div className="space-y-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -305,19 +398,40 @@ export function PosAndKdsModule({ mode, user, locations, activeLocationId }: Pro
               <ChefHat className="w-6 h-6 text-slate-700" />
               Kitchen Display System (KDS)
             </h1>
-            <p className="text-sm text-slate-500">Live preparation queue across active food trucks</p>
+            <p className="text-sm text-slate-500">Live preparation queue across KDS-enabled trucks &amp; locations</p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <select
               value={posLocationId}
-              onChange={(e) => setPosLocationId(e.target.value)}
+              onChange={(e) => {
+                const val = e.target.value;
+                setPosLocationId(val);
+                onLocationChange?.(val || 'ALL');
+              }}
               className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium"
             >
-              <option value="">All Trucks</option>
-              {truckLocations.map((t) => (
+              <option value="">All KDS-Enabled Locations ({kdsSelectableLocations.length})</option>
+              {kdsSelectableLocations.map((t) => (
                 <option key={t.id} value={t.id}>{t.name}</option>
               ))}
+              {selectedLocationObj && !isLocationKdsEnabled(selectedLocationObj) && (
+                <option value={selectedLocationObj.id}>{selectedLocationObj.name} (KDS Disabled)</option>
+              )}
             </select>
+            {canManageFleet && (
+              <button
+                type="button"
+                onClick={() => setShowKdsSettings((v) => !v)}
+                className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium ${
+                  showKdsSettings
+                    ? 'border-slate-900 bg-slate-900 text-white'
+                    : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                }`}
+              >
+                <SlidersHorizontal className="w-3.5 h-3.5" />
+                KDS Settings
+              </button>
+            )}
             <button
               onClick={loadKdsOrders}
               className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium hover:bg-slate-50"
@@ -328,52 +442,148 @@ export function PosAndKdsModule({ mode, user, locations, activeLocationId }: Pro
           </div>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
-          {lanes.map((lane) => {
-            const laneOrders = kdsOrders.filter((o) => o.kds_status === lane.key);
-            return (
-              <div key={lane.key} className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
-                <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
-                  <h2 className="font-display text-sm font-semibold text-slate-900">{lane.label}</h2>
-                  <span className="font-mono text-xs text-slate-500">{laneOrders.length} tickets</span>
-                </div>
-                {laneOrders.length === 0 ? (
-                  <p className="py-10 text-center text-xs text-slate-400">No tickets in {lane.label.toLowerCase()}</p>
-                ) : (
-                  laneOrders.map((ord) => (
-                    <div key={ord.id} className="rounded-lg border border-slate-200 bg-slate-50 p-3.5 space-y-2.5">
-                      <div className="flex items-center justify-between text-xs">
-                        <span className="font-mono font-semibold text-slate-900">{ord.receipt_number}</span>
-                        <span className="text-slate-500">{ord.channel} · {ord.location_name}</span>
-                      </div>
-                      <ul className="space-y-1.5 text-sm">
-                        {ord.items.map((it: any) => (
-                          <li key={it.id} className="text-slate-800">
-                            <span className="font-mono font-semibold mr-1.5">{it.quantity}x</span>
-                            <span className="font-medium">{it.product_name}</span>
-                            {it.variant_name && it.variant_name !== 'Standard' && (
-                              <span className="text-xs text-slate-500 ml-1">({it.variant_name})</span>
-                            )}
-                            {it.kitchen_notes && (
-                              <p className="text-xs text-amber-700 ml-6">Note: {it.kitchen_notes}</p>
-                            )}
-                          </li>
-                        ))}
-                      </ul>
-                      {ord.notes && <p className="text-xs text-slate-600 italic">Order note: {ord.notes}</p>}
-                      <button
-                        onClick={() => advanceKds(ord.id, lane.next)}
-                        className="w-full rounded-lg bg-slate-900 py-2 text-xs font-semibold text-white hover:bg-slate-800"
-                      >
-                        {lane.btnLabel}
-                      </button>
+        {feedback && (
+          <div
+            className={`p-3 rounded-lg border text-xs font-medium ${
+              feedback.type === 'ok'
+                ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                : 'bg-red-50 border-red-200 text-red-700'
+            }`}
+          >
+            {feedback.msg}
+          </div>
+        )}
+
+        {showKdsSettings && canManageFleet && (
+          <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
+              <div>
+                <h2 className="font-display text-sm font-semibold text-slate-900">KDS Availability per Truck &amp; Location</h2>
+                <p className="text-[11px] text-slate-500">
+                  Enable KDS to route POS orders into the prep queue, or disable KDS for direct POS order completion.
+                </p>
+              </div>
+              <span className="text-[11px] font-mono text-slate-500">
+                {kdsSelectableLocations.length} / {locations.length} enabled
+              </span>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+              {locations.map((loc) => {
+                const enabled = isLocationKdsEnabled(loc);
+                return (
+                  <div
+                    key={loc.id}
+                    className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50/70 px-3 py-2.5"
+                  >
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold text-slate-900 truncate">{loc.name}</p>
+                      <p className="text-[11px] text-slate-500">
+                        {loc.code} · {loc.type === 'COMMISSARY' ? 'Commissary' : 'Food Truck'}
+                      </p>
                     </div>
-                  ))
+                    <button
+                      type="button"
+                      disabled={togglingKdsLocId === loc.id}
+                      onClick={() => toggleLocationKds(loc, !enabled)}
+                      className={`rounded-md border px-2.5 py-1 text-[11px] font-semibold whitespace-nowrap shrink-0 transition-colors disabled:opacity-50 ${
+                        enabled
+                          ? 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+                          : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-100'
+                      }`}
+                    >
+                      {togglingKdsLocId === loc.id ? 'Saving...' : enabled ? 'Enabled' : 'Disabled'}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {currentLocationKdsDisabled || allLocationsKdsDisabled ? (
+          <div className="rounded-xl border border-slate-200 bg-white p-8 text-center space-y-3">
+            <ChefHat className="w-8 h-8 text-slate-400 mx-auto" />
+            <div className="space-y-1 max-w-md mx-auto">
+              <h2 className="font-display text-base font-semibold text-slate-900">
+                {currentLocationKdsDisabled
+                  ? `KDS is Disabled for ${selectedLocationObj?.name}`
+                  : 'KDS is Disabled Across All Locations'}
+              </h2>
+              <p className="text-xs text-slate-500">
+                Orders completed at POS for {currentLocationKdsDisabled ? 'this truck / location' : 'disabled locations'} are marked completed immediately without entering the kitchen queue.
+              </p>
+            </div>
+            {canManageFleet && (
+              <div className="pt-1 flex justify-center gap-2">
+                {currentLocationKdsDisabled && selectedLocationObj ? (
+                  <button
+                    type="button"
+                    disabled={togglingKdsLocId === selectedLocationObj.id}
+                    onClick={() => toggleLocationKds(selectedLocationObj, true)}
+                    className="rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50"
+                  >
+                    {togglingKdsLocId === selectedLocationObj.id ? 'Enabling...' : `Enable KDS for ${selectedLocationObj.name}`}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setShowKdsSettings(true)}
+                    className="rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800"
+                  >
+                    Configure KDS Locations
+                  </button>
                 )}
               </div>
-            );
-          })}
-        </div>
+            )}
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
+            {lanes.map((lane) => {
+              const laneOrders = kdsOrders.filter((o) => o.kds_status === lane.key);
+              return (
+                <div key={lane.key} className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+                  <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
+                    <h2 className="font-display text-sm font-semibold text-slate-900">{lane.label}</h2>
+                    <span className="font-mono text-xs text-slate-500">{laneOrders.length} tickets</span>
+                  </div>
+                  {laneOrders.length === 0 ? (
+                    <p className="py-10 text-center text-xs text-slate-400">No tickets in {lane.label.toLowerCase()}</p>
+                  ) : (
+                    laneOrders.map((ord) => (
+                      <div key={ord.id} className="rounded-lg border border-slate-200 bg-slate-50 p-3.5 space-y-2.5">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-mono font-semibold text-slate-900">{ord.receipt_number}</span>
+                          <span className="text-slate-500">{ord.channel} · {ord.location_name}</span>
+                        </div>
+                        <ul className="space-y-1.5 text-sm">
+                          {ord.items.map((it: any) => (
+                            <li key={it.id} className="text-slate-800">
+                              <span className="font-mono font-semibold mr-1.5">{it.quantity}x</span>
+                              <span className="font-medium">{it.product_name}</span>
+                              {it.variant_name && it.variant_name !== 'Standard' && (
+                                <span className="text-xs text-slate-500 ml-1">({it.variant_name})</span>
+                              )}
+                              {it.kitchen_notes && (
+                                <p className="text-xs text-amber-700 ml-6">Note: {it.kitchen_notes}</p>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                        {ord.notes && <p className="text-xs text-slate-600 italic">Order note: {ord.notes}</p>}
+                        <button
+                          onClick={() => advanceKds(ord.id, lane.next)}
+                          className="w-full rounded-lg bg-slate-900 py-2 text-xs font-semibold text-white hover:bg-slate-800"
+                        >
+                          {lane.btnLabel}
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
     );
   }
@@ -384,17 +594,37 @@ export function PosAndKdsModule({ mode, user, locations, activeLocationId }: Pro
   return (
     <div className="space-y-4">
       {/* POS Top Controls */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
+      <div className={`flex flex-wrap items-center justify-between gap-3 ${receiptModal ? 'no-print' : ''}`}>
         <div className="flex flex-wrap items-center gap-2">
           <select
             value={posLocationId}
-            onChange={(e) => setPosLocationId(e.target.value)}
+            onChange={(e) => {
+              const val = e.target.value;
+              setPosLocationId(val);
+              onLocationChange?.(val);
+            }}
             className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-800"
           >
-            {truckLocations.map((t) => (
+            {selectableLocations.map((t) => (
               <option key={t.id} value={t.id}>{t.name}</option>
             ))}
           </select>
+
+          <span
+            className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-2 text-[11px] font-semibold whitespace-nowrap ${
+              selectedLocKdsEnabled
+                ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                : 'border-slate-200 bg-slate-100 text-slate-600'
+            }`}
+            title={
+              selectedLocKdsEnabled
+                ? 'Orders sent to Kitchen Display System (KDS)'
+                : 'KDS disabled for this location; orders complete directly'
+            }
+          >
+            <ChefHat className="w-3.5 h-3.5" />
+            {selectedLocKdsEnabled ? 'KDS Active' : 'KDS Off · Direct'}
+          </span>
 
           <button
             onClick={() => setSimulateOffline((v) => !v)}
@@ -430,7 +660,7 @@ export function PosAndKdsModule({ mode, user, locations, activeLocationId }: Pro
 
       {feedback && (
         <div
-          className={`p-3 rounded-lg border text-xs font-medium ${
+          className={`p-3 rounded-lg border text-xs font-medium ${receiptModal ? 'no-print' : ''} ${
             feedback.type === 'ok'
               ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
               : 'bg-red-50 border-red-200 text-red-700'
@@ -441,7 +671,7 @@ export function PosAndKdsModule({ mode, user, locations, activeLocationId }: Pro
       )}
 
       {showHistory ? (
-        <div className="rounded-xl border border-slate-200 bg-white overflow-x-auto">
+        <div className={`rounded-xl border border-slate-200 bg-white overflow-x-auto ${receiptModal ? 'no-print' : ''}`}>
           <table className="w-full text-left text-xs">
             <thead className="border-b border-slate-200 bg-slate-50 text-slate-500">
               <tr>
@@ -484,7 +714,7 @@ export function PosAndKdsModule({ mode, user, locations, activeLocationId }: Pro
           </table>
         </div>
       ) : (
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+        <div className={`grid grid-cols-1 lg:grid-cols-12 gap-5 items-start ${receiptModal ? 'no-print' : ''}`}>
           {/* Left 7 cols: Menu Catalog */}
           <div className="lg:col-span-7 space-y-4">
             <div className="flex flex-wrap items-center gap-2">
@@ -574,6 +804,7 @@ export function PosAndKdsModule({ mode, user, locations, activeLocationId }: Pro
             </div>
 
             <div>
+              <label className="block text-[11px] font-medium text-slate-600 mb-1">Customer / Loyalty Member</label>
               <select
                 value={selectedCustomerId}
                 onChange={(e) => setSelectedCustomerId(e.target.value)}
@@ -644,13 +875,16 @@ export function PosAndKdsModule({ mode, user, locations, activeLocationId }: Pro
                   className="w-24 rounded border border-slate-200 px-2 py-1 text-right font-mono"
                 />
               </div>
-              <input
-                type="text"
-                placeholder="Order notes / table buzzer #..."
-                value={orderNotes}
-                onChange={(e) => setOrderNotes(e.target.value)}
-                className="w-full rounded border border-slate-200 px-2.5 py-1.5 text-xs"
-              />
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">Order Notes / Table Buzzer #</label>
+                <input
+                  type="text"
+                  placeholder="Order notes / table buzzer #..."
+                  value={orderNotes}
+                  onChange={(e) => setOrderNotes(e.target.value)}
+                  className="w-full rounded border border-slate-200 px-2.5 py-1.5 text-xs"
+                />
+              </div>
               <div className="flex items-center justify-between pt-1 text-base font-bold text-slate-900">
                 <span>Total Due (VAT Incl.)</span>
                 <span className="font-mono tabular-nums text-lg">{formatPHP(cartTotal)}</span>
@@ -669,9 +903,16 @@ export function PosAndKdsModule({ mode, user, locations, activeLocationId }: Pro
                   + Add Split
                 </button>
               </div>
+              <div className="grid grid-cols-12 gap-1.5 text-[11px] font-medium text-slate-500">
+                <span className="col-span-5">Method</span>
+                <span className="col-span-4 text-right">Amount (PHP)</span>
+                <span className="col-span-2">Ref #</span>
+                <span className="col-span-1" />
+              </div>
               {paymentRows.map((row, idx) => (
                 <div key={idx} className="grid grid-cols-12 gap-1.5 items-center">
                   <select
+                    aria-label="Payment Method"
                     value={row.method}
                     onChange={(e) =>
                       setPaymentRows((prev) => prev.map((r, i) => (i === idx ? { ...r, method: e.target.value } : r)))
@@ -685,6 +926,7 @@ export function PosAndKdsModule({ mode, user, locations, activeLocationId }: Pro
                   </select>
                   <input
                     type="number"
+                    aria-label="Payment Amount"
                     placeholder={idx === 0 && paymentRows.length === 1 ? String(cartTotal) : 'Amount'}
                     value={row.amount}
                     onChange={(e) =>
@@ -694,6 +936,7 @@ export function PosAndKdsModule({ mode, user, locations, activeLocationId }: Pro
                   />
                   <input
                     type="text"
+                    aria-label="Reference Number"
                     placeholder="Ref #"
                     value={row.referenceNo}
                     onChange={(e) =>
@@ -811,43 +1054,151 @@ export function PosAndKdsModule({ mode, user, locations, activeLocationId }: Pro
       )}
 
       {/* Printable Receipt Modal */}
-      {receiptModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-sm rounded-xl bg-white p-6 space-y-4 border border-slate-200">
-            <div className="text-center border-b border-dashed border-slate-300 pb-3 space-y-1">
-              <img
-                src="/assets/aistudio/Logo_836b4628.png"
-                alt="Maximus Barbecue Logo"
-                referrerPolicy="no-referrer"
-                className="w-12 h-12 mx-auto rounded-full object-contain"
-              />
-              <h3 className="font-display font-bold text-base">Maximus Barbecue ERP</h3>
-              <p className="text-xs text-slate-500 font-mono mt-0.5">{receiptModal.receipt_number}</p>
-              {receiptModal.offline && <p className="text-xs text-amber-700 font-medium mt-1">OFFLINE QUEUED RECEIPT</p>}
-            </div>
-            <div className="space-y-1.5 text-xs">
-              {(receiptModal.items || []).map((it: any, idx: number) => (
-                <div key={idx} className="flex justify-between">
-                  <span>{it.quantity}x {it.product_name}</span>
-                  <span className="font-mono tabular-nums">{formatPHP(it.line_total)}</span>
+      {receiptModal && (() => {
+        const receiptLoc = locations.find((l) => l.id === (receiptModal.location_id || posLocationId));
+        const truckName = receiptModal.location_name || receiptLoc?.name || 'Maximus Food Truck';
+        const truckLocation = receiptModal.location_address || receiptLoc?.address || receiptModal.truck_site || '';
+        const receiptDate = receiptModal.sold_at
+          ? new Date(receiptModal.sold_at).toLocaleString('en-PH', {
+              year: 'numeric',
+              month: 'short',
+              day: '2-digit',
+              hour: '2-digit',
+              minute: '2-digit',
+              hour12: true,
+            })
+          : new Date().toLocaleString('en-PH');
+        const totalDue = Number(receiptModal.total_amount || 0);
+        const discountAmt = Number(receiptModal.discount_amount || 0);
+        const vatAmt =
+          receiptModal.tax_amount !== undefined && receiptModal.tax_amount !== null
+            ? Number(receiptModal.tax_amount)
+            : Math.round((totalDue - totalDue / 1.12) * 100) / 100;
+        const vatableSales =
+          receiptModal.subtotal !== undefined && receiptModal.subtotal !== null
+            ? Number(receiptModal.subtotal)
+            : Math.round((totalDue + discountAmt - vatAmt) * 100) / 100;
+        const payments = Array.isArray(receiptModal.payments) ? receiptModal.payments : [];
+        const totalPaid = payments.reduce((sum: number, p: any) => sum + Number(p.amount || 0), 0);
+        const changeDue = Math.max(0, Math.round((totalPaid - totalDue) * 100) / 100);
+        const formatMethod = (m: string) => {
+          switch (m) {
+            case 'CASH':
+              return 'Cash';
+            case 'E_WALLET':
+              return 'E-Wallet';
+            case 'CARD':
+              return 'Card';
+            case 'BANK_TRANSFER':
+              return 'Bank Transfer';
+            default:
+              return m || 'Cash';
+          }
+        };
+
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 print:static print:bg-transparent print:p-0 print:block">
+            <div className="w-full max-w-sm rounded-xl bg-white p-6 space-y-4 border border-slate-200 print:border-0 print:shadow-none print:mx-auto">
+              <div className="text-center border-b border-dashed border-slate-300 pb-3 space-y-1">
+                <img
+                  src="/assets/aistudio/Logo_836b4628.png"
+                  alt="Maximus Barbecue Logo"
+                  referrerPolicy="no-referrer"
+                  className="w-12 h-12 mx-auto rounded-full object-contain"
+                />
+                <h3 className="font-display font-bold text-base text-slate-900">Maximus Barbecue ERP</h3>
+                <p className="text-xs font-semibold text-slate-800">{truckName}</p>
+                {truckLocation && <p className="text-[11px] text-slate-500">{truckLocation}</p>}
+                <p className="text-xs text-slate-600 font-mono pt-1">Receipt No.: {receiptModal.receipt_number}</p>
+                <p className="text-[11px] text-slate-500 font-mono">Date: {receiptDate}</p>
+                {receiptModal.offline && <p className="text-xs text-amber-700 font-medium mt-1">OFFLINE QUEUED RECEIPT</p>}
+              </div>
+
+              <div className="space-y-1.5 text-xs">
+                {(receiptModal.items || []).map((it: any, idx: number) => (
+                  <div key={idx} className="flex justify-between gap-2">
+                    <span className="text-slate-800">
+                      {it.quantity}x {it.product_name}
+                      {it.variant_name && it.variant_name !== 'Standard' ? ` (${it.variant_name})` : ''}
+                    </span>
+                    <span className="font-mono tabular-nums text-slate-900 shrink-0">{formatPHP(it.line_total)}</span>
+                  </div>
+                ))}
+              </div>
+
+              <div className="border-t border-dashed border-slate-300 pt-2.5 space-y-1.5">
+                {discountAmt > 0 && (
+                  <div className="flex justify-between text-xs text-slate-600">
+                    <span>Discount</span>
+                    <span className="font-mono tabular-nums">-{formatPHP(discountAmt)}</span>
+                  </div>
+                )}
+                <div className="flex justify-between font-bold text-sm text-slate-900">
+                  <span>TOTAL DUE</span>
+                  <span className="font-mono tabular-nums">{formatPHP(totalDue)}</span>
                 </div>
-              ))}
-            </div>
-            <div className="border-t border-dashed border-slate-300 pt-2.5 flex justify-between font-bold text-sm">
-              <span>TOTAL</span>
-              <span className="font-mono tabular-nums">{formatPHP(receiptModal.total_amount)}</span>
-            </div>
-            <div className="flex justify-end gap-2 no-print pt-2">
-              <button onClick={() => window.print()} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border text-xs font-medium">
-                <Printer className="w-3.5 h-3.5" /> Print
-              </button>
-              <button onClick={() => setReceiptModal(null)} className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold">
-                Done
-              </button>
+
+                {/* Payment Method(s) Used */}
+                <div className="border-t border-dashed border-slate-200 pt-2 space-y-1 text-xs">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Payment Method</p>
+                  {payments.length > 0 ? (
+                    payments.map((p: any, idx: number) => (
+                      <div key={idx} className="flex justify-between text-slate-700">
+                        <span>
+                          {formatMethod(p.method)}
+                          {(p.reference_no || p.referenceNo) ? ` (Ref: ${p.reference_no || p.referenceNo})` : ''}
+                        </span>
+                        <span className="font-mono tabular-nums">{formatPHP(p.amount)}</span>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="flex justify-between text-slate-700">
+                      <span>Cash</span>
+                      <span className="font-mono tabular-nums">{formatPHP(totalDue)}</span>
+                    </div>
+                  )}
+                  {changeDue > 0 && (
+                    <div className="flex justify-between text-slate-600">
+                      <span>Change</span>
+                      <span className="font-mono tabular-nums">{formatPHP(changeDue)}</span>
+                    </div>
+                  )}
+                </div>
+
+                {/* VAT Computation */}
+                <div className="border-t border-dashed border-slate-200 pt-2 space-y-1 text-xs text-slate-600">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">VAT Computation</p>
+                  <div className="flex justify-between">
+                    <span>VATable Sales</span>
+                    <span className="font-mono tabular-nums">{formatPHP(vatableSales)}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>VAT (12%)</span>
+                    <span className="font-mono tabular-nums">{formatPHP(vatAmt)}</span>
+                  </div>
+                  <div className="flex justify-between font-medium text-slate-800">
+                    <span>Total Amount</span>
+                    <span className="font-mono tabular-nums">{formatPHP(totalDue)}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="border-t border-dashed border-slate-300 pt-3 text-center">
+                <p className="text-xs font-semibold text-slate-800">Thank you come again!</p>
+              </div>
+
+              <div className="flex justify-end gap-2 no-print pt-1">
+                <button onClick={() => window.print()} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border text-xs font-medium hover:bg-slate-50">
+                  <Printer className="w-3.5 h-3.5" /> Print
+                </button>
+                <button onClick={() => setReceiptModal(null)} className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800">
+                  Done
+                </button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Refund Authorization Modal */}
       {refundTarget && (
@@ -859,13 +1210,16 @@ export function PosAndKdsModule({ mode, user, locations, activeLocationId }: Pro
             <p className="text-xs text-slate-600">
               Refunding {formatPHP(refundTarget.total_amount)} will preserve the audit trail and automatically post an equal-and-opposite reversing Journal Entry.
             </p>
-            <input
-              type="text"
-              placeholder="Reason for refund (required for audit log)"
-              value={refundReason}
-              onChange={(e) => setRefundReason(e.target.value)}
-              className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
-            />
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Refund Reason (for audit log)</label>
+              <input
+                type="text"
+                placeholder="Reason for refund (required for audit log)"
+                value={refundReason}
+                onChange={(e) => setRefundReason(e.target.value)}
+                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+              />
+            </div>
             <div className="flex justify-end gap-2">
               <button onClick={() => setRefundTarget(null)} className="px-4 py-2 rounded-lg border text-xs font-medium">Cancel</button>
               <button onClick={handleRefund} className="px-4 py-2 rounded-lg bg-red-600 text-white text-xs font-semibold">

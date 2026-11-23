@@ -6,10 +6,11 @@ import { LocationRow } from '../types/erp.ts';
 interface Props {
   locations: LocationRow[];
   activeLocationId: string;
+  onLocationChange?: (locationId: string) => void;
   onNavigate: (tab: string) => void;
 }
 
-export function DashboardModule({ locations, activeLocationId, onNavigate }: Props) {
+export function DashboardModule({ locations, activeLocationId, onLocationChange, onNavigate }: Props) {
   const [period, setPeriod] = useState<'today' | '7d' | '30d'>('30d');
   const [locationFilter, setLocationFilter] = useState<string>(activeLocationId === 'ALL' ? '' : activeLocationId);
   const [data, setData] = useState<any>(null);
@@ -103,7 +104,11 @@ export function DashboardModule({ locations, activeLocationId, onNavigate }: Pro
 
           <select
             value={locationFilter}
-            onChange={(e) => setLocationFilter(e.target.value)}
+            onChange={(e) => {
+              const val = e.target.value;
+              setLocationFilter(val);
+              onLocationChange?.(val || 'ALL');
+            }}
             className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700"
           >
             <option value="">All Trucks &amp; Commissary</option>

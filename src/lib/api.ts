@@ -1,28 +1,21 @@
-const TOKEN_KEY = 'maximus_bbq_token';
+import { auth } from './firebase.ts';
+import { firestoreApiRequest, getActiveErpUserId, setActiveErpUserId } from './firestoreErp.ts';
 
 export function getAuthToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY);
+  return auth.currentUser ? getActiveErpUserId() || 'firebase-session' : null;
 }
 
 export function setAuthToken(token: string | null) {
-  if (token) localStorage.setItem(TOKEN_KEY, token);
-  else localStorage.removeItem(TOKEN_KEY);
+  if (!token) {
+    setActiveErpUserId(null);
+  }
 }
 
 export async function apiFetch<T = any>(path: string, options: RequestInit = {}): Promise<T> {
-  const token = getAuthToken();
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    ...(options.headers as Record<string, string> | undefined),
-  };
-  if (token) headers.Authorization = `Bearer ${token}`;
-
-  const res = await fetch(`/api/v1${path}`, { ...options, headers });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(data.error || `Request failed (${res.status})`);
+  if (!auth.currentUser) {
+    throw new Error('Authentication required. Please sign in with Google.');
   }
-  return data as T;
+  return firestoreApiRequest<T>(path, options);
 }
 
 export function formatPHP(value: number | string | null | undefined): string {

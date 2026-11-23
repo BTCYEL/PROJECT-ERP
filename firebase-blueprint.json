@@ -1,0 +1,591 @@
+{
+  "entities": {
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "Authenticated Firebase user profile with role isolation",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "maxLength": 200 },
+        "displayName": { "type": "string", "maxLength": 150 },
+        "photoURL": { "type": "string", "maxLength": 250000 },
+        "role": { "type": "string", "enum": ["admin", "member"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "displayName", "role", "createdAt", "updatedAt"]
+    },
+    "ErpUser": {
+      "title": "ErpUser",
+      "description": "System user account for ERP RBAC access control and avatar management",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "maxLength": 200 },
+        "fullName": { "type": "string", "minLength": 1, "maxLength": 150 },
+        "roleId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "roleCode": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "roleName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "assignedLocationId": { "type": "string", "maxLength": 128 },
+        "avatarUrl": { "type": "string", "maxLength": 250000 },
+        "passwordHash": { "type": "string", "maxLength": 200 },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "email", "fullName", "roleId", "roleCode", "roleName", "isActive", "createdAt", "updatedAt"]
+    },
+    "Employee": {
+      "title": "Employee",
+      "description": "Employee directory record with payroll rate, truck assignment, and profile photo",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "employeeCode": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "fullName": { "type": "string", "minLength": 1, "maxLength": 150 },
+        "department": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "position": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "locationId": { "type": "string", "maxLength": 128 },
+        "payType": { "type": "string", "enum": ["DAILY", "MONTHLY"] },
+        "baseRate": { "type": "number" },
+        "avatarUrl": { "type": "string", "maxLength": 250000 },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "employeeCode", "fullName", "department", "position", "payType", "baseRate", "isActive", "createdAt", "updatedAt"]
+    },
+    "Category": {
+      "title": "Category",
+      "description": "Menu product category",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "sortOrder": { "type": "integer" },
+        "showInPos": { "type": "boolean", "description": "Whether category and its products are visible in POS" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "name", "sortOrder", "showInPos", "createdAt", "updatedAt"]
+    },
+    "Product": {
+      "title": "Product",
+      "description": "Menu product with costing metadata, variants, modifiers, expiry date, and BOM recipe ingredients",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "sku": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "description": { "type": "string", "maxLength": 500 },
+        "imageUrl": { "type": "string", "maxLength": 250000 },
+        "categoryId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "basePrice": { "type": "number" },
+        "packagingCost": { "type": "number" },
+        "directLaborCost": { "type": "number" },
+        "targetFoodCostPct": { "type": "number" },
+        "taxConfigId": { "type": "string", "maxLength": 128 },
+        "expiryDate": { "type": "string", "maxLength": 40 },
+        "isAvailable": { "type": "boolean" },
+        "variants": { "type": "array", "description": "Bounded list of size variants" },
+        "modifiers": { "type": "array", "description": "Bounded list of add-on modifiers" },
+        "recipeYieldQty": { "type": "number" },
+        "prepInstructions": { "type": "string", "maxLength": 1000 },
+        "ingredients": { "type": "array", "description": "Bounded BOM recipe ingredient list" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "sku", "name", "categoryId", "basePrice", "packagingCost", "directLaborCost", "targetFoodCostPct", "isAvailable", "variants", "modifiers", "recipeYieldQty", "ingredients", "createdAt", "updatedAt"]
+    },
+    "InventoryItem": {
+      "title": "InventoryItem",
+      "description": "Ingredient, raw material, or packaging SKU master record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "sku": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "itemType": { "type": "string", "enum": ["RAW_MATERIAL", "PACKAGING", "FINISHED_GOOD"] },
+        "baseUomId": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "uomCode": { "type": "string", "minLength": 1, "maxLength": 20 },
+        "costingMethod": { "type": "string", "enum": ["FIFO", "WEIGHTED_AVERAGE"] },
+        "minStockLevel": { "type": "number" },
+        "reorderPoint": { "type": "number" },
+        "lastUnitCost": { "type": "number" },
+        "weightedAvgCost": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "sku", "name", "itemType", "baseUomId", "uomCode", "costingMethod", "minStockLevel", "reorderPoint", "lastUnitCost", "weightedAvgCost", "createdAt", "updatedAt"]
+    },
+    "StockBatch": {
+      "title": "StockBatch",
+      "description": "FIFO stock batch per location",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "inventoryItemId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "locationId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "batchNumber": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "initialQty": { "type": "number" },
+        "remainingQty": { "type": "number" },
+        "unitCost": { "type": "number" },
+        "expiryDate": { "type": "string", "maxLength": 40 },
+        "receivedAt": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "inventoryItemId", "locationId", "batchNumber", "initialQty", "remainingQty", "unitCost", "receivedAt", "createdAt", "updatedAt"]
+    },
+    "InventoryTransaction": {
+      "title": "InventoryTransaction",
+      "description": "Immutable inventory ledger movement",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "inventoryItemId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "locationId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "batchId": { "type": "string", "maxLength": 128 },
+        "txnType": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "quantityDelta": { "type": "number" },
+        "unitCost": { "type": "number" },
+        "totalCost": { "type": "number" },
+        "referenceType": { "type": "string", "maxLength": 64 },
+        "referenceId": { "type": "string", "maxLength": 128 },
+        "notes": { "type": "string", "maxLength": 500 },
+        "createdBy": { "type": "string", "maxLength": 128 },
+        "txnDate": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "inventoryItemId", "locationId", "txnType", "quantityDelta", "unitCost", "totalCost", "txnDate", "createdAt"]
+    },
+    "StockTransfer": {
+      "title": "StockTransfer",
+      "description": "Commissary-to-truck stock transfer",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "transferNumber": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "fromLocationId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "toLocationId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "status": { "type": "string", "enum": ["RECEIVED", "IN_TRANSIT", "CANCELLED"] },
+        "notes": { "type": "string", "maxLength": 500 },
+        "items": { "type": "array", "description": "Transfer line items" },
+        "createdBy": { "type": "string", "maxLength": 128 },
+        "transferDate": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "transferNumber", "fromLocationId", "toLocationId", "status", "items", "transferDate", "createdAt"]
+    },
+    "Sale": {
+      "title": "Sale",
+      "description": "POS order with KDS status, line items, and payments",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "receiptNumber": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "clientTxnId": { "type": "string", "maxLength": 128 },
+        "locationId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "cashierId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "customerId": { "type": "string", "maxLength": 128 },
+        "channel": { "type": "string", "maxLength": 40 },
+        "status": { "type": "string", "enum": ["COMPLETED", "REFUNDED", "VOID"] },
+        "kdsStatus": { "type": "string", "enum": ["PENDING", "PREPARING", "READY", "COMPLETED", "CANCELLED"] },
+        "subtotal": { "type": "number" },
+        "discountAmount": { "type": "number" },
+        "taxAmount": { "type": "number" },
+        "totalAmount": { "type": "number" },
+        "totalCogs": { "type": "number" },
+        "notes": { "type": "string", "maxLength": 500 },
+        "isOfflineSynced": { "type": "boolean" },
+        "items": { "type": "array", "description": "Order line items" },
+        "payments": { "type": "array", "description": "Order payments" },
+        "soldAt": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "receiptNumber", "locationId", "cashierId", "channel", "status", "kdsStatus", "subtotal", "discountAmount", "taxAmount", "totalAmount", "totalCogs", "items", "payments", "soldAt", "createdAt", "updatedAt"]
+    },
+    "Supplier": {
+      "title": "Supplier",
+      "description": "Vendor/supplier record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "contactPerson": { "type": "string", "maxLength": 120 },
+        "phone": { "type": "string", "maxLength": 40 },
+        "email": { "type": "string", "maxLength": 160 },
+        "address": { "type": "string", "maxLength": 300 },
+        "tin": { "type": "string", "maxLength": 40 },
+        "paymentTerms": { "type": "integer" },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "code", "name", "paymentTerms", "isActive", "createdAt"]
+    },
+    "PurchaseOrder": {
+      "title": "PurchaseOrder",
+      "description": "Supplier purchase order with approval and receiving workflow",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "poNumber": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "supplierId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "locationId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "status": { "type": "string", "enum": ["PENDING_APPROVAL", "APPROVED", "PARTIAL", "PARTIALLY_RECEIVED", "RECEIVED", "CANCELLED"] },
+        "totalAmount": { "type": "number" },
+        "approvedBy": { "type": "string", "maxLength": 128 },
+        "notes": { "type": "string", "maxLength": 500 },
+        "items": { "type": "array", "description": "PO line items" },
+        "orderedAt": { "type": "string", "maxLength": 40 },
+        "expectedAt": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "poNumber", "supplierId", "locationId", "status", "totalAmount", "items", "orderedAt", "createdAt", "updatedAt"]
+    },
+    "GoodsReceipt": {
+      "title": "GoodsReceipt",
+      "description": "Goods receipt note against a purchase order",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "grnNumber": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "purchaseOrderId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "receivedBy": { "type": "string", "maxLength": 128 },
+        "notes": { "type": "string", "maxLength": 500 },
+        "items": { "type": "array", "description": "GRN line items" },
+        "receivedAt": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "grnNumber", "purchaseOrderId", "items", "receivedAt", "createdAt"]
+    },
+    "SupplierInvoice": {
+      "title": "SupplierInvoice",
+      "description": "Accounts payable supplier invoice",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "invoiceNumber": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "supplierId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "purchaseOrderId": { "type": "string", "maxLength": 128 },
+        "totalAmount": { "type": "number" },
+        "paidAmount": { "type": "number" },
+        "dueDate": { "type": "string", "maxLength": 40 },
+        "status": { "type": "string", "enum": ["UNPAID", "PARTIAL", "PAID"] },
+        "payments": { "type": "array", "description": "AP payment records" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "invoiceNumber", "supplierId", "totalAmount", "paidAmount", "dueDate", "status", "payments", "createdAt", "updatedAt"]
+    },
+    "Account": {
+      "title": "Account",
+      "description": "Chart of accounts entry",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "minLength": 1, "maxLength": 20 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 150 },
+        "type": { "type": "string", "enum": ["ASSET", "LIABILITY", "EQUITY", "REVENUE", "EXPENSE"] },
+        "isSystem": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "code", "name", "type", "isSystem", "createdAt"]
+    },
+    "JournalEntry": {
+      "title": "JournalEntry",
+      "description": "Double-entry accounting journal voucher",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "entryNumber": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "entryDate": { "type": "string", "maxLength": 40 },
+        "description": { "type": "string", "maxLength": 400 },
+        "referenceType": { "type": "string", "maxLength": 64 },
+        "referenceId": { "type": "string", "maxLength": 128 },
+        "isReversed": { "type": "boolean" },
+        "lines": { "type": "array", "description": "Balanced debit/credit journal lines" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "entryNumber", "entryDate", "description", "isReversed", "lines", "createdAt"]
+    },
+    "Expense": {
+      "title": "Expense",
+      "description": "Operating expense record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "locationId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "accountId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "category": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "amount": { "type": "number" },
+        "description": { "type": "string", "maxLength": 400 },
+        "isRecurring": { "type": "boolean" },
+        "paidFromPettyCash": { "type": "boolean" },
+        "expenseDate": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "locationId", "accountId", "category", "amount", "description", "isRecurring", "paidFromPettyCash", "expenseDate", "createdAt"]
+    },
+    "DailyClosing": {
+      "title": "DailyClosing",
+      "description": "End-of-day Z-reading reconciliation",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "locationId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "businessDate": { "type": "string", "maxLength": 20 },
+        "openingFloat": { "type": "number" },
+        "expectedCash": { "type": "number" },
+        "actualCash": { "type": "number" },
+        "variance": { "type": "number" },
+        "totalSales": { "type": "number" },
+        "grossProfit": { "type": "number" },
+        "closedBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "notes": { "type": "string", "maxLength": 400 },
+        "closedAt": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "locationId", "businessDate", "openingFloat", "expectedCash", "actualCash", "variance", "totalSales", "grossProfit", "closedBy", "closedAt", "createdAt"]
+    },
+    "TaxConfig": {
+      "title": "TaxConfig",
+      "description": "VAT or percentage tax configuration",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "ratePercent": { "type": "number" },
+        "isInclusive": { "type": "boolean" },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "code", "name", "ratePercent", "isInclusive", "isActive", "createdAt", "updatedAt"]
+    },
+    "Location": {
+      "title": "Location",
+      "description": "Commissary or food truck branch location",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 140 },
+        "type": { "type": "string", "enum": ["COMMISSARY", "FOOD_TRUCK"] },
+        "address": { "type": "string", "maxLength": 240 },
+        "isActive": { "type": "boolean" },
+        "kdsEnabled": { "type": "boolean", "description": "Whether Kitchen Display System (KDS) is available/enabled for this truck or location" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "code", "name", "type", "isActive", "createdAt"]
+    },
+    "FoodTruck": {
+      "title": "FoodTruck",
+      "description": "Food truck vehicle asset and odometer status",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "locationId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "plateNumber": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "makeModel": { "type": "string", "minLength": 1, "maxLength": 140 },
+        "status": { "type": "string", "enum": ["ACTIVE", "MAINTENANCE", "INACTIVE"] },
+        "currentSite": { "type": "string", "maxLength": 160 },
+        "odometerKm": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "locationId", "plateNumber", "makeModel", "status", "odometerKm", "createdAt", "updatedAt"]
+    },
+    "FleetLog": {
+      "title": "FleetLog",
+      "description": "Truck site assignment, fuel log, or maintenance log",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "logType": { "type": "string", "enum": ["ASSIGNMENT", "FUEL", "MAINTENANCE"] },
+        "truckId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "siteName": { "type": "string", "maxLength": 160 },
+        "assignedDate": { "type": "string", "maxLength": 40 },
+        "shiftNotes": { "type": "string", "maxLength": 300 },
+        "liters": { "type": "number" },
+        "totalCost": { "type": "number" },
+        "odometerKm": { "type": "number" },
+        "title": { "type": "string", "maxLength": 160 },
+        "description": { "type": "string", "maxLength": 400 },
+        "serviceDate": { "type": "string", "maxLength": 40 },
+        "nextDueDate": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "logType", "truckId", "createdAt"]
+    },
+    "AttendanceLog": {
+      "title": "AttendanceLog",
+      "description": "Employee clock-in and clock-out log",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "employeeId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "clockIn": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "clockOut": { "type": "string", "maxLength": 40 },
+        "overtimeHours": { "type": "number" },
+        "status": { "type": "string", "enum": ["PRESENT", "LATE", "ABSENT"] },
+        "notes": { "type": "string", "maxLength": 300 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "employeeId", "clockIn", "overtimeHours", "status", "createdAt", "updatedAt"]
+    },
+    "PayrollRun": {
+      "title": "PayrollRun",
+      "description": "Philippine statutory payroll batch run",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "periodStart": { "type": "string", "maxLength": 20 },
+        "periodEnd": { "type": "string", "maxLength": 20 },
+        "status": { "type": "string", "enum": ["APPROVED", "PAID"] },
+        "totalGross": { "type": "number" },
+        "totalDeductions": { "type": "number" },
+        "totalNet": { "type": "number" },
+        "items": { "type": "array", "description": "Payroll line items per employee" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "periodStart", "periodEnd", "status", "totalGross", "totalDeductions", "totalNet", "items", "createdAt"]
+    },
+    "Customer": {
+      "title": "Customer",
+      "description": "CRM loyalty customer profile",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "fullName": { "type": "string", "minLength": 1, "maxLength": 150 },
+        "phone": { "type": "string", "maxLength": 40 },
+        "email": { "type": "string", "maxLength": 160 },
+        "loyaltyPoints": { "type": "integer" },
+        "tier": { "type": "string", "enum": ["STANDARD", "SILVER", "GOLD", "PLATINUM"] },
+        "preferences": { "type": "string", "maxLength": 300 },
+        "feedbackNotes": { "type": "string", "maxLength": 400 },
+        "registeredAt": { "type": "string", "maxLength": 40, "description": "Date when customer registered" },
+        "locationId": { "type": "string", "maxLength": 128, "description": "Truck or branch location where customer registered" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "fullName", "loyaltyPoints", "tier", "createdAt", "updatedAt"]
+    },
+    "Notification": {
+      "title": "Notification",
+      "description": "Operational alert or low-stock warning",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "type": { "type": "string", "minLength": 1, "maxLength": 50 },
+        "severity": { "type": "string", "enum": ["INFO", "WARNING", "CRITICAL"] },
+        "title": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "message": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "locationId": { "type": "string", "maxLength": 128, "description": "Optional truck or branch location associated with this alert" },
+        "isRead": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "type", "severity", "title", "message", "isRead", "createdAt", "updatedAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Immutable RBAC and governance audit log entry",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 128 },
+        "userName": { "type": "string", "maxLength": 150 },
+        "action": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "entityType": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "entityId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "details": { "type": "string", "maxLength": 1000 },
+        "loggedAt": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "action", "entityType", "entityId", "loggedAt", "createdAt"]
+    },
+    "WorkspaceMeta": {
+      "title": "WorkspaceMeta",
+      "description": "Structured configuration document for roles, UOMs, payroll rules, petty cash, and financial periods",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "seeded": { "type": "boolean" },
+        "businessName": { "type": "string", "maxLength": 120 },
+        "currency": { "type": "string", "maxLength": 10 },
+        "roles": { "type": "array", "description": "RBAC role definitions" },
+        "uoms": { "type": "array", "description": "Units of measure" },
+        "unitConversions": { "type": "array", "description": "UOM conversion rules" },
+        "pettyCashFunds": { "type": "array", "description": "Location petty cash funds" },
+        "financialPeriods": { "type": "array", "description": "Accounting periods" },
+        "payrollRule": { "type": "object", "description": "Philippine statutory payroll percentages" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "seeded", "businessName", "currency", "roles", "uoms", "unitConversions", "pettyCashFunds", "financialPeriods", "payrollRule", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": { "schema": { "$ref": "#/entities/UserAccount" }, "description": "Firebase user profiles" },
+    "/erp_users/{erpUserId}": { "schema": { "$ref": "#/entities/ErpUser" }, "description": "ERP user access accounts" },
+    "/employees/{employeeId}": { "schema": { "$ref": "#/entities/Employee" }, "description": "Employee directory" },
+    "/categories/{categoryId}": { "schema": { "$ref": "#/entities/Category" }, "description": "Menu categories" },
+    "/products/{productId}": { "schema": { "$ref": "#/entities/Product" }, "description": "Menu products and BOM recipes" },
+    "/inventory_items/{itemId}": { "schema": { "$ref": "#/entities/InventoryItem" }, "description": "Raw materials and ingredients" },
+    "/stock_batches/{batchId}": { "schema": { "$ref": "#/entities/StockBatch" }, "description": "FIFO stock batches" },
+    "/inventory_transactions/{txnId}": { "schema": { "$ref": "#/entities/InventoryTransaction" }, "description": "Inventory movement ledger" },
+    "/stock_transfers/{transferId}": { "schema": { "$ref": "#/entities/StockTransfer" }, "description": "Inter-location stock transfers" },
+    "/sales/{saleId}": { "schema": { "$ref": "#/entities/Sale" }, "description": "POS & KDS orders" },
+    "/suppliers/{supplierId}": { "schema": { "$ref": "#/entities/Supplier" }, "description": "Procurement suppliers" },
+    "/purchase_orders/{poId}": { "schema": { "$ref": "#/entities/PurchaseOrder" }, "description": "Purchase orders" },
+    "/goods_receipts/{grnId}": { "schema": { "$ref": "#/entities/GoodsReceipt" }, "description": "Goods receipt notes" },
+    "/supplier_invoices/{invoiceId}": { "schema": { "$ref": "#/entities/SupplierInvoice" }, "description": "Supplier AP invoices" },
+    "/accounts/{accountId}": { "schema": { "$ref": "#/entities/Account" }, "description": "Chart of accounts" },
+    "/journal_entries/{jeId}": { "schema": { "$ref": "#/entities/JournalEntry" }, "description": "Double-entry journal entries" },
+    "/expenses/{expenseId}": { "schema": { "$ref": "#/entities/Expense" }, "description": "Operating expenses" },
+    "/daily_closings/{closingId}": { "schema": { "$ref": "#/entities/DailyClosing" }, "description": "Daily Z-readings" },
+    "/tax_configs/{taxId}": { "schema": { "$ref": "#/entities/TaxConfig" }, "description": "Tax rate configs" },
+    "/locations/{locationId}": { "schema": { "$ref": "#/entities/Location" }, "description": "Commissary and truck locations" },
+    "/food_trucks/{truckId}": { "schema": { "$ref": "#/entities/FoodTruck" }, "description": "Fleet vehicles" },
+    "/fleet_logs/{logId}": { "schema": { "$ref": "#/entities/FleetLog" }, "description": "Fleet assignments, fuel, and maintenance" },
+    "/attendance_logs/{attId}": { "schema": { "$ref": "#/entities/AttendanceLog" }, "description": "Employee attendance logs" },
+    "/payroll_runs/{runId}": { "schema": { "$ref": "#/entities/PayrollRun" }, "description": "Payroll runs" },
+    "/customers/{customerId}": { "schema": { "$ref": "#/entities/Customer" }, "description": "CRM customers" },
+    "/notifications/{notifId}": { "schema": { "$ref": "#/entities/Notification" }, "description": "ERP alerts" },
+    "/audit_logs/{logId}": { "schema": { "$ref": "#/entities/AuditLog" }, "description": "RBAC & audit trail" },
+    "/workspace_meta/{metaId}": { "schema": { "$ref": "#/entities/WorkspaceMeta" }, "description": "Workspace configuration" }
+  }
+}

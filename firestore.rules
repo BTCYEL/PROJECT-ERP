@@ -1,0 +1,962 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =====================================================
+    // GLOBAL PRIMITIVES & IDENTITY HELPERS
+    // =====================================================
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isEmailVerified() && request.auth.uid == userId;
+    }
+
+    function isBootstrapAdmin() {
+      return isEmailVerified() && request.auth.token.email == 'norielescobio@gmail.com';
+    }
+
+    function isDocOwner() {
+      return isEmailVerified() && (isBootstrapAdmin() || (resource != null && existing().ownerUid == request.auth.uid));
+    }
+
+    function isValidString(val, minLen, maxLen) {
+      return val is string && val.size() >= minLen && val.size() <= maxLen;
+    }
+
+    function isNullableString(val, maxLen) {
+      return val == null || (val is string && val.size() <= maxLen);
+    }
+
+    function isValidNum(val) {
+      return val is number || val is int;
+    }
+
+    function isBoundedMapList(arr, maxLen) {
+      return arr is list && arr.size() <= maxLen && (arr.size() == 0 || arr[0] is map);
+    }
+
+    function preservesImmutableOwnerAndCreated() {
+      return incoming().id == existing().id
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt;
+    }
+
+    // =====================================================
+    // VALIDATION BLUEPRINTS
+    // =====================================================
+    function isValidUserAccount(data) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'photoURL', 'role', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'photoURL', 'role', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && isValidString(data.email, 3, 200)
+        && isValidString(data.displayName, 1, 150)
+        && isNullableString(data.photoURL, 250000)
+        && data.role in ['admin', 'member']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidErpUser(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'email', 'fullName', 'roleId', 'roleCode', 'roleName', 'assignedLocationId', 'avatarUrl', 'passwordHash', 'isActive', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'email', 'fullName', 'roleId', 'roleCode', 'roleName', 'assignedLocationId', 'avatarUrl', 'passwordHash', 'isActive', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.email, 3, 200)
+        && isValidString(data.fullName, 1, 150)
+        && isValidId(data.roleId)
+        && isValidString(data.roleCode, 1, 64)
+        && isValidString(data.roleName, 1, 120)
+        && isNullableString(data.assignedLocationId, 128)
+        && isNullableString(data.avatarUrl, 250000)
+        && isValidString(data.passwordHash, 1, 200)
+        && data.isActive is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidEmployee(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'employeeCode', 'fullName', 'department', 'position', 'locationId', 'payType', 'baseRate', 'avatarUrl', 'isActive', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'employeeCode', 'fullName', 'department', 'position', 'locationId', 'payType', 'baseRate', 'avatarUrl', 'isActive', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.employeeCode, 1, 64)
+        && isValidString(data.fullName, 1, 150)
+        && isValidString(data.department, 1, 100)
+        && isValidString(data.position, 1, 100)
+        && isNullableString(data.locationId, 128)
+        && data.payType in ['DAILY', 'MONTHLY']
+        && isValidNum(data.baseRate) && data.baseRate >= 0
+        && isNullableString(data.avatarUrl, 250000)
+        && data.isActive is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCategory(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'name', 'sortOrder', 'showInPos', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'name', 'sortOrder', 'showInPos', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.name, 1, 120)
+        && data.sortOrder is int
+        && data.showInPos is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidProduct(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'sku', 'name', 'description', 'imageUrl', 'categoryId', 'basePrice', 'packagingCost', 'directLaborCost', 'targetFoodCostPct', 'taxConfigId', 'expiryDate', 'isAvailable', 'variants', 'modifiers', 'recipeYieldQty', 'prepInstructions', 'ingredients', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'sku', 'name', 'description', 'imageUrl', 'categoryId', 'basePrice', 'packagingCost', 'directLaborCost', 'targetFoodCostPct', 'taxConfigId', 'expiryDate', 'isAvailable', 'variants', 'modifiers', 'recipeYieldQty', 'prepInstructions', 'ingredients', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.sku, 1, 64)
+        && isValidString(data.name, 1, 160)
+        && isValidString(data.description, 0, 500)
+        && isNullableString(data.imageUrl, 250000)
+        && isValidId(data.categoryId)
+        && isValidNum(data.basePrice) && data.basePrice >= 0
+        && isValidNum(data.packagingCost) && data.packagingCost >= 0
+        && isValidNum(data.directLaborCost) && data.directLaborCost >= 0
+        && isValidNum(data.targetFoodCostPct) && data.targetFoodCostPct >= 0
+        && isNullableString(data.taxConfigId, 128)
+        && isNullableString(data.expiryDate, 40)
+        && data.isAvailable is bool
+        && isBoundedMapList(data.variants, 25)
+        && isBoundedMapList(data.modifiers, 40)
+        && isValidNum(data.recipeYieldQty) && data.recipeYieldQty > 0
+        && isValidString(data.prepInstructions, 0, 1000)
+        && isBoundedMapList(data.ingredients, 60)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidInventoryItem(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'sku', 'name', 'itemType', 'baseUomId', 'uomCode', 'costingMethod', 'minStockLevel', 'reorderPoint', 'lastUnitCost', 'weightedAvgCost', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'sku', 'name', 'itemType', 'baseUomId', 'uomCode', 'costingMethod', 'minStockLevel', 'reorderPoint', 'lastUnitCost', 'weightedAvgCost', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.sku, 1, 64)
+        && isValidString(data.name, 1, 160)
+        && data.itemType in ['RAW_MATERIAL', 'PACKAGING', 'FINISHED_GOOD']
+        && isValidString(data.baseUomId, 1, 64)
+        && isValidString(data.uomCode, 1, 20)
+        && data.costingMethod in ['FIFO', 'WEIGHTED_AVERAGE']
+        && isValidNum(data.minStockLevel) && data.minStockLevel >= 0
+        && isValidNum(data.reorderPoint) && data.reorderPoint >= 0
+        && isValidNum(data.lastUnitCost) && data.lastUnitCost >= 0
+        && isValidNum(data.weightedAvgCost) && data.weightedAvgCost >= 0
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidStockBatch(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'inventoryItemId', 'locationId', 'batchNumber', 'initialQty', 'remainingQty', 'unitCost', 'expiryDate', 'receivedAt', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'inventoryItemId', 'locationId', 'batchNumber', 'initialQty', 'remainingQty', 'unitCost', 'expiryDate', 'receivedAt', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidId(data.inventoryItemId)
+        && isValidId(data.locationId)
+        && isValidString(data.batchNumber, 1, 80)
+        && isValidNum(data.initialQty)
+        && isValidNum(data.remainingQty)
+        && isValidNum(data.unitCost) && data.unitCost >= 0
+        && isNullableString(data.expiryDate, 40)
+        && isValidString(data.receivedAt, 1, 40)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidInventoryTxn(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'inventoryItemId', 'locationId', 'batchId', 'txnType', 'quantityDelta', 'unitCost', 'totalCost', 'referenceType', 'referenceId', 'notes', 'createdBy', 'txnDate', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'inventoryItemId', 'locationId', 'batchId', 'txnType', 'quantityDelta', 'unitCost', 'totalCost', 'referenceType', 'referenceId', 'notes', 'createdBy', 'txnDate', 'createdAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidId(data.inventoryItemId)
+        && isValidId(data.locationId)
+        && isNullableString(data.batchId, 128)
+        && isValidString(data.txnType, 1, 64)
+        && isValidNum(data.quantityDelta)
+        && isValidNum(data.unitCost)
+        && isValidNum(data.totalCost)
+        && isNullableString(data.referenceType, 64)
+        && isNullableString(data.referenceId, 128)
+        && isNullableString(data.notes, 500)
+        && isNullableString(data.createdBy, 128)
+        && isValidString(data.txnDate, 1, 40)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidStockTransfer(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'transferNumber', 'fromLocationId', 'toLocationId', 'status', 'notes', 'items', 'createdBy', 'transferDate', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'transferNumber', 'fromLocationId', 'toLocationId', 'status', 'notes', 'items', 'createdBy', 'transferDate', 'createdAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.transferNumber, 1, 64)
+        && isValidId(data.fromLocationId)
+        && isValidId(data.toLocationId)
+        && data.status in ['RECEIVED', 'IN_TRANSIT', 'CANCELLED']
+        && isNullableString(data.notes, 500)
+        && isBoundedMapList(data.items, 50)
+        && isNullableString(data.createdBy, 128)
+        && isValidString(data.transferDate, 1, 40)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidSale(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'receiptNumber', 'clientTxnId', 'locationId', 'cashierId', 'customerId', 'channel', 'status', 'kdsStatus', 'subtotal', 'discountAmount', 'taxAmount', 'totalAmount', 'totalCogs', 'notes', 'isOfflineSynced', 'items', 'payments', 'soldAt', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'receiptNumber', 'clientTxnId', 'locationId', 'cashierId', 'customerId', 'channel', 'status', 'kdsStatus', 'subtotal', 'discountAmount', 'taxAmount', 'totalAmount', 'totalCogs', 'notes', 'isOfflineSynced', 'items', 'payments', 'soldAt', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.receiptNumber, 1, 64)
+        && isNullableString(data.clientTxnId, 128)
+        && isValidId(data.locationId)
+        && isValidId(data.cashierId)
+        && isNullableString(data.customerId, 128)
+        && isValidString(data.channel, 1, 40)
+        && data.status in ['COMPLETED', 'REFUNDED', 'VOID']
+        && data.kdsStatus in ['PENDING', 'PREPARING', 'READY', 'COMPLETED', 'CANCELLED']
+        && isValidNum(data.subtotal)
+        && isValidNum(data.discountAmount)
+        && isValidNum(data.taxAmount)
+        && isValidNum(data.totalAmount)
+        && isValidNum(data.totalCogs)
+        && isNullableString(data.notes, 500)
+        && data.isOfflineSynced is bool
+        && isBoundedMapList(data.items, 60)
+        && isBoundedMapList(data.payments, 15)
+        && isValidString(data.soldAt, 1, 40)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidSupplier(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'code', 'name', 'contactPerson', 'phone', 'email', 'address', 'tin', 'paymentTerms', 'isActive', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'code', 'name', 'contactPerson', 'phone', 'email', 'address', 'tin', 'paymentTerms', 'isActive', 'createdAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.code, 1, 40)
+        && isValidString(data.name, 1, 160)
+        && isNullableString(data.contactPerson, 120)
+        && isNullableString(data.phone, 40)
+        && isNullableString(data.email, 160)
+        && isNullableString(data.address, 300)
+        && isNullableString(data.tin, 40)
+        && data.paymentTerms is int
+        && data.isActive is bool
+        && data.createdAt is timestamp;
+    }
+
+    function isValidPurchaseOrder(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'poNumber', 'supplierId', 'locationId', 'status', 'totalAmount', 'approvedBy', 'notes', 'items', 'orderedAt', 'expectedAt', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'poNumber', 'supplierId', 'locationId', 'status', 'totalAmount', 'approvedBy', 'notes', 'items', 'orderedAt', 'expectedAt', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.poNumber, 1, 64)
+        && isValidId(data.supplierId)
+        && isValidId(data.locationId)
+        && data.status in ['PENDING_APPROVAL', 'APPROVED', 'PARTIAL', 'PARTIALLY_RECEIVED', 'RECEIVED', 'CANCELLED']
+        && isValidNum(data.totalAmount) && data.totalAmount >= 0
+        && isNullableString(data.approvedBy, 128)
+        && isNullableString(data.notes, 500)
+        && isBoundedMapList(data.items, 60)
+        && isValidString(data.orderedAt, 1, 40)
+        && isNullableString(data.expectedAt, 40)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidGoodsReceipt(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'grnNumber', 'purchaseOrderId', 'receivedBy', 'notes', 'items', 'receivedAt', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'grnNumber', 'purchaseOrderId', 'receivedBy', 'notes', 'items', 'receivedAt', 'createdAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.grnNumber, 1, 64)
+        && isValidId(data.purchaseOrderId)
+        && isNullableString(data.receivedBy, 128)
+        && isNullableString(data.notes, 500)
+        && isBoundedMapList(data.items, 60)
+        && isValidString(data.receivedAt, 1, 40)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidSupplierInvoice(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'invoiceNumber', 'supplierId', 'purchaseOrderId', 'totalAmount', 'paidAmount', 'dueDate', 'status', 'payments', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'invoiceNumber', 'supplierId', 'purchaseOrderId', 'totalAmount', 'paidAmount', 'dueDate', 'status', 'payments', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.invoiceNumber, 1, 64)
+        && isValidId(data.supplierId)
+        && isNullableString(data.purchaseOrderId, 128)
+        && isValidNum(data.totalAmount) && data.totalAmount >= 0
+        && isValidNum(data.paidAmount) && data.paidAmount >= 0
+        && isValidString(data.dueDate, 1, 40)
+        && data.status in ['UNPAID', 'PARTIAL', 'PAID']
+        && isBoundedMapList(data.payments, 40)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAccount(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'code', 'name', 'type', 'isSystem', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'code', 'name', 'type', 'isSystem', 'createdAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.code, 1, 20)
+        && isValidString(data.name, 1, 150)
+        && data.type in ['ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'EXPENSE']
+        && data.isSystem is bool
+        && data.createdAt is timestamp;
+    }
+
+    function isValidJournalEntry(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'entryNumber', 'entryDate', 'description', 'referenceType', 'referenceId', 'isReversed', 'lines', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'entryNumber', 'entryDate', 'description', 'referenceType', 'referenceId', 'isReversed', 'lines', 'createdAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.entryNumber, 1, 64)
+        && isValidString(data.entryDate, 1, 40)
+        && isValidString(data.description, 1, 400)
+        && isNullableString(data.referenceType, 64)
+        && isNullableString(data.referenceId, 128)
+        && data.isReversed is bool
+        && isBoundedMapList(data.lines, 30)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidExpense(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'locationId', 'accountId', 'category', 'amount', 'description', 'isRecurring', 'paidFromPettyCash', 'expenseDate', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'locationId', 'accountId', 'category', 'amount', 'description', 'isRecurring', 'paidFromPettyCash', 'expenseDate', 'createdAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidId(data.locationId)
+        && isValidId(data.accountId)
+        && isValidString(data.category, 1, 80)
+        && isValidNum(data.amount) && data.amount > 0
+        && isValidString(data.description, 1, 400)
+        && data.isRecurring is bool
+        && data.paidFromPettyCash is bool
+        && isValidString(data.expenseDate, 1, 40)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidDailyClosing(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'locationId', 'businessDate', 'openingFloat', 'expectedCash', 'actualCash', 'variance', 'totalSales', 'grossProfit', 'closedBy', 'notes', 'closedAt', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'locationId', 'businessDate', 'openingFloat', 'expectedCash', 'actualCash', 'variance', 'totalSales', 'grossProfit', 'closedBy', 'notes', 'closedAt', 'createdAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidId(data.locationId)
+        && isValidString(data.businessDate, 1, 20)
+        && isValidNum(data.openingFloat)
+        && isValidNum(data.expectedCash)
+        && isValidNum(data.actualCash)
+        && isValidNum(data.variance)
+        && isValidNum(data.totalSales)
+        && isValidNum(data.grossProfit)
+        && isValidId(data.closedBy)
+        && isNullableString(data.notes, 400)
+        && isValidString(data.closedAt, 1, 40)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidTaxConfig(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'code', 'name', 'ratePercent', 'isInclusive', 'isActive', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'code', 'name', 'ratePercent', 'isInclusive', 'isActive', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.code, 1, 40)
+        && isValidString(data.name, 1, 120)
+        && isValidNum(data.ratePercent) && data.ratePercent >= 0
+        && data.isInclusive is bool
+        && data.isActive is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidLocation(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'code', 'name', 'type', 'address', 'isActive', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'code', 'name', 'type', 'address', 'isActive', 'kdsEnabled', 'createdAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.code, 1, 40)
+        && isValidString(data.name, 1, 140)
+        && data.type in ['COMMISSARY', 'FOOD_TRUCK']
+        && isNullableString(data.address, 240)
+        && data.isActive is bool
+        && (!('kdsEnabled' in data) || data.kdsEnabled is bool)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidFoodTruck(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'locationId', 'plateNumber', 'makeModel', 'status', 'currentSite', 'odometerKm', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'locationId', 'plateNumber', 'makeModel', 'status', 'currentSite', 'odometerKm', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidId(data.locationId)
+        && isValidString(data.plateNumber, 1, 32)
+        && isValidString(data.makeModel, 1, 140)
+        && data.status in ['ACTIVE', 'MAINTENANCE', 'INACTIVE']
+        && isNullableString(data.currentSite, 160)
+        && isValidNum(data.odometerKm) && data.odometerKm >= 0
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidFleetLog(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'logType', 'truckId', 'siteName', 'assignedDate', 'shiftNotes', 'liters', 'totalCost', 'odometerKm', 'title', 'description', 'serviceDate', 'nextDueDate', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'logType', 'truckId', 'siteName', 'assignedDate', 'shiftNotes', 'liters', 'totalCost', 'odometerKm', 'title', 'description', 'serviceDate', 'nextDueDate', 'createdAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && data.logType in ['ASSIGNMENT', 'FUEL', 'MAINTENANCE']
+        && isValidId(data.truckId)
+        && isNullableString(data.siteName, 160)
+        && isNullableString(data.assignedDate, 40)
+        && isNullableString(data.shiftNotes, 300)
+        && (data.liters == null || isValidNum(data.liters))
+        && (data.totalCost == null || isValidNum(data.totalCost))
+        && (data.odometerKm == null || isValidNum(data.odometerKm))
+        && isNullableString(data.title, 160)
+        && isNullableString(data.description, 400)
+        && isNullableString(data.serviceDate, 40)
+        && isNullableString(data.nextDueDate, 40)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidAttendanceLog(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'employeeId', 'clockIn', 'clockOut', 'overtimeHours', 'status', 'notes', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'employeeId', 'clockIn', 'clockOut', 'overtimeHours', 'status', 'notes', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidId(data.employeeId)
+        && isValidString(data.clockIn, 1, 40)
+        && isNullableString(data.clockOut, 40)
+        && isValidNum(data.overtimeHours) && data.overtimeHours >= 0
+        && data.status in ['PRESENT', 'LATE', 'ABSENT']
+        && isNullableString(data.notes, 300)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidPayrollRun(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'periodStart', 'periodEnd', 'status', 'totalGross', 'totalDeductions', 'totalNet', 'items', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'periodStart', 'periodEnd', 'status', 'totalGross', 'totalDeductions', 'totalNet', 'items', 'createdAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.periodStart, 1, 20)
+        && isValidString(data.periodEnd, 1, 20)
+        && data.status in ['APPROVED', 'PAID']
+        && isValidNum(data.totalGross)
+        && isValidNum(data.totalDeductions)
+        && isValidNum(data.totalNet)
+        && isBoundedMapList(data.items, 100)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidCustomer(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'fullName', 'phone', 'email', 'loyaltyPoints', 'tier', 'preferences', 'feedbackNotes', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'fullName', 'phone', 'email', 'loyaltyPoints', 'tier', 'preferences', 'feedbackNotes', 'registeredAt', 'locationId', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.fullName, 1, 150)
+        && isNullableString(data.phone, 40)
+        && isNullableString(data.email, 160)
+        && data.loyaltyPoints is int
+        && data.tier in ['STANDARD', 'SILVER', 'GOLD', 'PLATINUM']
+        && isNullableString(data.preferences, 300)
+        && isNullableString(data.feedbackNotes, 400)
+        && (!('registeredAt' in data) || isNullableString(data.registeredAt, 40))
+        && (!('locationId' in data) || isNullableString(data.locationId, 128))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidNotification(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'type', 'severity', 'title', 'message', 'isRead', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'type', 'severity', 'title', 'message', 'locationId', 'isRead', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.type, 1, 50)
+        && data.severity in ['INFO', 'WARNING', 'CRITICAL']
+        && isValidString(data.title, 1, 160)
+        && isValidString(data.message, 1, 500)
+        && (!('locationId' in data) || isNullableString(data.locationId, 128))
+        && data.isRead is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAuditLog(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'userId', 'userName', 'action', 'entityType', 'entityId', 'details', 'loggedAt', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'userId', 'userName', 'action', 'entityType', 'entityId', 'details', 'loggedAt', 'createdAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isNullableString(data.userId, 128)
+        && isNullableString(data.userName, 150)
+        && isValidString(data.action, 1, 80)
+        && isValidString(data.entityType, 1, 80)
+        && isValidString(data.entityId, 1, 128)
+        && isNullableString(data.details, 1000)
+        && isValidString(data.loggedAt, 1, 40)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidWorkspaceMeta(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'seeded', 'businessName', 'currency', 'roles', 'uoms', 'unitConversions', 'pettyCashFunds', 'financialPeriods', 'payrollRule', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'seeded', 'businessName', 'currency', 'roles', 'uoms', 'unitConversions', 'pettyCashFunds', 'financialPeriods', 'payrollRule', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && data.seeded is bool
+        && isValidString(data.businessName, 1, 120)
+        && isValidString(data.currency, 1, 10)
+        && isBoundedMapList(data.roles, 25)
+        && isBoundedMapList(data.uoms, 25)
+        && isBoundedMapList(data.unitConversions, 25)
+        && isBoundedMapList(data.pettyCashFunds, 25)
+        && isBoundedMapList(data.financialPeriods, 25)
+        && data.payrollRule is map
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // =====================================================
+    // COLLECTION MATCH BLOCKS
+    // =====================================================
+    match /test/connection {
+      allow get: if isSignedIn();
+    }
+
+    match /users/{userId} {
+      allow get: if isOwner(userId) || isBootstrapAdmin();
+      allow list: if isBootstrapAdmin();
+      allow create: if isValidId(userId) && isOwner(userId) && isValidUserAccount(incoming())
+        && incoming().uid == request.auth.uid
+        && (incoming().role == 'member' || isBootstrapAdmin())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId) && isValidUserAccount(incoming())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          (isOwner(userId) && incoming().role == existing().role && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'updatedAt']))
+        );
+      allow delete: if isBootstrapAdmin() && isValidId(userId);
+    }
+
+    match /erp_users/{erpUserId} {
+      allow get: if isValidId(erpUserId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(erpUserId) && isValidErpUser(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(erpUserId) && isDocOwner() && isValidErpUser(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['email', 'fullName', 'roleId', 'roleCode', 'roleName', 'assignedLocationId', 'avatarUrl', 'passwordHash', 'isActive', 'updatedAt'])
+        );
+      allow delete: if isValidId(erpUserId) && isDocOwner();
+    }
+
+    match /employees/{employeeId} {
+      allow get: if isValidId(employeeId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(employeeId) && isValidEmployee(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(employeeId) && isDocOwner() && isValidEmployee(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['employeeCode', 'fullName', 'department', 'position', 'locationId', 'payType', 'baseRate', 'avatarUrl', 'isActive', 'updatedAt'])
+        );
+      allow delete: if isValidId(employeeId) && isDocOwner();
+    }
+
+    match /categories/{categoryId} {
+      allow get: if isValidId(categoryId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(categoryId) && isValidCategory(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(categoryId) && isDocOwner() && isValidCategory(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['name', 'sortOrder', 'showInPos', 'updatedAt'])
+        );
+      allow delete: if isValidId(categoryId) && isDocOwner();
+    }
+
+    match /products/{productId} {
+      allow get: if isValidId(productId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(productId) && isValidProduct(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && existsAfter(/databases/$(database)/documents/categories/$(incoming().categoryId))
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(productId) && isDocOwner() && isValidProduct(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['sku', 'name', 'description', 'imageUrl', 'categoryId', 'basePrice', 'packagingCost', 'directLaborCost', 'targetFoodCostPct', 'taxConfigId', 'expiryDate', 'isAvailable', 'variants', 'modifiers', 'updatedAt']) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['basePrice', 'packagingCost', 'directLaborCost', 'targetFoodCostPct', 'prepInstructions', 'ingredients', 'updatedAt']) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['isAvailable', 'updatedAt'])
+        );
+      allow delete: if isValidId(productId) && isDocOwner();
+    }
+
+    match /inventory_items/{itemId} {
+      allow get: if isValidId(itemId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(itemId) && isValidInventoryItem(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(itemId) && isDocOwner() && isValidInventoryItem(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['sku', 'name', 'itemType', 'baseUomId', 'uomCode', 'costingMethod', 'minStockLevel', 'reorderPoint', 'lastUnitCost', 'weightedAvgCost', 'updatedAt'])
+        );
+      allow delete: if isValidId(itemId) && isDocOwner();
+    }
+
+    match /stock_batches/{batchId} {
+      allow get: if isValidId(batchId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(batchId) && isValidStockBatch(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(batchId) && isDocOwner() && isValidStockBatch(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['remainingQty', 'updatedAt'])
+        );
+      allow delete: if isValidId(batchId) && isDocOwner();
+    }
+
+    match /inventory_transactions/{txnId} {
+      allow get: if isValidId(txnId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(txnId) && isValidInventoryTxn(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    match /stock_transfers/{transferId} {
+      allow get: if isValidId(transferId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(transferId) && isValidStockTransfer(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    match /sales/{saleId} {
+      allow get: if isValidId(saleId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(saleId) && isValidSale(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(saleId) && isDocOwner() && isValidSale(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          (existing().status == 'COMPLETED' && incoming().diff(existing()).affectedKeys().hasOnly(['kdsStatus', 'updatedAt'])) ||
+          (existing().status == 'COMPLETED' && incoming().status == 'REFUNDED' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'kdsStatus', 'notes', 'updatedAt']))
+        );
+      allow delete: if isValidId(saleId) && isDocOwner();
+    }
+
+    match /suppliers/{supplierId} {
+      allow get: if isValidId(supplierId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(supplierId) && isValidSupplier(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update: if isValidId(supplierId) && isDocOwner() && isValidSupplier(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['code', 'name', 'contactPerson', 'phone', 'email', 'address', 'tin', 'paymentTerms', 'isActive'])
+        );
+      allow delete: if isValidId(supplierId) && isDocOwner();
+    }
+
+    match /purchase_orders/{poId} {
+      allow get: if isValidId(poId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(poId) && isValidPurchaseOrder(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(poId) && isDocOwner() && isValidPurchaseOrder(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          (existing().status == 'PENDING_APPROVAL' && incoming().status == 'PENDING_APPROVAL' && incoming().diff(existing()).affectedKeys().hasOnly(['supplierId', 'locationId', 'totalAmount', 'notes', 'items', 'expectedAt', 'updatedAt'])) ||
+          (existing().status == 'PENDING_APPROVAL' && incoming().status == 'APPROVED' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'approvedBy', 'updatedAt'])) ||
+          (existing().status == 'PENDING_APPROVAL' && incoming().status == 'APPROVED' && incoming().diff(existing()).affectedKeys().hasOnly(['supplierId', 'locationId', 'totalAmount', 'notes', 'items', 'expectedAt', 'status', 'approvedBy', 'updatedAt'])) ||
+          (existing().status in ['PENDING_APPROVAL', 'APPROVED'] && incoming().status == 'CANCELLED' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'updatedAt'])) ||
+          (existing().status in ['APPROVED', 'PARTIAL', 'PARTIALLY_RECEIVED'] && incoming().status in ['PARTIAL', 'PARTIALLY_RECEIVED', 'RECEIVED'] && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'items', 'updatedAt']))
+        );
+      allow delete: if isValidId(poId) && isDocOwner();
+    }
+
+    match /goods_receipts/{grnId} {
+      allow get: if isValidId(grnId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(grnId) && isValidGoodsReceipt(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    match /supplier_invoices/{invoiceId} {
+      allow get: if isValidId(invoiceId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(invoiceId) && isValidSupplierInvoice(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(invoiceId) && isDocOwner() && isValidSupplierInvoice(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          (existing().status != 'PAID' && incoming().diff(existing()).affectedKeys().hasOnly(['paidAmount', 'status', 'payments', 'updatedAt']))
+        );
+      allow delete: if isValidId(invoiceId) && isDocOwner();
+    }
+
+    match /accounts/{accountId} {
+      allow get: if isValidId(accountId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(accountId) && isValidAccount(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if isValidId(accountId) && isDocOwner();
+    }
+
+    match /journal_entries/{jeId} {
+      allow get: if isValidId(jeId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(jeId) && isValidJournalEntry(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    match /expenses/{expenseId} {
+      allow get: if isValidId(expenseId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(expenseId) && isValidExpense(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    match /daily_closings/{closingId} {
+      allow get: if isValidId(closingId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(closingId) && isValidDailyClosing(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    match /tax_configs/{taxId} {
+      allow get: if isValidId(taxId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(taxId) && isValidTaxConfig(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(taxId) && isDocOwner() && isValidTaxConfig(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['isActive', 'ratePercent', 'isInclusive', 'updatedAt'])
+        );
+      allow delete: if isValidId(taxId) && isDocOwner();
+    }
+
+    match /locations/{locationId} {
+      allow get: if isValidId(locationId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(locationId) && isValidLocation(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update: if isValidId(locationId) && isDocOwner() && isValidLocation(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['code', 'name', 'type', 'address', 'isActive', 'kdsEnabled'])
+        );
+      allow delete: if isValidId(locationId) && isDocOwner();
+    }
+
+    match /food_trucks/{truckId} {
+      allow get: if isValidId(truckId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(truckId) && isValidFoodTruck(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(truckId) && isDocOwner() && isValidFoodTruck(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['plateNumber', 'makeModel', 'currentSite', 'odometerKm', 'status', 'updatedAt'])
+        );
+      allow delete: if isValidId(truckId) && isDocOwner();
+    }
+
+    match /fleet_logs/{logId} {
+      allow get: if isValidId(logId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(logId) && isValidFleetLog(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    match /attendance_logs/{attId} {
+      allow get: if isValidId(attId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(attId) && isValidAttendanceLog(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(attId) && isDocOwner() && isValidAttendanceLog(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          (existing().clockOut == null && incoming().diff(existing()).affectedKeys().hasOnly(['clockOut', 'overtimeHours', 'updatedAt']))
+        );
+      allow delete: if isValidId(attId) && isDocOwner();
+    }
+
+    match /payroll_runs/{runId} {
+      allow get: if isValidId(runId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(runId) && isValidPayrollRun(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update: if isValidId(runId) && isDocOwner() && isValidPayrollRun(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && existing().status == 'APPROVED'
+        && incoming().diff(existing()).affectedKeys().hasOnly(['status']);
+      allow delete: if isValidId(runId) && isDocOwner();
+    }
+
+    match /customers/{customerId} {
+      allow get: if isValidId(customerId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(customerId) && isValidCustomer(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(customerId) && isDocOwner() && isValidCustomer(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['loyaltyPoints', 'tier', 'preferences', 'feedbackNotes', 'registeredAt', 'locationId', 'updatedAt'])
+        );
+      allow delete: if isValidId(customerId) && isDocOwner();
+    }
+
+    match /notifications/{notifId} {
+      allow get: if isValidId(notifId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(notifId) && isValidNotification(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(notifId) && isDocOwner() && isValidNotification(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['isRead', 'updatedAt'])
+        );
+      allow delete: if isValidId(notifId) && isDocOwner();
+    }
+
+    match /audit_logs/{logId} {
+      allow get: if isValidId(logId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(logId) && isValidAuditLog(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    match /workspace_meta/{metaId} {
+      allow get: if isValidId(metaId) && isEmailVerified()
+        && (
+          isBootstrapAdmin() ||
+          (resource == null && metaId == 'ws_' + request.auth.uid) ||
+          (resource != null && existing().ownerUid == request.auth.uid)
+        );
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(metaId) && isValidWorkspaceMeta(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(metaId) && isDocOwner() && isValidWorkspaceMeta(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['payrollRule', 'pettyCashFunds', 'financialPeriods', 'businessName', 'updatedAt'])
+        );
+      allow delete: if isValidId(metaId) && isDocOwner();
+    }
+  }
+}

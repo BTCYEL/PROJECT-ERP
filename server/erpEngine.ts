@@ -458,9 +458,12 @@ export function processSale(
       throw new Error(`Payment (${paidSum}) is less than order total (${totalAmount})`);
     }
 
+    const locCfg = db.prepare('SELECT kds_enabled FROM locations WHERE id = ?').get(dto.locationId) as { kds_enabled?: number } | undefined;
+    const initialKdsStatus = locCfg && locCfg.kds_enabled === 0 ? 'COMPLETED' : 'PENDING';
+
     db.prepare(`
       INSERT INTO sales (id, receipt_number, client_txn_id, location_id, cashier_id, customer_id, channel, status, kds_status, subtotal, discount_amount, tax_amount, total_amount, total_cogs, notes, is_offline_synced, sold_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'COMPLETED', 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       saleId,
       receiptNumber,
@@ -469,6 +472,7 @@ export function processSale(
       cashierId,
       dto.customerId || null,
       dto.channel || 'WALK_IN',
+      initialKdsStatus,
       round2(subtotal),
       discount,
       round2(totalTax),

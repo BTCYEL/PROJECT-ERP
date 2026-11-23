@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { Component, useEffect, useMemo, useState } from 'react';
 import {
   LayoutDashboard,
   ShoppingCart,
@@ -18,8 +18,11 @@ import {
   X,
   Settings,
 } from 'lucide-react';
+import { onAuthStateChanged, signOut, User } from 'firebase/auth';
 import { MotionConfig } from 'motion/react';
-import { apiFetch, getAuthToken, setAuthToken } from './lib/api.ts';
+import { auth } from './lib/firebase.ts';
+import { apiFetch } from './lib/api.ts';
+import { resetFirebaseSyncCache, setActiveErpUserId, syncFirebaseUserAndSeed } from './lib/firestoreErp.ts';
 import { AuthUser, LocationRow, PERMISSIONS } from './types/erp.ts';
 import { LoginView } from './components/LoginView.tsx';
 import { DashboardModule } from './components/DashboardModule.tsx';
@@ -31,6 +34,57 @@ import { FinanceAndCostingModule } from './components/FinanceAndCostingModule.ts
 import { OperationsHrCrmModule } from './components/OperationsHrCrmModule.tsx';
 import { AvatarBadge, SettingsUserControlModule } from './components/SettingsUserControlModule.tsx';
 
+interface ErrorBoundaryState {
+  error: Error | null;
+}
+
+class AppErrorBoundary extends Component<{ children: React.ReactNode }, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { error: null };
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { error };
+  }
+
+  render() {
+    if (this.state.error) {
+      let friendlyMsg = this.state.error.message;
+      try {
+        const parsed = JSON.parse(this.state.error.message);
+        if (parsed?.error) friendlyMsg = `${parsed.error} (${parsed.operationType || 'read'} on ${parsed.path || 'workspace'})`;
+      } catch {
+        // plain error message
+      }
+      return (
+        <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
+          <div className="max-w-md w-full bg-white border border-red-200 rounded-xl p-6 space-y-4">
+            <h2 className="font-display text-lg font-semibold text-slate-900">Workspace Sync Error</h2>
+            <p className="text-xs text-red-700 bg-red-50 border border-red-100 rounded-lg p-3 break-words">{friendlyMsg}</p>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => window.location.reload()}
+                className="rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800"
+              >
+                Reload Workspace
+              </button>
+              <button
+                onClick={() => {
+                  setActiveErpUserId(null);
+                  resetFirebaseSyncCache();
+                  signOut(auth).finally(() => window.location.reload());
+                }}
+                className="rounded-lg border border-slate-200 px-4 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50"
+              >
+                Sign Out
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 interface NavItem {
   id: string;
   label: string;
@@ -41,7 +95,7 @@ interface NavItem {
 }
 
 const NAV_ITEMS: NavItem[] = [
-  { id: 'dashboard', label: 'Company Dashboard', group: 'Overview', perm: PERMISSIONS.DASHBOARD_VIEW, icon: LayoutDashboard },
+  { id: 'dashboard', label: 'Dashboard', group: 'Overview', perm: PERMISSIONS.DASHBOARD_VIEW, icon: LayoutDashboard },
   { id: 'pos', label: 'POS Terminal', group: 'Frontline', perm: PERMISSIONS.POS_SELL, icon: ShoppingCart },
   { id: 'kds', label: 'Kitchen Display', group: 'Frontline', perm: PERMISSIONS.KDS_MANAGE, icon: ChefHat },
   { id: 'products', label: 'Menu & Recipes', group: 'Operations', perm: PERMISSIONS.PRODUCT_MANAGE, icon: BookOpen },
@@ -49,16 +103,18 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'procurement', label: 'Procurement & AP', group: 'Operations', perm: PERMISSIONS.PO_CREATE, icon: ShoppingBag },
   { id: 'costing', label: 'Food Costing', group: 'Finance', perm: PERMISSIONS.DASHBOARD_VIEW, icon: Calculator },
   { id: 'finance', label: 'Finance & Closing', group: 'Finance', perm: PERMISSIONS.FINANCE_VIEW, icon: Landmark },
-  { id: 'fleet', label: 'Fleet & Sites', group: 'Workforce & Fleet', perm: PERMISSIONS.FLEET_MANAGE, icon: Truck },
+  { id: 'fleet', label: 'Truck & Sites', group: 'Workforce & Fleet', perm: PERMISSIONS.FLEET_MANAGE, icon: Truck },
   { id: 'hr', label: 'HR & PH Payroll', group: 'Workforce & Fleet', perm: PERMISSIONS.HR_MANAGE, icon: Users },
   { id: 'crm', label: 'Customer CRM', group: 'Growth & Audit', perm: PERMISSIONS.CRM_MANAGE, icon: HeartHandshake },
   { id: 'reports', label: 'Reports & RBAC', group: 'Growth & Audit', perm: PERMISSIONS.REPORTS_VIEW, icon: FileSpreadsheet },
   { id: 'settings', label: 'User Control', group: 'Administration', perm: PERMISSIONS.SETTINGS_ADMIN, icon: Settings, ownerOrSuperAdminOnly: true },
 ];
 
-export default function App() {
+function AppShell() {
+  const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [user, setUser] = useState<AuthUser | null>(null);
   const [booting, setBooting] = useState(true);
+  const [bootError, setBootError] = useState('');
   const [activeTab, setActiveTab] = useState('dashboard');
   const [locations, setLocations] = useState<LocationRow[]>([]);
   const [activeLocationId, setActiveLocationId] = useState<string>('ALL');
@@ -66,9 +122,23 @@ export default function App() {
   const [showNotifs, setShowNotifs] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
-  const loadWorkspaceContext = async () => {
+  const loadNotifications = async (locId = activeLocationId) => {
     try {
-      const [locs, notifs] = await Promise.all([apiFetch<LocationRow[]>('/locations'), apiFetch<any[]>('/notifications')]);
+      const qs = locId && locId !== 'ALL' ? `?locationId=${encodeURIComponent(locId)}` : '';
+      const notifs = await apiFetch<any[]>(`/notifications${qs}`);
+      setNotifications(notifs);
+    } catch {
+      // Handled gracefully if session expires or lacks permissions
+    }
+  };
+
+  const loadWorkspaceContext = async (locId = activeLocationId) => {
+    try {
+      const qs = locId && locId !== 'ALL' ? `?locationId=${encodeURIComponent(locId)}` : '';
+      const [locs, notifs] = await Promise.all([
+        apiFetch<LocationRow[]>('/locations'),
+        apiFetch<any[]>(`/notifications${qs}`),
+      ]);
       setLocations(locs);
       setNotifications(notifs);
     } catch {
@@ -77,19 +147,43 @@ export default function App() {
   };
 
   useEffect(() => {
-    const token = getAuthToken();
-    if (!token) {
-      setBooting(false);
-      return;
-    }
-    apiFetch<AuthUser>('/auth/me')
-      .then(async (u) => {
-        setUser(u);
+    const unsub = onAuthStateChanged(auth, async (fbUser) => {
+      setFirebaseUser(fbUser);
+      setBootError('');
+      if (!fbUser) {
+        setUser(null);
+        resetFirebaseSyncCache();
+        setBooting(false);
+        return;
+      }
+
+      try {
+        await syncFirebaseUserAndSeed(fbUser);
+        const erpUser = await apiFetch<AuthUser>('/auth/me');
+        setUser(erpUser);
         await loadWorkspaceContext();
-      })
-      .catch(() => setAuthToken(null))
-      .finally(() => setBooting(false));
+      } catch (err: any) {
+        let msg = err?.message || 'Failed to load cloud workspace';
+        try {
+          const parsed = JSON.parse(msg);
+          if (parsed?.error) msg = `${parsed.error} (${parsed.operationType || 'read'} on ${parsed.path || 'workspace'})`;
+        } catch {
+          // plain error message
+        }
+        setBootError(msg);
+        setUser(null);
+      } finally {
+        setBooting(false);
+      }
+    });
+    return () => unsub();
   }, []);
+
+  useEffect(() => {
+    if (user) {
+      loadNotifications(activeLocationId);
+    }
+  }, [user, activeLocationId]);
 
   const visibleNav = useMemo(() => {
     if (!user) return [];
@@ -112,6 +206,7 @@ export default function App() {
   }, [currentTab, activeTab]);
 
   const handleAuthenticated = async (u: AuthUser) => {
+    setBootError('');
     const isOwnerOrSuper = u.roleCode === 'SUPER_ADMIN' || u.roleCode === 'BUSINESS_OWNER';
     const allowed = NAV_ITEMS.filter((n) => {
       if (n.ownerOrSuperAdminOnly) return isOwnerOrSuper;
@@ -133,7 +228,7 @@ export default function App() {
 
   const handleLogout = async () => {
     await apiFetch('/auth/logout', { method: 'POST' }).catch(() => {});
-    setAuthToken(null);
+    setActiveErpUserId(null);
     setUser(null);
     setActiveTab('dashboard');
   };
@@ -155,8 +250,33 @@ export default function App() {
     );
   }
 
-  if (!user) {
-    return <LoginView onAuthenticated={handleAuthenticated} />;
+  if (bootError) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
+        <div className="max-w-md w-full bg-white border border-red-200 rounded-xl p-6 space-y-4">
+          <h2 className="font-display text-lg font-semibold text-slate-900">Unable to Connect to Cloud Workspace</h2>
+          <p className="text-xs text-red-700 bg-red-50 border border-red-100 rounded-lg p-3 break-words">{bootError}</p>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => window.location.reload()}
+              className="rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800"
+            >
+              Retry
+            </button>
+            <button
+              onClick={() => signOut(auth).finally(() => window.location.reload())}
+              className="rounded-lg border border-slate-200 px-4 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50"
+            >
+              Sign Out
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!firebaseUser || !user) {
+    return <LoginView firebaseUser={firebaseUser} onAuthenticated={handleAuthenticated} />;
   }
 
   const unreadCount = notifications.filter((n) => n.is_read === 0).length;
@@ -176,7 +296,7 @@ export default function App() {
               className="w-8 h-8 rounded-full object-contain shrink-0"
             />
             <span className="font-display font-bold text-sm tracking-tight text-slate-900 whitespace-nowrap">
-              Maximus Barbecue ERP
+              Maximus Barbecue
             </span>
           </div>
 
@@ -237,7 +357,7 @@ export default function App() {
                     referrerPolicy="no-referrer"
                     className="w-7 h-7 rounded-full object-contain shrink-0"
                   />
-                  <span className="font-display font-bold text-sm whitespace-nowrap">Maximus Barbecue ERP</span>
+                  <span className="font-display font-bold text-sm whitespace-nowrap">Maximus Barbecue</span>
                 </div>
                 <button onClick={() => setMobileMenuOpen(false)} className="p-1">
                   <X className="w-5 h-5" />
@@ -292,9 +412,10 @@ export default function App() {
 
             <div className="flex items-center gap-3 shrink-0">
               <select
+                aria-label="Filter by Food Truck & Location"
                 value={activeLocationId}
                 onChange={(e) => setActiveLocationId(e.target.value)}
-                className="hidden sm:block rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-700"
+                className="max-w-[145px] sm:max-w-none rounded-lg border border-slate-200 bg-slate-50 px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-700"
               >
                 <option value="ALL">All Trucks &amp; Commissary</option>
                 {locations.map((l) => (
@@ -312,7 +433,11 @@ export default function App() {
 
               <div className="relative">
                 <button
-                  onClick={() => setShowNotifs((s) => !s)}
+                  onClick={() => {
+                    const next = !showNotifs;
+                    setShowNotifs(next);
+                    if (next) loadNotifications(activeLocationId);
+                  }}
                   className="relative p-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700"
                   aria-label="Notifications"
                 >
@@ -326,13 +451,22 @@ export default function App() {
 
                 {showNotifs && (
                   <div className="absolute right-0 mt-2 w-80 rounded-xl border border-slate-200 bg-white shadow-lg z-40 p-3 space-y-2">
-                    <div className="flex items-center justify-between border-b border-slate-100 pb-2">
-                      <span className="text-xs font-semibold text-slate-900">Automated ERP Alerts</span>
-                      <span className="text-[11px] font-mono text-slate-500">{unreadCount} unread</span>
+                    <div className="flex items-center justify-between border-b border-slate-100 pb-2 gap-2">
+                      <div className="min-w-0">
+                        <span className="block text-xs font-semibold text-slate-900">Automated ERP Alerts</span>
+                        <span className="block text-[10px] text-slate-500 truncate">
+                          {activeLocationId === 'ALL'
+                            ? 'All Trucks & Commissary'
+                            : locations.find((l) => l.id === activeLocationId)?.name || 'Selected Location'}
+                        </span>
+                      </div>
+                      <span className="text-[11px] font-mono text-slate-500 shrink-0">{unreadCount} unread</span>
                     </div>
                     <div className="max-h-72 overflow-y-auto divide-y divide-slate-100">
                       {notifications.length === 0 ? (
-                        <p className="py-6 text-center text-xs text-slate-400">No alerts</p>
+                        <p className="py-6 text-center text-xs text-slate-400">
+                          {activeLocationId === 'ALL' ? 'No alerts' : 'No alerts for selected truck / location'}
+                        </p>
                       ) : (
                         notifications.map((n) => (
                           <div key={n.id} className={`py-2.5 text-xs space-y-1 ${n.is_read ? 'opacity-60' : ''}`}>
@@ -344,6 +478,9 @@ export default function App() {
                                 </button>
                               )}
                             </div>
+                            {n.location_name && (
+                              <p className="text-[10px] font-medium text-amber-700">{n.location_name}</p>
+                            )}
                             <p className="text-slate-600">{n.message}</p>
                           </div>
                         ))
@@ -357,23 +494,72 @@ export default function App() {
 
           <main className="flex-1 p-4 lg:p-8 max-w-[1440px] w-full mx-auto">
             {currentTab === 'dashboard' && (
-              <DashboardModule locations={locations} activeLocationId={activeLocationId} onNavigate={setActiveTab} />
+              <DashboardModule
+                locations={locations}
+                activeLocationId={activeLocationId}
+                onLocationChange={setActiveLocationId}
+                onNavigate={setActiveTab}
+              />
             )}
             {currentTab === 'pos' && (
-              <PosAndKdsModule mode="pos" user={user} locations={locations} activeLocationId={activeLocationId} />
+              <PosAndKdsModule
+                mode="pos"
+                user={user}
+                locations={locations}
+                activeLocationId={activeLocationId}
+                onLocationChange={setActiveLocationId}
+                onLocationsChanged={loadWorkspaceContext}
+              />
             )}
             {currentTab === 'kds' && (
-              <PosAndKdsModule mode="kds" user={user} locations={locations} activeLocationId={activeLocationId} />
+              <PosAndKdsModule
+                mode="kds"
+                user={user}
+                locations={locations}
+                activeLocationId={activeLocationId}
+                onLocationChange={setActiveLocationId}
+                onLocationsChanged={loadWorkspaceContext}
+              />
             )}
             {currentTab === 'products' && <ProductsBomModule />}
-            {currentTab === 'inventory' && <InventoryModule locations={locations} activeLocationId={activeLocationId} />}
-            {currentTab === 'procurement' && <ProcurementModule user={user} locations={locations} />}
-            {currentTab === 'finance' && <FinanceAndCostingModule mode="finance" locations={locations} />}
-            {currentTab === 'costing' && <FinanceAndCostingModule mode="costing" locations={locations} />}
-            {currentTab === 'fleet' && <OperationsHrCrmModule mode="fleet" />}
-            {currentTab === 'hr' && <OperationsHrCrmModule mode="hr" />}
-            {currentTab === 'crm' && <OperationsHrCrmModule mode="crm" />}
-            {currentTab === 'reports' && <OperationsHrCrmModule mode="reports" />}
+            {currentTab === 'inventory' && (
+              <InventoryModule
+                locations={locations}
+                activeLocationId={activeLocationId}
+                onLocationChange={setActiveLocationId}
+              />
+            )}
+            {currentTab === 'procurement' && (
+              <ProcurementModule user={user} locations={locations} activeLocationId={activeLocationId} />
+            )}
+            {currentTab === 'finance' && (
+              <FinanceAndCostingModule mode="finance" locations={locations} activeLocationId={activeLocationId} />
+            )}
+            {currentTab === 'costing' && (
+              <FinanceAndCostingModule mode="costing" locations={locations} activeLocationId={activeLocationId} />
+            )}
+            {currentTab === 'fleet' && (
+              <OperationsHrCrmModule
+                mode="fleet"
+                locations={locations}
+                activeLocationId={activeLocationId}
+                onLocationsChanged={loadWorkspaceContext}
+              />
+            )}
+            {currentTab === 'hr' && (
+              <OperationsHrCrmModule mode="hr" locations={locations} activeLocationId={activeLocationId} />
+            )}
+            {currentTab === 'crm' && (
+              <OperationsHrCrmModule mode="crm" locations={locations} activeLocationId={activeLocationId} />
+            )}
+            {currentTab === 'reports' && (
+              <OperationsHrCrmModule
+                mode="reports"
+                locations={locations}
+                activeLocationId={activeLocationId}
+                onLocationChange={setActiveLocationId}
+              />
+            )}
             {currentTab === 'settings' && (user.roleCode === 'SUPER_ADMIN' || user.roleCode === 'BUSINESS_OWNER') && (
               <SettingsUserControlModule currentUser={user} onProfileUpdated={refreshCurrentUser} />
             )}
@@ -381,5 +567,13 @@ export default function App() {
         </div>
       </div>
     </MotionConfig>
+  );
+}
+
+export default function App() {
+  return (
+    <AppErrorBoundary>
+      <AppShell />
+    </AppErrorBoundary>
   );
 }

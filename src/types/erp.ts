@@ -52,4 +52,5 @@ export interface LocationRow {
   type: 'COMMISSARY' | 'WAREHOUSE' | 'FOOD_TRUCK' | 'POPUP_SITE';
   address: string;
   is_active: number;
+  kds_enabled?: number;
 }

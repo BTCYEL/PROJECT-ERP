@@ -12,8 +12,25 @@ if (!fs.existsSync(dataDir)) {
 const dbPath = path.join(dataDir, 'kalyefleet_erp.sqlite');
 export const db = new Database(dbPath);
 
-db.pragma('journal_mode = WAL');
+db.pragma('busy_timeout = 5000');
+try {
+  db.pragma('wal_checkpoint(TRUNCATE)');
+} catch {
+  // Ignore if not currently in WAL mode
+}
+db.pragma('journal_mode = DELETE');
+db.pragma('synchronous = FULL');
 db.pragma('foreign_keys = ON');
+
+export function closeDatabase() {
+  try {
+    if (db.open) {
+      db.close();
+    }
+  } catch {
+    // Ignore close errors during shutdown
+  }
+}
 
 export function initSchema() {
   db.exec(`
@@ -44,6 +61,7 @@ export function initSchema() {
       type TEXT NOT NULL,
       address TEXT,
       is_active INTEGER NOT NULL DEFAULT 1,
+      kds_enabled INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -221,6 +239,7 @@ export function initSchema() {
       direct_labor_cost REAL NOT NULL DEFAULT 0,
       target_food_cost_pct REAL NOT NULL DEFAULT 35,
       tax_config_id TEXT REFERENCES tax_configs(id),
+      expiry_date TEXT,
       is_available INTEGER NOT NULL DEFAULT 1
     );
 
@@ -563,6 +582,8 @@ export function initSchema() {
   };
   ensureColumn('users', 'avatar_url', 'TEXT');
   ensureColumn('employees', 'avatar_url', 'TEXT');
+  ensureColumn('products', 'expiry_date', 'TEXT');
+  ensureColumn('locations', 'kds_enabled', 'INTEGER NOT NULL DEFAULT 1');
 
   db.exec(`
     UPDATE users SET email = REPLACE(email, '@kalyefleet.ph', '@maximusbbq.ph') WHERE email LIKE '%@kalyefleet.ph';
@@ -670,10 +691,10 @@ export function seedDatabase() {
     });
 
     // 3. Locations & Trucks
-    const insLoc = db.prepare('INSERT INTO locations (id, code, name, type, address) VALUES (?, ?, ?, ?, ?)');
-    insLoc.run('loc_commissary', 'COM-01', 'Central Commissary Kitchen', 'COMMISSARY', 'Pasig Food Hub, Metro Manila');
-    insLoc.run('loc_truck_1', 'TRK-01', 'Truck 01 — BGC High Street', 'FOOD_TRUCK', '7th Ave & Bonifacio High St, Taguig');
-    insLoc.run('loc_truck_2', 'TRK-02', 'Truck 02 — Ayala Triangle', 'FOOD_TRUCK', 'Makati Ave Night Market, Makati');
+    const insLoc = db.prepare('INSERT INTO locations (id, code, name, type, address, kds_enabled) VALUES (?, ?, ?, ?, ?, ?)');
+    insLoc.run('loc_commissary', 'COM-01', 'Central Commissary Kitchen', 'COMMISSARY', 'Pasig Food Hub, Metro Manila', 0);
+    insLoc.run('loc_truck_1', 'TRK-01', 'Truck 01 — BGC High Street', 'FOOD_TRUCK', '7th Ave & Bonifacio High St, Taguig', 1);
+    insLoc.run('loc_truck_2', 'TRK-02', 'Truck 02 — Ayala Triangle', 'FOOD_TRUCK', 'Makati Ave Night Market, Makati', 1);
 
     const insTruck = db.prepare('INSERT INTO food_trucks (id, location_id, plate_number, make_model, status, current_site, odometer_km) VALUES (?, ?, ?, ?, ?, ?, ?)');
     insTruck.run('trk_1', 'loc_truck_1', 'NAA-4821', 'Isuzu NLR Custom Kitchen Van', 'ACTIVE', 'BGC High Street South', 42850);
