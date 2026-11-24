@@ -81,7 +81,7 @@ service cloud.firestore {
 
     function isValidErpUser(data) {
       return data.keys().hasAll(['id', 'ownerUid', 'email', 'fullName', 'roleId', 'roleCode', 'roleName', 'assignedLocationId', 'avatarUrl', 'passwordHash', 'isActive', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['id', 'ownerUid', 'email', 'fullName', 'roleId', 'roleCode', 'roleName', 'assignedLocationId', 'avatarUrl', 'passwordHash', 'isActive', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'email', 'fullName', 'roleId', 'roleCode', 'roleName', 'assignedLocationId', 'avatarUrl', 'passwordHash', 'shiftPinHash', 'failedLoginAttempts', 'lockedUntil', 'isActive', 'createdAt', 'updatedAt'])
         && isValidId(data.id)
         && isValidId(data.ownerUid)
         && isValidString(data.email, 3, 200)
@@ -92,6 +92,9 @@ service cloud.firestore {
         && isNullableString(data.assignedLocationId, 128)
         && isNullableString(data.avatarUrl, 250000)
         && isValidString(data.passwordHash, 1, 200)
+        && (!('shiftPinHash' in data) || isNullableString(data.shiftPinHash, 200))
+        && (!('failedLoginAttempts' in data) || (isValidNum(data.failedLoginAttempts) && data.failedLoginAttempts >= 0))
+        && (!('lockedUntil' in data) || isNullableString(data.lockedUntil, 64))
         && data.isActive is bool
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
@@ -99,7 +102,7 @@ service cloud.firestore {
 
     function isValidEmployee(data) {
       return data.keys().hasAll(['id', 'ownerUid', 'employeeCode', 'fullName', 'department', 'position', 'locationId', 'payType', 'baseRate', 'avatarUrl', 'isActive', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['id', 'ownerUid', 'employeeCode', 'fullName', 'department', 'position', 'locationId', 'payType', 'baseRate', 'avatarUrl', 'isActive', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'employeeCode', 'fullName', 'department', 'position', 'locationId', 'payType', 'baseRate', 'avatarUrl', 'faceDescriptorJson', 'faceEnrolledAt', 'attendancePin', 'isActive', 'createdAt', 'updatedAt'])
         && isValidId(data.id)
         && isValidId(data.ownerUid)
         && isValidString(data.employeeCode, 1, 64)
@@ -107,9 +110,12 @@ service cloud.firestore {
         && isValidString(data.department, 1, 100)
         && isValidString(data.position, 1, 100)
         && isNullableString(data.locationId, 128)
-        && data.payType in ['DAILY', 'MONTHLY']
+        && data.payType in ['DAILY', 'HOURLY', 'MONTHLY']
         && isValidNum(data.baseRate) && data.baseRate >= 0
         && isNullableString(data.avatarUrl, 250000)
+        && (!('faceDescriptorJson' in data) || isNullableString(data.faceDescriptorJson, 4096))
+        && (!('faceEnrolledAt' in data) || isNullableString(data.faceEnrolledAt, 40))
+        && (!('attendancePin' in data) || isNullableString(data.attendancePin, 12))
         && data.isActive is bool
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
@@ -254,7 +260,7 @@ service cloud.firestore {
 
     function isValidSupplier(data) {
       return data.keys().hasAll(['id', 'ownerUid', 'code', 'name', 'contactPerson', 'phone', 'email', 'address', 'tin', 'paymentTerms', 'isActive', 'createdAt'])
-        && data.keys().hasOnly(['id', 'ownerUid', 'code', 'name', 'contactPerson', 'phone', 'email', 'address', 'tin', 'paymentTerms', 'isActive', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'code', 'name', 'contactPerson', 'phone', 'email', 'address', 'tin', 'paymentTerms', 'isActive', 'updatedBy', 'updatedByName', 'createdAt', 'updatedAt'])
         && isValidId(data.id)
         && isValidId(data.ownerUid)
         && isValidString(data.code, 1, 40)
@@ -266,20 +272,29 @@ service cloud.firestore {
         && isNullableString(data.tin, 40)
         && data.paymentTerms is int
         && data.isActive is bool
-        && data.createdAt is timestamp;
+        && (!('updatedBy' in data) || isNullableString(data.updatedBy, 128))
+        && (!('updatedByName' in data) || isNullableString(data.updatedByName, 150))
+        && data.createdAt is timestamp
+        && (!('updatedAt' in data) || data.updatedAt is timestamp);
     }
 
     function isValidPurchaseOrder(data) {
       return data.keys().hasAll(['id', 'ownerUid', 'poNumber', 'supplierId', 'locationId', 'status', 'totalAmount', 'approvedBy', 'notes', 'items', 'orderedAt', 'expectedAt', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['id', 'ownerUid', 'poNumber', 'supplierId', 'locationId', 'status', 'totalAmount', 'approvedBy', 'notes', 'items', 'orderedAt', 'expectedAt', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'poNumber', 'supplierId', 'locationId', 'status', 'totalAmount', 'approvedBy', 'stage1ApprovedBy', 'stage1ApprovedByName', 'stage1ApprovedAt', 'managerSignatureData', 'managerSignerName', 'signedAt', 'notes', 'items', 'orderedAt', 'expectedAt', 'createdAt', 'updatedAt'])
         && isValidId(data.id)
         && isValidId(data.ownerUid)
         && isValidString(data.poNumber, 1, 64)
         && isValidId(data.supplierId)
         && isValidId(data.locationId)
-        && data.status in ['PENDING_APPROVAL', 'APPROVED', 'PARTIAL', 'PARTIALLY_RECEIVED', 'RECEIVED', 'CANCELLED']
+        && data.status in ['DRAFT', 'PENDING_APPROVAL', 'PENDING_MANAGER_SIGNATURE', 'APPROVED', 'PARTIAL', 'PARTIALLY_RECEIVED', 'RECEIVED', 'PAID', 'CANCELLED']
         && isValidNum(data.totalAmount) && data.totalAmount >= 0
         && isNullableString(data.approvedBy, 128)
+        && (!('stage1ApprovedBy' in data) || isNullableString(data.stage1ApprovedBy, 128))
+        && (!('stage1ApprovedByName' in data) || isNullableString(data.stage1ApprovedByName, 150))
+        && (!('stage1ApprovedAt' in data) || isNullableString(data.stage1ApprovedAt, 40))
+        && (!('managerSignatureData' in data) || isNullableString(data.managerSignatureData, 200000))
+        && (!('managerSignerName' in data) || isNullableString(data.managerSignerName, 150))
+        && (!('signedAt' in data) || isNullableString(data.signedAt, 40))
         && isNullableString(data.notes, 500)
         && isBoundedMapList(data.items, 60)
         && isValidString(data.orderedAt, 1, 40)
@@ -397,7 +412,7 @@ service cloud.firestore {
 
     function isValidLocation(data) {
       return data.keys().hasAll(['id', 'ownerUid', 'code', 'name', 'type', 'address', 'isActive', 'createdAt'])
-        && data.keys().hasOnly(['id', 'ownerUid', 'code', 'name', 'type', 'address', 'isActive', 'kdsEnabled', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'code', 'name', 'type', 'address', 'isActive', 'kdsEnabled', 'dailySalesTarget', 'createdAt'])
         && isValidId(data.id)
         && isValidId(data.ownerUid)
         && isValidString(data.code, 1, 40)
@@ -406,6 +421,7 @@ service cloud.firestore {
         && isNullableString(data.address, 240)
         && data.isActive is bool
         && (!('kdsEnabled' in data) || data.kdsEnabled is bool)
+        && (!('dailySalesTarget' in data) || (isValidNum(data.dailySalesTarget) && data.dailySalesTarget >= 0))
         && data.createdAt is timestamp;
     }
 
@@ -446,14 +462,20 @@ service cloud.firestore {
 
     function isValidAttendanceLog(data) {
       return data.keys().hasAll(['id', 'ownerUid', 'employeeId', 'clockIn', 'clockOut', 'overtimeHours', 'status', 'notes', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['id', 'ownerUid', 'employeeId', 'clockIn', 'clockOut', 'overtimeHours', 'status', 'notes', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'employeeId', 'locationId', 'clockIn', 'clockOut', 'workedHours', 'overtimeHours', 'status', 'verificationMethod', 'matchConfidence', 'clockInPhoto', 'clockOutPhoto', 'notes', 'createdAt', 'updatedAt'])
         && isValidId(data.id)
         && isValidId(data.ownerUid)
         && isValidId(data.employeeId)
+        && (!('locationId' in data) || isNullableString(data.locationId, 128))
         && isValidString(data.clockIn, 1, 40)
         && isNullableString(data.clockOut, 40)
+        && (!('workedHours' in data) || (isValidNum(data.workedHours) && data.workedHours >= 0))
         && isValidNum(data.overtimeHours) && data.overtimeHours >= 0
         && data.status in ['PRESENT', 'LATE', 'ABSENT']
+        && (!('verificationMethod' in data) || data.verificationMethod in ['FACE_SCAN', 'PIN_FALLBACK', 'MANUAL'])
+        && (!('matchConfidence' in data) || data.matchConfidence == null || (isValidNum(data.matchConfidence) && data.matchConfidence >= 0 && data.matchConfidence <= 100))
+        && (!('clockInPhoto' in data) || isNullableString(data.clockInPhoto, 120000))
+        && (!('clockOutPhoto' in data) || isNullableString(data.clockOutPhoto, 120000))
         && isNullableString(data.notes, 300)
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
@@ -524,7 +546,7 @@ service cloud.firestore {
 
     function isValidWorkspaceMeta(data) {
       return data.keys().hasAll(['id', 'ownerUid', 'seeded', 'businessName', 'currency', 'roles', 'uoms', 'unitConversions', 'pettyCashFunds', 'financialPeriods', 'payrollRule', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['id', 'ownerUid', 'seeded', 'businessName', 'currency', 'roles', 'uoms', 'unitConversions', 'pettyCashFunds', 'financialPeriods', 'payrollRule', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'seeded', 'businessName', 'currency', 'roles', 'uoms', 'unitConversions', 'pettyCashFunds', 'financialPeriods', 'payrollRule', 'poApprovalThreshold', 'createdAt', 'updatedAt'])
         && isValidId(data.id)
         && isValidId(data.ownerUid)
         && data.seeded is bool
@@ -536,6 +558,7 @@ service cloud.firestore {
         && isBoundedMapList(data.pettyCashFunds, 25)
         && isBoundedMapList(data.financialPeriods, 25)
         && data.payrollRule is map
+        && (!('poApprovalThreshold' in data) || (isValidNum(data.poApprovalThreshold) && data.poApprovalThreshold >= 0))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -578,7 +601,7 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && (
           isBootstrapAdmin() ||
-          incoming().diff(existing()).affectedKeys().hasOnly(['email', 'fullName', 'roleId', 'roleCode', 'roleName', 'assignedLocationId', 'avatarUrl', 'passwordHash', 'isActive', 'updatedAt'])
+          incoming().diff(existing()).affectedKeys().hasOnly(['email', 'fullName', 'roleId', 'roleCode', 'roleName', 'assignedLocationId', 'avatarUrl', 'passwordHash', 'shiftPinHash', 'failedLoginAttempts', 'lockedUntil', 'isActive', 'updatedAt'])
         );
       allow delete: if isValidId(erpUserId) && isDocOwner();
     }
@@ -595,7 +618,7 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && (
           isBootstrapAdmin() ||
-          incoming().diff(existing()).affectedKeys().hasOnly(['employeeCode', 'fullName', 'department', 'position', 'locationId', 'payType', 'baseRate', 'avatarUrl', 'isActive', 'updatedAt'])
+          incoming().diff(existing()).affectedKeys().hasOnly(['employeeCode', 'fullName', 'department', 'position', 'locationId', 'payType', 'baseRate', 'avatarUrl', 'faceDescriptorJson', 'faceEnrolledAt', 'attendancePin', 'isActive', 'updatedAt'])
         );
       allow delete: if isValidId(employeeId) && isDocOwner();
     }
@@ -712,12 +735,14 @@ service cloud.firestore {
       allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
       allow create: if isEmailVerified() && isValidId(supplierId) && isValidSupplier(incoming())
         && incoming().ownerUid == request.auth.uid
-        && incoming().createdAt == request.time;
+        && incoming().createdAt == request.time
+        && (!('updatedAt' in incoming()) || incoming().updatedAt == request.time);
       allow update: if isValidId(supplierId) && isDocOwner() && isValidSupplier(incoming())
         && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
         && (
           isBootstrapAdmin() ||
-          incoming().diff(existing()).affectedKeys().hasOnly(['code', 'name', 'contactPerson', 'phone', 'email', 'address', 'tin', 'paymentTerms', 'isActive'])
+          incoming().diff(existing()).affectedKeys().hasOnly(['code', 'name', 'contactPerson', 'phone', 'email', 'address', 'tin', 'paymentTerms', 'isActive', 'updatedBy', 'updatedByName', 'updatedAt'])
         );
       allow delete: if isValidId(supplierId) && isDocOwner();
     }
@@ -734,11 +759,15 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && (
           isBootstrapAdmin() ||
-          (existing().status == 'PENDING_APPROVAL' && incoming().status == 'PENDING_APPROVAL' && incoming().diff(existing()).affectedKeys().hasOnly(['supplierId', 'locationId', 'totalAmount', 'notes', 'items', 'expectedAt', 'updatedAt'])) ||
-          (existing().status == 'PENDING_APPROVAL' && incoming().status == 'APPROVED' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'approvedBy', 'updatedAt'])) ||
-          (existing().status == 'PENDING_APPROVAL' && incoming().status == 'APPROVED' && incoming().diff(existing()).affectedKeys().hasOnly(['supplierId', 'locationId', 'totalAmount', 'notes', 'items', 'expectedAt', 'status', 'approvedBy', 'updatedAt'])) ||
-          (existing().status in ['PENDING_APPROVAL', 'APPROVED'] && incoming().status == 'CANCELLED' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'updatedAt'])) ||
-          (existing().status in ['APPROVED', 'PARTIAL', 'PARTIALLY_RECEIVED'] && incoming().status in ['PARTIAL', 'PARTIALLY_RECEIVED', 'RECEIVED'] && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'items', 'updatedAt']))
+          (existing().status in ['DRAFT', 'PENDING_APPROVAL'] && incoming().status in ['DRAFT', 'PENDING_APPROVAL'] && incoming().diff(existing()).affectedKeys().hasOnly(['supplierId', 'locationId', 'status', 'totalAmount', 'notes', 'items', 'expectedAt', 'updatedAt'])) ||
+          (existing().status in ['DRAFT', 'PENDING_APPROVAL'] && incoming().status == 'PENDING_MANAGER_SIGNATURE' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'stage1ApprovedBy', 'stage1ApprovedByName', 'stage1ApprovedAt', 'updatedAt'])) ||
+          (existing().status in ['DRAFT', 'PENDING_APPROVAL'] && incoming().status == 'PENDING_MANAGER_SIGNATURE' && incoming().diff(existing()).affectedKeys().hasOnly(['supplierId', 'locationId', 'status', 'totalAmount', 'notes', 'items', 'expectedAt', 'stage1ApprovedBy', 'stage1ApprovedByName', 'stage1ApprovedAt', 'updatedAt'])) ||
+          (existing().status in ['DRAFT', 'PENDING_APPROVAL'] && incoming().status == 'APPROVED' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'approvedBy', 'updatedAt'])) ||
+          (existing().status in ['DRAFT', 'PENDING_APPROVAL'] && incoming().status == 'APPROVED' && incoming().diff(existing()).affectedKeys().hasOnly(['supplierId', 'locationId', 'status', 'totalAmount', 'notes', 'items', 'expectedAt', 'approvedBy', 'updatedAt'])) ||
+          (existing().status == 'PENDING_MANAGER_SIGNATURE' && incoming().status == 'APPROVED' && incoming().managerSignatureData is string && incoming().managerSignatureData.size() > 20 && incoming().managerSignerName is string && incoming().managerSignerName.size() > 0 && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'approvedBy', 'managerSignatureData', 'managerSignerName', 'signedAt', 'updatedAt'])) ||
+          (existing().status in ['DRAFT', 'PENDING_APPROVAL', 'PENDING_MANAGER_SIGNATURE', 'APPROVED'] && incoming().status == 'CANCELLED' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'updatedAt'])) ||
+          (existing().status in ['APPROVED', 'PARTIAL', 'PARTIALLY_RECEIVED'] && incoming().status in ['PARTIAL', 'PARTIALLY_RECEIVED', 'RECEIVED'] && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'items', 'updatedAt'])) ||
+          (existing().status in ['RECEIVED', 'PARTIAL', 'PARTIALLY_RECEIVED'] && incoming().status == 'PAID' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
         );
       allow delete: if isValidId(poId) && isDocOwner();
     }
@@ -833,7 +862,7 @@ service cloud.firestore {
         && preservesImmutableOwnerAndCreated()
         && (
           isBootstrapAdmin() ||
-          incoming().diff(existing()).affectedKeys().hasOnly(['code', 'name', 'type', 'address', 'isActive', 'kdsEnabled'])
+          incoming().diff(existing()).affectedKeys().hasOnly(['code', 'name', 'type', 'address', 'isActive', 'kdsEnabled', 'dailySalesTarget'])
         );
       allow delete: if isValidId(locationId) && isDocOwner();
     }
@@ -876,7 +905,7 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && (
           isBootstrapAdmin() ||
-          (existing().clockOut == null && incoming().diff(existing()).affectedKeys().hasOnly(['clockOut', 'overtimeHours', 'updatedAt']))
+          (existing().clockOut == null && incoming().diff(existing()).affectedKeys().hasOnly(['clockOut', 'workedHours', 'overtimeHours', 'clockOutPhoto', 'notes', 'updatedAt']))
         );
       allow delete: if isValidId(attId) && isDocOwner();
     }
@@ -954,7 +983,7 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && (
           isBootstrapAdmin() ||
-          incoming().diff(existing()).affectedKeys().hasOnly(['payrollRule', 'pettyCashFunds', 'financialPeriods', 'businessName', 'updatedAt'])
+          incoming().diff(existing()).affectedKeys().hasOnly(['payrollRule', 'pettyCashFunds', 'financialPeriods', 'businessName', 'poApprovalThreshold', 'updatedAt'])
         );
       allow delete: if isValidId(metaId) && isDocOwner();
     }

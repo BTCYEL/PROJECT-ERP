@@ -1,5 +1,21 @@
-import React, { useEffect, useState } from 'react';
-import { Plus, CheckCircle2, PackageCheck, Pencil, XCircle, Eye, Printer, Trash2, X } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import {
+  Plus,
+  CheckCircle2,
+  PackageCheck,
+  Pencil,
+  XCircle,
+  Eye,
+  Printer,
+  Trash2,
+  X,
+  History,
+  User,
+  PenTool,
+  ShieldCheck,
+  SlidersHorizontal,
+  RotateCcw,
+} from 'lucide-react';
 import { apiFetch, formatNum, formatPHP } from '../lib/api.ts';
 import { AuthUser, LocationRow, PERMISSIONS } from '../types/erp.ts';
 
@@ -7,6 +23,8 @@ interface Props {
   user: AuthUser;
   locations: LocationRow[];
   activeLocationId?: string;
+  quickAction?: { action: string; nonce: number } | null;
+  onQuickActionHandled?: () => void;
 }
 
 interface PoLineDraft {
@@ -16,24 +34,43 @@ interface PoLineDraft {
   unitCost: string;
 }
 
-export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }: Props) {
+export function ProcurementModule({ user, locations, activeLocationId = 'ALL', quickAction, onQuickActionHandled }: Props) {
   const [subTab, setSubTab] = useState<'pos' | 'suppliers' | 'payables'>('pos');
-  const [data, setData] = useState<any>({ suppliers: [], priceComparison: [], purchaseOrders: [], invoices: [] });
+  const [data, setData] = useState<any>({ approvalThreshold: 10000, suppliers: [], supplierAuditLogs: [], priceComparison: [], purchaseOrders: [], invoices: [] });
   const [invItems, setInvItems] = useState<any[]>([]);
   const [receivingPo, setReceivingPo] = useState<any>(null);
   const [recvMap, setRecvMap] = useState<Record<string, { qty: string; batch: string; expiry: string; notes: string }>>({});
+
+  const [poStatusFilter, setPoStatusFilter] = useState<'ALL' | 'DRAFT' | 'PENDING_APPROVAL' | 'PENDING_MANAGER_SIGNATURE' | 'APPROVED' | 'PARTIAL' | 'RECEIVED' | 'PAID' | 'CANCELLED'>('ALL');
+
+  // Configurable Approval Threshold Modal
+  const [showThresholdModal, setShowThresholdModal] = useState(false);
+  const [thresholdInput, setThresholdInput] = useState('10000');
+  const [thresholdErr, setThresholdErr] = useState('');
+  const [savingThreshold, setSavingThreshold] = useState(false);
+
+  // Stage 2 Manager Digital Signature Modal
+  const [signaturePo, setSignaturePo] = useState<any>(null);
+  const [signerName, setSignerName] = useState(user.fullName || '');
+  const [signatureErr, setSignatureErr] = useState('');
+  const [submittingSignature, setSubmittingSignature] = useState(false);
+  const [hasSignatureStroke, setHasSignatureStroke] = useState(false);
+  const [isDrawingSignature, setIsDrawingSignature] = useState(false);
+  const sigCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // Create PO Modal
   const [showNewPo, setShowNewPo] = useState(false);
   const [poForm, setPoForm] = useState<{
     supplierId: string;
     locationId: string;
+    status: 'DRAFT' | 'PENDING_APPROVAL' | 'APPROVED';
     expectedAt: string;
     notes: string;
     items: PoLineDraft[];
   }>({
     supplierId: '',
     locationId: 'loc_commissary',
+    status: 'PENDING_APPROVAL',
     expectedAt: '',
     notes: '',
     items: [{ inventoryItemId: '', orderedQty: '100', unitCost: '14' }],
@@ -44,12 +81,14 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
   const [reviewForm, setReviewForm] = useState<{
     supplierId: string;
     locationId: string;
+    status: 'DRAFT' | 'PENDING_APPROVAL' | 'APPROVED';
     expectedAt: string;
     notes: string;
     items: PoLineDraft[];
   }>({
     supplierId: '',
     locationId: '',
+    status: 'PENDING_APPROVAL',
     expectedAt: '',
     notes: '',
     items: [],
@@ -82,6 +121,8 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
   const [supplierContext, setSupplierContext] = useState<'newPo' | 'reviewPo' | 'tab'>('tab');
   const [deleteSupplierTarget, setDeleteSupplierTarget] = useState<any>(null);
   const [deletingSupplier, setDeletingSupplier] = useState(false);
+  const [auditSupplierTarget, setAuditSupplierTarget] = useState<any>(null);
+  const [auditFilterSupplierId, setAuditFilterSupplierId] = useState<string>('ALL');
 
   const [msg, setMsg] = useState('');
   const [err, setErr] = useState('');
@@ -89,6 +130,12 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
   const canApprove =
     user.roleCode === 'SUPER_ADMIN' ||
     user.roleCode === 'BUSINESS_OWNER' ||
+    user.permissions.includes(PERMISSIONS.PO_APPROVE);
+
+  const canMarkPaid =
+    user.roleCode === 'SUPER_ADMIN' ||
+    user.roleCode === 'BUSINESS_OWNER' ||
+    user.permissions.includes(PERMISSIONS.FINANCE_VIEW) ||
     user.permissions.includes(PERMISSIONS.PO_APPROVE);
 
   const load = async () => {
@@ -128,6 +175,15 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
     load();
   }, []);
 
+  useEffect(() => {
+    if (!quickAction) return;
+    if (quickAction.action === 'new-po') {
+      setSubTab('pos');
+      openNewPoModal();
+      onQuickActionHandled?.();
+    }
+  }, [quickAction]);
+
   const openNewPoModal = () => {
     setErr('');
     const firstItem = invItems[0];
@@ -138,6 +194,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
     setPoForm({
       supplierId: data.suppliers?.[0]?.id || '',
       locationId: defaultLoc,
+      status: 'PENDING_APPROVAL',
       expectedAt: '',
       notes: '',
       items: [
@@ -154,9 +211,12 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
   const openReviewModal = (po: any) => {
     setErr('');
     setReviewPo(po);
+    const editableStatus: 'DRAFT' | 'PENDING_APPROVAL' | 'APPROVED' =
+      po.status === 'DRAFT' ? 'DRAFT' : 'PENDING_APPROVAL';
     setReviewForm({
       supplierId: po.supplier_id || data.suppliers?.[0]?.id || '',
       locationId: po.location_id || locations[0]?.id || '',
+      status: editableStatus,
       expectedAt: po.expected_at ? String(po.expected_at).slice(0, 10) : '',
       notes: po.notes || '',
       items: (po.items || []).map((pi: any) => ({
@@ -168,19 +228,158 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
     });
   };
 
+  const approvalThreshold = Number.isFinite(Number(data.approvalThreshold)) ? Number(data.approvalThreshold) : 10000;
+
+  const openThresholdModal = () => {
+    setThresholdErr('');
+    setThresholdInput(String(approvalThreshold));
+    setShowThresholdModal(true);
+  };
+
+  const saveApprovalThreshold = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setThresholdErr('');
+    const parsed = Number(thresholdInput);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      setThresholdErr('Please enter a valid non-negative threshold amount in PHP.');
+      return;
+    }
+    setSavingThreshold(true);
+    try {
+      const res = await apiFetch<{ ok: boolean; approvalThreshold: number }>('/procurement/approval-config', {
+        method: 'PUT',
+        body: JSON.stringify({ approvalThreshold: parsed }),
+      });
+      setShowThresholdModal(false);
+      setMsg(`Updated multi-stage signature threshold to ${formatPHP(res.approvalThreshold)}.`);
+      await load();
+    } catch (e: any) {
+      setThresholdErr(e.message || 'Unable to update approval threshold');
+    } finally {
+      setSavingThreshold(false);
+    }
+  };
+
+  const openSignatureModal = (po: any) => {
+    setSignatureErr('');
+    setSignerName(user.fullName || '');
+    setHasSignatureStroke(false);
+    setIsDrawingSignature(false);
+    setSignaturePo(po);
+    requestAnimationFrame(() => {
+      const canvas = sigCanvasRef.current;
+      if (canvas) {
+        const ctx = canvas.getContext('2d');
+        ctx?.clearRect(0, 0, canvas.width, canvas.height);
+      }
+    });
+  };
+
+  const clearSignatureCanvas = () => {
+    const canvas = sigCanvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      ctx?.clearRect(0, 0, canvas.width, canvas.height);
+    }
+    setHasSignatureStroke(false);
+    setSignatureErr('');
+  };
+
+  const getSignaturePoint = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const canvas = sigCanvasRef.current!;
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: ((e.clientX - rect.left) * canvas.width) / rect.width,
+      y: ((e.clientY - rect.top) * canvas.height) / rect.height,
+    };
+  };
+
+  const handleSigPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const canvas = sigCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const { x, y } = getSignaturePoint(e);
+    ctx.strokeStyle = '#0f172a';
+    ctx.lineWidth = 2.4;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x + 0.01, y + 0.01);
+    ctx.stroke();
+    setIsDrawingSignature(true);
+    setHasSignatureStroke(true);
+    setSignatureErr('');
+  };
+
+  const handleSigPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!isDrawingSignature) return;
+    const canvas = sigCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const { x, y } = getSignaturePoint(e);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+  };
+
+  const handleSigPointerUp = () => {
+    setIsDrawingSignature(false);
+  };
+
+  const submitManagerSignature = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!signaturePo) return;
+    setSignatureErr('');
+    if (!signerName.trim()) {
+      setSignatureErr('Please enter the signing manager’s full name.');
+      return;
+    }
+    if (!hasSignatureStroke || !sigCanvasRef.current) {
+      setSignatureErr('Please draw your digital signature on the signature pad before approving.');
+      return;
+    }
+    setSubmittingSignature(true);
+    try {
+      const signatureData = sigCanvasRef.current.toDataURL('image/png');
+      await apiFetch(`/procurement/purchase-orders/${signaturePo.id}/approve`, {
+        method: 'POST',
+        body: JSON.stringify({
+          signerName: signerName.trim(),
+          signatureData,
+        }),
+      });
+      const signedNo = signaturePo.po_number;
+      setSignaturePo(null);
+      setReviewPo((prev: any) => (prev?.id === signaturePo.id ? null : prev));
+      setMsg(`Digitally signed and finalized approval for ${signedNo}. Ready for goods receiving.`);
+      await load();
+    } catch (e: any) {
+      setSignatureErr(e.message || 'Unable to apply manager signature');
+    } finally {
+      setSubmittingSignature(false);
+    }
+  };
+
   const saveReviewPo = async (approveAfterSave: boolean) => {
     if (!reviewPo) return;
     setErr('');
     setSavingReview(true);
+    const targetStatus = approveAfterSave ? 'APPROVED' : reviewForm.status;
     try {
       const res = await apiFetch<any>(`/procurement/purchase-orders/${reviewPo.id}`, {
         method: 'PUT',
         body: JSON.stringify({
           supplierId: reviewForm.supplierId,
           locationId: reviewForm.locationId,
+          status: targetStatus,
           expectedAt: reviewForm.expectedAt || null,
           notes: reviewForm.notes,
-          approve: approveAfterSave,
+          approve: targetStatus === 'APPROVED',
           items: reviewForm.items.map((line) => ({
             id: line.id,
             inventoryItemId: line.inventoryItemId,
@@ -190,12 +389,24 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
         }),
       });
       setReviewPo(null);
-      setMsg(
-        approveAfterSave
-          ? `Reviewed and approved ${res.poNumber} (${formatPHP(res.totalAmount)}). Ready for goods receiving.`
-          : `Updated purchase order ${res.poNumber} (${formatPHP(res.totalAmount)}).`,
-      );
-      await load();
+      const refreshed = await load();
+      if (res.status === 'PENDING_MANAGER_SIGNATURE') {
+        setMsg(
+          `Stage 1 verified ${res.poNumber} (${formatPHP(res.totalAmount)}). Manager digital signature is now required.`,
+        );
+        const updatedPo = refreshed?.purchaseOrders?.find((p: any) => p.id === res.id);
+        if (updatedPo && canApprove) {
+          openSignatureModal(updatedPo);
+        }
+      } else {
+        setMsg(
+          res.status === 'APPROVED'
+            ? `Reviewed and approved ${res.poNumber} (${formatPHP(res.totalAmount)}). Ready for goods receiving.`
+            : res.status === 'DRAFT'
+              ? `Saved ${res.poNumber} as Draft (${formatPHP(res.totalAmount)}).`
+              : `Updated purchase order ${res.poNumber} (${formatPHP(res.totalAmount)}).`,
+        );
+      }
     } catch (e: any) {
       setErr(e.message || 'Unable to update purchase order');
     } finally {
@@ -203,14 +414,46 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
     }
   };
 
-  const approvePO = async (id: string) => {
+  const approvePO = async (po: any) => {
     setErr('');
+    if (po.status === 'PENDING_MANAGER_SIGNATURE') {
+      openSignatureModal(po);
+      return;
+    }
     try {
-      await apiFetch(`/procurement/purchase-orders/${id}/approve`, { method: 'POST' });
-      setMsg('Purchase order approved and ready for goods receiving.');
-      await load();
+      const res = await apiFetch<any>(`/procurement/purchase-orders/${po.id}/approve`, { method: 'POST' });
+      const refreshed = await load();
+      if (res?.status === 'PENDING_MANAGER_SIGNATURE' || res?.requiresSignature) {
+        setMsg(
+          `Stage 1 approved ${po.po_number}. Order exceeds ${formatPHP(approvalThreshold)} — Stage 2 Manager Digital Signature required.`,
+        );
+        const updatedPo = refreshed?.purchaseOrders?.find((p: any) => p.id === po.id) || {
+          ...po,
+          status: 'PENDING_MANAGER_SIGNATURE',
+          stage1_approved_by_name: user.fullName,
+          stage1_approved_at: new Date().toISOString(),
+        };
+        openSignatureModal(updatedPo);
+      } else {
+        setMsg(`Purchase order ${po.po_number} approved and ready for goods receiving.`);
+      }
     } catch (e: any) {
       setErr(e.message);
+    }
+  };
+
+  const markPoPaid = async (po: any) => {
+    setErr('');
+    try {
+      await apiFetch(`/procurement/purchase-orders/${po.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ status: 'PAID' }),
+      });
+      setReviewPo((prev: any) => (prev?.id === po.id ? null : prev));
+      setMsg(`Marked purchase order ${po.po_number} as Paid.`);
+      await load();
+    } catch (e: any) {
+      setErr(e.message || 'Unable to mark purchase order as paid');
     }
   };
 
@@ -396,11 +639,12 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
       return;
     }
     try {
-      const r = await apiFetch('/procurement/purchase-orders', {
+      const r = await apiFetch<any>('/procurement/purchase-orders', {
         method: 'POST',
         body: JSON.stringify({
           supplierId: poForm.supplierId,
           locationId: poForm.locationId,
+          status: poForm.status,
           expectedAt: poForm.expectedAt || null,
           notes: poForm.notes,
           items: poForm.items.map((i) => ({
@@ -411,7 +655,13 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
         }),
       });
       setShowNewPo(false);
-      setMsg(`Created ${r.poNumber} awaiting manager approval.`);
+      setMsg(
+        poForm.status === 'DRAFT'
+          ? `Saved ${r.poNumber} as Draft.`
+          : poForm.status === 'APPROVED'
+            ? `Created and approved ${r.poNumber}. Ready for goods receiving.`
+            : `Created ${r.poNumber} awaiting manager approval.`,
+      );
       await load();
     } catch (e: any) {
       setErr(e.message);
@@ -433,36 +683,184 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
     }
   };
 
-  const getStatusClass = (status: string) => {
+  const getPoStatusMeta = (status: string) => {
     switch (status) {
+      case 'DRAFT':
+        return {
+          label: 'Draft',
+          badgeClass: 'bg-slate-100 text-slate-700 border-slate-200',
+          dotClass: 'bg-slate-400',
+          textClass: 'text-slate-700',
+        };
       case 'PENDING_APPROVAL':
-        return 'text-amber-700';
+        return {
+          label: 'Pending',
+          badgeClass: 'bg-amber-50 text-amber-800 border-amber-200',
+          dotClass: 'bg-amber-500',
+          textClass: 'text-amber-700',
+        };
+      case 'PENDING_MANAGER_SIGNATURE':
+        return {
+          label: 'Pending Signature',
+          badgeClass: 'bg-violet-50 text-violet-800 border-violet-200',
+          dotClass: 'bg-violet-600',
+          textClass: 'text-violet-700',
+        };
       case 'APPROVED':
-        return 'text-emerald-700';
+        return {
+          label: 'Approved',
+          badgeClass: 'bg-sky-50 text-sky-800 border-sky-200',
+          dotClass: 'bg-sky-500',
+          textClass: 'text-sky-700',
+        };
       case 'PARTIAL':
       case 'PARTIALLY_RECEIVED':
-        return 'text-blue-700';
+        return {
+          label: 'Partial',
+          badgeClass: 'bg-indigo-50 text-indigo-800 border-indigo-200',
+          dotClass: 'bg-indigo-500',
+          textClass: 'text-indigo-700',
+        };
       case 'RECEIVED':
-        return 'text-slate-800';
+        return {
+          label: 'Received',
+          badgeClass: 'bg-emerald-50 text-emerald-800 border-emerald-200',
+          dotClass: 'bg-emerald-500',
+          textClass: 'text-emerald-700',
+        };
+      case 'PAID':
+        return {
+          label: 'Paid',
+          badgeClass: 'bg-teal-50 text-teal-800 border-teal-200',
+          dotClass: 'bg-teal-600',
+          textClass: 'text-teal-700',
+        };
       case 'CANCELLED':
-        return 'text-red-600';
+        return {
+          label: 'Cancelled',
+          badgeClass: 'bg-red-50 text-red-700 border-red-200',
+          dotClass: 'bg-red-500',
+          textClass: 'text-red-600',
+        };
       default:
-        return 'text-slate-800';
+        return {
+          label: status || 'Unknown',
+          badgeClass: 'bg-slate-100 text-slate-700 border-slate-200',
+          dotClass: 'bg-slate-400',
+          textClass: 'text-slate-700',
+        };
     }
   };
 
+  const renderPoStatusBadge = (status: string) => {
+    const meta = getPoStatusMeta(status);
+    return (
+      <span className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap ${meta.badgeClass}`}>
+        <span className={`w-1.5 h-1.5 rounded-xs ${meta.dotClass}`} />
+        {meta.label}
+      </span>
+    );
+  };
+
+  const renderInvoiceStatusBadge = (status: string) => {
+    const normalized = String(status || '').toUpperCase();
+    const cls =
+      normalized === 'PAID'
+        ? 'bg-teal-50 text-teal-800 border-teal-200'
+        : normalized === 'PARTIAL'
+          ? 'bg-indigo-50 text-indigo-800 border-indigo-200'
+          : 'bg-amber-50 text-amber-800 border-amber-200';
+    const dot =
+      normalized === 'PAID' ? 'bg-teal-600' : normalized === 'PARTIAL' ? 'bg-indigo-500' : 'bg-amber-500';
+    return (
+      <span className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap ${cls}`}>
+        <span className={`w-1.5 h-1.5 rounded-xs ${dot}`} />
+        {normalized === 'PAID' ? 'Paid' : normalized === 'PARTIAL' ? 'Partial' : 'Unpaid'}
+      </span>
+    );
+  };
+
+  const formatAuditTimestamp = (iso?: string | null) => {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return String(iso).slice(0, 16);
+    return d.toLocaleString('en-PH', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+  };
+
+  const renderSupplierAuditActionBadge = (action: string) => {
+    const act = String(action || '').toUpperCase();
+    const meta =
+      act === 'CREATE_SUPPLIER'
+        ? { label: 'Created', cls: 'bg-emerald-50 text-emerald-800 border-emerald-200', dot: 'bg-emerald-500' }
+        : act === 'DELETE_SUPPLIER'
+          ? { label: 'Removed / Archived', cls: 'bg-red-50 text-red-700 border-red-200', dot: 'bg-red-500' }
+          : { label: 'Updated', cls: 'bg-sky-50 text-sky-800 border-sky-200', dot: 'bg-sky-500' };
+    return (
+      <span className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap ${meta.cls}`}>
+        <span className={`w-1.5 h-1.5 rounded-xs ${meta.dot}`} />
+        {meta.label}
+      </span>
+    );
+  };
+
+  const allSupplierAuditLogs: any[] = data.supplierAuditLogs || [];
+  const visibleSupplierAuditLogs =
+    auditFilterSupplierId === 'ALL'
+      ? allSupplierAuditLogs
+      : allSupplierAuditLogs.filter((log) => log.supplier_id === auditFilterSupplierId);
+
   const newPoTotal = poForm.items.reduce((s, i) => s + (Number(i.orderedQty) || 0) * (Number(i.unitCost) || 0), 0);
+  const newPoExceedsThreshold = newPoTotal > approvalThreshold;
   const reviewPoTotal = reviewForm.items.reduce((s, i) => s + (Number(i.orderedQty) || 0) * (Number(i.unitCost) || 0), 0);
-  const reviewEditable = reviewPo?.status === 'PENDING_APPROVAL';
+  const reviewEditable = reviewPo?.status === 'DRAFT' || reviewPo?.status === 'PENDING_APPROVAL';
+  const reviewDisplayTotal = reviewEditable ? reviewPoTotal : Number(reviewPo?.total_amount || 0);
+  const reviewExceedsThreshold = reviewDisplayTotal > approvalThreshold;
   const reviewCanCancel =
     reviewPo &&
-    (reviewPo.status === 'PENDING_APPROVAL' || reviewPo.status === 'APPROVED') &&
+    (reviewPo.status === 'DRAFT' || reviewPo.status === 'PENDING_APPROVAL' || reviewPo.status === 'PENDING_MANAGER_SIGNATURE' || reviewPo.status === 'APPROVED') &&
     (reviewPo.items || []).every((pi: any) => Number(pi.received_qty || 0) === 0);
+
+  useEffect(() => {
+    if (newPoExceedsThreshold && poForm.status === 'APPROVED') {
+      setPoForm((f) => ({ ...f, status: 'PENDING_APPROVAL' }));
+    }
+  }, [newPoExceedsThreshold, poForm.status]);
+
+  useEffect(() => {
+    if (reviewEditable && reviewPoTotal > approvalThreshold && reviewForm.status === 'APPROVED') {
+      setReviewForm((f) => ({ ...f, status: 'PENDING_APPROVAL' }));
+    }
+  }, [reviewEditable, reviewPoTotal, approvalThreshold, reviewForm.status]);
 
   const visiblePurchaseOrders =
     activeLocationId && activeLocationId !== 'ALL'
       ? (data.purchaseOrders || []).filter((po: any) => po.location_id === activeLocationId)
       : data.purchaseOrders || [];
+  const filteredPurchaseOrders =
+    poStatusFilter === 'ALL'
+      ? visiblePurchaseOrders
+      : visiblePurchaseOrders.filter((po: any) =>
+          poStatusFilter === 'PARTIAL'
+            ? po.status === 'PARTIAL' || po.status === 'PARTIALLY_RECEIVED'
+            : po.status === poStatusFilter,
+        );
+  const poStatusCounts = {
+    ALL: visiblePurchaseOrders.length,
+    DRAFT: visiblePurchaseOrders.filter((po: any) => po.status === 'DRAFT').length,
+    PENDING_APPROVAL: visiblePurchaseOrders.filter((po: any) => po.status === 'PENDING_APPROVAL').length,
+    PENDING_MANAGER_SIGNATURE: visiblePurchaseOrders.filter((po: any) => po.status === 'PENDING_MANAGER_SIGNATURE').length,
+    APPROVED: visiblePurchaseOrders.filter((po: any) => po.status === 'APPROVED').length,
+    PARTIAL: visiblePurchaseOrders.filter((po: any) => po.status === 'PARTIAL' || po.status === 'PARTIALLY_RECEIVED').length,
+    RECEIVED: visiblePurchaseOrders.filter((po: any) => po.status === 'RECEIVED').length,
+    PAID: visiblePurchaseOrders.filter((po: any) => po.status === 'PAID').length,
+    CANCELLED: visiblePurchaseOrders.filter((po: any) => po.status === 'CANCELLED').length,
+  };
   const visibleInvoices =
     activeLocationId && activeLocationId !== 'ALL'
       ? (data.invoices || []).filter((inv: any) => inv.location_id === activeLocationId)
@@ -506,184 +904,364 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
       </div>
 
       {subTab === 'pos' && (
-        <div className="rounded-xl border border-slate-200 bg-white overflow-x-auto">
-          <table className="w-full text-left text-xs">
-            <thead className="border-b border-slate-200 bg-slate-50 text-slate-500">
-              <tr>
-                <th className="p-3 font-medium">PO Number</th>
-                <th className="p-3 font-medium">Supplier</th>
-                <th className="p-3 font-medium">Delivery Location</th>
-                <th className="p-3 font-medium">Items</th>
-                <th className="p-3 font-medium text-right">Total Amount</th>
-                <th className="p-3 font-medium">Status</th>
-                <th className="p-3 font-medium text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100">
-              {visiblePurchaseOrders.length === 0 ? (
-                <tr>
-                  <td colSpan={7} className="p-6 text-center text-xs text-slate-400">
-                    No purchase orders match the selected truck / location.
-                  </td>
-                </tr>
-              ) : visiblePurchaseOrders.map((po: any) => {
-                const hasReceived = (po.items || []).some((pi: any) => Number(pi.received_qty || 0) > 0);
-                const canCancel = (po.status === 'PENDING_APPROVAL' || po.status === 'APPROVED') && !hasReceived;
-
-                return (
-                  <tr key={po.id} className="hover:bg-slate-50">
-                    <td className="p-3 font-mono font-semibold text-slate-900 whitespace-nowrap">{po.po_number}</td>
-                    <td className="p-3">{po.supplier_name}</td>
-                    <td className="p-3 text-slate-600">{po.location_name}</td>
-                    <td className="p-3 text-slate-600">
-                      {po.items.map((i: any) => `${i.item_name} (${i.received_qty}/${i.ordered_qty} ${i.uom_code})`).join(', ')}
-                    </td>
-                    <td className="p-3 text-right font-mono tabular-nums font-semibold whitespace-nowrap">{formatPHP(po.total_amount)}</td>
-                    <td className={`p-3 font-semibold whitespace-nowrap ${getStatusClass(po.status)}`}>{po.status}</td>
-                    <td className="p-3 text-right whitespace-nowrap">
-                      <div className="inline-flex items-center justify-end gap-1.5">
-                        {po.status === 'PENDING_APPROVAL' ? (
-                          <button
-                            type="button"
-                            onClick={() => openReviewModal(po)}
-                            className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
-                          >
-                            <Pencil className="w-3.5 h-3.5" /> Edit / Review
-                          </button>
-                        ) : (
-                          <button
-                            type="button"
-                            onClick={() => openReviewModal(po)}
-                            className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
-                          >
-                            <Eye className="w-3.5 h-3.5" /> Review
-                          </button>
-                        )}
-
-                        {po.status === 'PENDING_APPROVAL' && canApprove && (
-                          <button
-                            type="button"
-                            onClick={() => approvePO(po.id)}
-                            className="inline-flex items-center gap-1 rounded-md bg-slate-900 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-slate-800"
-                          >
-                            <CheckCircle2 className="w-3.5 h-3.5" /> Approve
-                          </button>
-                        )}
-
-                        {(po.status === 'APPROVED' || po.status === 'PARTIAL' || po.status === 'PARTIALLY_RECEIVED') && (
-                          <button
-                            type="button"
-                            onClick={() => openReceive(po)}
-                            className="inline-flex items-center gap-1 rounded-md bg-emerald-600 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700"
-                          >
-                            <PackageCheck className="w-3.5 h-3.5" /> Receive Goods
-                          </button>
-                        )}
-
-                        {canCancel && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setErr('');
-                              setCancelReason('');
-                              setCancelPoTarget(po);
-                            }}
-                            className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50"
-                          >
-                            <XCircle className="w-3.5 h-3.5" /> Cancel
-                          </button>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {subTab === 'suppliers' && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <div className="rounded-xl border border-slate-200 bg-white overflow-x-auto">
-            <div className="p-4 border-b border-slate-200 flex items-center justify-between gap-2">
-              <span className="text-xs font-semibold text-slate-700">Active Suppliers ({data.suppliers.length})</span>
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-4 py-2.5">
+            <div className="flex items-center gap-2.5 text-xs">
+              <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-violet-50 text-violet-700 border border-violet-200 shrink-0">
+                <ShieldCheck className="w-4 h-4" />
+              </div>
+              <div>
+                <span className="font-semibold text-slate-900">
+                  Multi-Stage Signature Threshold: <span className="font-mono text-violet-800">{formatPHP(approvalThreshold)}</span>
+                </span>
+                <p className="text-[11px] text-slate-500">
+                  Orders exceeding {formatPHP(approvalThreshold)} require Stage 1 verification and a Stage 2 Manager Digital Signature before goods receiving.
+                </p>
+              </div>
+            </div>
+            {canApprove && (
               <button
                 type="button"
-                onClick={() => openAddSupplierModal('tab')}
-                className="inline-flex items-center gap-1 rounded-md bg-slate-900 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-slate-800 whitespace-nowrap"
+                onClick={openThresholdModal}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 whitespace-nowrap shrink-0"
               >
-                <Plus className="w-3.5 h-3.5" /> Add Supplier
+                <SlidersHorizontal className="w-3.5 h-3.5" /> Configure Threshold
               </button>
-            </div>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1.5">
+            {([
+              { id: 'ALL', label: 'All POs', dot: 'bg-slate-400', count: poStatusCounts.ALL },
+              { id: 'DRAFT', label: 'Draft', dot: 'bg-slate-400', count: poStatusCounts.DRAFT },
+              { id: 'PENDING_APPROVAL', label: 'Pending', dot: 'bg-amber-500', count: poStatusCounts.PENDING_APPROVAL },
+              { id: 'PENDING_MANAGER_SIGNATURE', label: 'Pending Signature', dot: 'bg-violet-600', count: poStatusCounts.PENDING_MANAGER_SIGNATURE },
+              { id: 'APPROVED', label: 'Approved', dot: 'bg-sky-500', count: poStatusCounts.APPROVED },
+              { id: 'PARTIAL', label: 'Partial', dot: 'bg-indigo-500', count: poStatusCounts.PARTIAL },
+              { id: 'RECEIVED', label: 'Received', dot: 'bg-emerald-500', count: poStatusCounts.RECEIVED },
+              { id: 'PAID', label: 'Paid', dot: 'bg-teal-600', count: poStatusCounts.PAID },
+              { id: 'CANCELLED', label: 'Cancelled', dot: 'bg-red-500', count: poStatusCounts.CANCELLED },
+            ] as const).map((st) => {
+              const active = poStatusFilter === st.id;
+              return (
+                <button
+                  key={st.id}
+                  type="button"
+                  onClick={() => setPoStatusFilter(st.id)}
+                  className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap ${
+                    active
+                      ? 'border-slate-900 bg-slate-900 text-white'
+                      : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                  }`}
+                >
+                  {st.id !== 'ALL' && <span className={`w-1.5 h-1.5 rounded-xs ${active ? 'bg-white' : st.dot}`} />}
+                  <span>{st.label}</span>
+                  <span className={`font-mono text-[11px] ${active ? 'text-slate-300' : 'text-slate-400'}`}>
+                    {st.count}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="rounded-xl border border-slate-200 bg-white overflow-x-auto">
             <table className="w-full text-left text-xs">
-              <thead className="border-b border-slate-100 text-slate-500">
+              <thead className="border-b border-slate-200 bg-slate-50 text-slate-500">
                 <tr>
+                  <th className="p-3 font-medium">PO Number</th>
                   <th className="p-3 font-medium">Supplier</th>
-                  <th className="p-3 font-medium">Contact</th>
-                  <th className="p-3 font-medium text-right">Terms</th>
+                  <th className="p-3 font-medium">Delivery Location</th>
+                  <th className="p-3 font-medium">Items</th>
+                  <th className="p-3 font-medium text-right">Total Amount</th>
+                  <th className="p-3 font-medium">Status</th>
                   <th className="p-3 font-medium text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {data.suppliers.length === 0 ? (
+                {filteredPurchaseOrders.length === 0 ? (
                   <tr>
-                    <td colSpan={4} className="p-6 text-center text-xs text-slate-400">
-                      No active suppliers yet. Click &ldquo;Add Supplier&rdquo; to register one.
+                    <td colSpan={7} className="p-6 text-center text-xs text-slate-400">
+                      No purchase orders match the selected location or status filter.
                     </td>
                   </tr>
-                ) : (
-                  data.suppliers.map((s: any) => (
-                    <tr key={s.id}>
-                      <td className="p-3 font-semibold text-slate-900">
-                        {s.name}
-                        <p className="font-normal text-slate-500 font-mono text-[11px]">{[s.code, s.tin].filter(Boolean).join(' · ') || '—'}</p>
+                ) : filteredPurchaseOrders.map((po: any) => {
+                  const hasReceived = (po.items || []).some((pi: any) => Number(pi.received_qty || 0) > 0);
+                  const isDraftOrPending = po.status === 'DRAFT' || po.status === 'PENDING_APPROVAL';
+                  const isAwaitingSignature = po.status === 'PENDING_MANAGER_SIGNATURE';
+                  const exceedsThreshold = Number(po.total_amount || 0) > approvalThreshold;
+                  const canCancel = (isDraftOrPending || isAwaitingSignature || po.status === 'APPROVED') && !hasReceived;
+
+                  return (
+                    <tr key={po.id} className="hover:bg-slate-50">
+                      <td className="p-3 font-mono font-semibold text-slate-900 whitespace-nowrap">{po.po_number}</td>
+                      <td className="p-3">{po.supplier_name}</td>
+                      <td className="p-3 text-slate-600">{po.location_name}</td>
+                      <td className="p-3 text-slate-600">
+                        {po.items.map((i: any) => `${i.item_name} (${i.received_qty}/${i.ordered_qty} ${i.uom_code})`).join(', ')}
                       </td>
-                      <td className="p-3 text-slate-600">{s.contact_person || '—'}<p className="text-[11px]">{s.phone || ''}</p></td>
-                      <td className="p-3 text-right font-mono whitespace-nowrap">{s.payment_terms} days</td>
-                      <td className="p-3 text-right whitespace-nowrap space-x-1">
-                        <button
-                          type="button"
-                          onClick={() => openEditSupplierModal(s, 'tab')}
-                          className="inline-flex items-center gap-1 rounded border border-slate-200 px-2 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
-                        >
-                          <Pencil className="w-3 h-3" /> Edit
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setDeleteSupplierTarget(s)}
-                          className="inline-flex items-center gap-1 rounded border border-red-200 px-2 py-1 text-[11px] font-medium text-red-700 hover:bg-red-50"
-                        >
-                          <Trash2 className="w-3 h-3" /> Delete
-                        </button>
+                      <td className="p-3 text-right whitespace-nowrap">
+                        <div className="font-mono tabular-nums font-semibold text-slate-900">{formatPHP(po.total_amount)}</div>
+                        {po.manager_signature_data ? (
+                          <div className="text-[10px] font-medium text-violet-700">Digitally Signed</div>
+                        ) : exceedsThreshold ? (
+                          <div className="text-[10px] font-medium text-amber-700">&gt; Threshold · 2-Stage</div>
+                        ) : null}
+                      </td>
+                      <td className="p-3 whitespace-nowrap">{renderPoStatusBadge(po.status)}</td>
+                      <td className="p-3 text-right whitespace-nowrap">
+                        <div className="inline-flex items-center justify-end gap-1.5">
+                          {isDraftOrPending ? (
+                            <button
+                              type="button"
+                              onClick={() => openReviewModal(po)}
+                              className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
+                            >
+                              <Pencil className="w-3.5 h-3.5" /> Edit / Review
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => openReviewModal(po)}
+                              className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
+                            >
+                              <Eye className="w-3.5 h-3.5" /> Review
+                            </button>
+                          )}
+
+                          {isDraftOrPending && canApprove && (
+                            <button
+                              type="button"
+                              onClick={() => approvePO(po)}
+                              className="inline-flex items-center gap-1 rounded-md bg-slate-900 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-slate-800"
+                            >
+                              <CheckCircle2 className="w-3.5 h-3.5" /> {exceedsThreshold ? 'Verify (Stage 1)' : 'Approve'}
+                            </button>
+                          )}
+
+                          {isAwaitingSignature && canApprove && (
+                            <button
+                              type="button"
+                              onClick={() => openSignatureModal(po)}
+                              className="inline-flex items-center gap-1 rounded-md bg-violet-700 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-violet-800"
+                            >
+                              <PenTool className="w-3.5 h-3.5" /> Sign &amp; Approve
+                            </button>
+                          )}
+
+                          {(po.status === 'APPROVED' || po.status === 'PARTIAL' || po.status === 'PARTIALLY_RECEIVED') && (
+                            <button
+                              type="button"
+                              onClick={() => openReceive(po)}
+                              className="inline-flex items-center gap-1 rounded-md bg-emerald-600 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700"
+                            >
+                              <PackageCheck className="w-3.5 h-3.5" /> Receive Goods
+                            </button>
+                          )}
+
+                          {po.status === 'RECEIVED' && canMarkPaid && (
+                            <button
+                              type="button"
+                              onClick={() => markPoPaid(po)}
+                              className="inline-flex items-center gap-1 rounded-md border border-teal-200 bg-teal-50 px-2.5 py-1.5 text-xs font-semibold text-teal-800 hover:bg-teal-100"
+                            >
+                              <CheckCircle2 className="w-3.5 h-3.5" /> Mark Paid
+                            </button>
+                          )}
+
+                          {canCancel && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setErr('');
+                                setCancelReason('');
+                                setCancelPoTarget(po);
+                              }}
+                              className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50"
+                            >
+                              <XCircle className="w-3.5 h-3.5" /> Cancel
+                            </button>
+                          )}
+                        </div>
                       </td>
                     </tr>
-                  ))
-                )}
+                  );
+                })}
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+
+      {subTab === 'suppliers' && (
+        <div className="space-y-6">
+          <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
+            <div className="xl:col-span-7 rounded-xl border border-slate-200 bg-white overflow-x-auto">
+              <div className="p-4 border-b border-slate-200 flex items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-slate-700">Active Suppliers ({data.suppliers.length})</span>
+                <button
+                  type="button"
+                  onClick={() => openAddSupplierModal('tab')}
+                  className="inline-flex items-center gap-1 rounded-md bg-slate-900 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-slate-800 whitespace-nowrap"
+                >
+                  <Plus className="w-3.5 h-3.5" /> Add Supplier
+                </button>
+              </div>
+              <table className="w-full text-left text-xs">
+                <thead className="border-b border-slate-100 text-slate-500">
+                  <tr>
+                    <th className="p-3 font-medium">Supplier</th>
+                    <th className="p-3 font-medium">Contact</th>
+                    <th className="p-3 font-medium text-right">Terms</th>
+                    <th className="p-3 font-medium">Last Modified</th>
+                    <th className="p-3 font-medium text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {data.suppliers.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} className="p-6 text-center text-xs text-slate-400">
+                        No active suppliers yet. Click &ldquo;Add Supplier&rdquo; to register one.
+                      </td>
+                    </tr>
+                  ) : (
+                    data.suppliers.map((s: any) => (
+                      <tr key={s.id} className="hover:bg-slate-50/70">
+                        <td className="p-3 font-semibold text-slate-900">
+                          {s.name}
+                          <p className="font-normal text-slate-500 font-mono text-[11px]">{[s.code, s.tin].filter(Boolean).join(' · ') || '—'}</p>
+                        </td>
+                        <td className="p-3 text-slate-600">{s.contact_person || '—'}<p className="text-[11px]">{s.phone || ''}</p></td>
+                        <td className="p-3 text-right font-mono whitespace-nowrap">{s.payment_terms} days</td>
+                        <td className="p-3 whitespace-nowrap">
+                          <div className="text-[11px] font-medium text-slate-800 font-mono">
+                            {formatAuditTimestamp(s.updated_at)}
+                          </div>
+                          <div className="inline-flex items-center gap-1 text-[11px] text-slate-500 mt-0.5">
+                            <User className="w-3 h-3 text-slate-400" />
+                            <span>{s.updated_by_name || 'System Seed'}</span>
+                          </div>
+                        </td>
+                        <td className="p-3 text-right whitespace-nowrap space-x-1">
+                          <button
+                            type="button"
+                            onClick={() => setAuditSupplierTarget(s)}
+                            className="inline-flex items-center gap-1 rounded border border-slate-200 px-2 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                            title="View supplier audit trail"
+                          >
+                            <History className="w-3 h-3" /> History
+                            {Number(s.audit_count || 0) > 0 && (
+                              <span className="font-mono text-[10px] text-slate-500">({s.audit_count})</span>
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => openEditSupplierModal(s, 'tab')}
+                            className="inline-flex items-center gap-1 rounded border border-slate-200 px-2 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                          >
+                            <Pencil className="w-3 h-3" /> Edit
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setDeleteSupplierTarget(s)}
+                            className="inline-flex items-center gap-1 rounded border border-red-200 px-2 py-1 text-[11px] font-medium text-red-700 hover:bg-red-50"
+                          >
+                            <Trash2 className="w-3 h-3" /> Delete
+                          </button>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="xl:col-span-5 rounded-xl border border-slate-200 bg-white overflow-x-auto">
+              <div className="p-4 border-b border-slate-200 text-xs font-semibold text-slate-700">Supplier Price Comparison</div>
+              <table className="w-full text-left text-xs">
+                <thead className="border-b border-slate-100 text-slate-500">
+                  <tr>
+                    <th className="p-3 font-medium">Ingredient</th>
+                    <th className="p-3 font-medium">Supplier</th>
+                    <th className="p-3 font-medium text-right">Unit Price</th>
+                    <th className="p-3 font-medium text-right">Lead Time</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {data.priceComparison.map((pc: any) => (
+                    <tr key={pc.id}>
+                      <td className="p-3 font-medium text-slate-900">{pc.item_name}</td>
+                      <td className="p-3 text-slate-600">{pc.supplier_name}</td>
+                      <td className="p-3 text-right font-mono tabular-nums font-semibold">{formatPHP(pc.unit_price)} / {pc.uom_code}</td>
+                      <td className="p-3 text-right font-mono">{pc.lead_time_days}d</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
 
           <div className="rounded-xl border border-slate-200 bg-white overflow-x-auto">
-            <div className="p-4 border-b border-slate-200 text-xs font-semibold text-slate-700">Supplier Price Comparison</div>
+            <div className="p-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-800">
+                  <History className="w-3.5 h-3.5 text-slate-500" />
+                  <span>Supplier Profile Audit Trail ({visibleSupplierAuditLogs.length})</span>
+                </div>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Chronological record of supplier profile creations, edits, and removals with responsible user
+                </p>
+              </div>
+              <select
+                value={auditFilterSupplierId}
+                onChange={(e) => setAuditFilterSupplierId(e.target.value)}
+                className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-700"
+              >
+                <option value="ALL">All Suppliers</option>
+                {data.suppliers.map((s: any) => (
+                  <option key={s.id} value={s.id}>{s.name} ({s.code})</option>
+                ))}
+              </select>
+            </div>
             <table className="w-full text-left text-xs">
-              <thead className="border-b border-slate-100 text-slate-500">
+              <thead className="border-b border-slate-100 bg-slate-50 text-slate-500">
                 <tr>
-                  <th className="p-3 font-medium">Ingredient</th>
+                  <th className="p-3 font-medium">Modified Date</th>
                   <th className="p-3 font-medium">Supplier</th>
-                  <th className="p-3 font-medium text-right">Unit Price</th>
-                  <th className="p-3 font-medium text-right">Lead Time</th>
+                  <th className="p-3 font-medium">Change Type</th>
+                  <th className="p-3 font-medium">Responsible User</th>
+                  <th className="p-3 font-medium">Change Details</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {data.priceComparison.map((pc: any) => (
-                  <tr key={pc.id}>
-                    <td className="p-3 font-medium text-slate-900">{pc.item_name}</td>
-                    <td className="p-3 text-slate-600">{pc.supplier_name}</td>
-                    <td className="p-3 text-right font-mono tabular-nums font-semibold">{formatPHP(pc.unit_price)} / {pc.uom_code}</td>
-                    <td className="p-3 text-right font-mono">{pc.lead_time_days}d</td>
+                {visibleSupplierAuditLogs.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} className="p-6 text-center text-xs text-slate-400">
+                      No supplier profile changes recorded yet. Creating or editing a supplier will log entries here.
+                    </td>
                   </tr>
-                ))}
+                ) : (
+                  visibleSupplierAuditLogs.map((log: any) => (
+                    <tr key={log.id} className="hover:bg-slate-50/70">
+                      <td className="p-3 font-mono text-[11px] text-slate-700 whitespace-nowrap">
+                        {formatAuditTimestamp(log.logged_at)}
+                      </td>
+                      <td className="p-3 font-medium text-slate-900 whitespace-nowrap">
+                        {log.supplier_name}
+                        {log.supplier_code && (
+                          <span className="ml-1.5 font-mono text-[11px] text-slate-400">{log.supplier_code}</span>
+                        )}
+                      </td>
+                      <td className="p-3 whitespace-nowrap">{renderSupplierAuditActionBadge(log.action)}</td>
+                      <td className="p-3 whitespace-nowrap">
+                        <span className="inline-flex items-center gap-1.5 font-medium text-slate-800">
+                          <User className="w-3.5 h-3.5 text-slate-400" />
+                          {log.user_name || 'System'}
+                        </span>
+                      </td>
+                      <td className="p-3 text-slate-600">{log.details || '—'}</td>
+                    </tr>
+                  ))
+                )}
               </tbody>
             </table>
           </div>
@@ -722,7 +1300,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
                     <td className="p-3 text-right font-mono tabular-nums">{formatPHP(inv.total_amount)}</td>
                     <td className="p-3 text-right font-mono tabular-nums">{formatPHP(inv.paid_amount)}</td>
                     <td className="p-3 text-right font-mono tabular-nums font-semibold text-red-700">{formatPHP(bal)}</td>
-                    <td className="p-3 font-semibold">{inv.status}</td>
+                    <td className="p-3 whitespace-nowrap">{renderInvoiceStatusBadge(inv.status)}</td>
                     <td className="p-3 text-right whitespace-nowrap">
                       <div className="inline-flex items-center justify-end gap-1.5">
                         <button
@@ -890,6 +1468,21 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
                 </select>
               </div>
               <div>
+                <label className="block text-xs font-medium text-slate-600 mb-1">Purchase Order Status</label>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={poForm.status}
+                    onChange={(e) => setPoForm({ ...poForm, status: e.target.value as 'DRAFT' | 'PENDING_APPROVAL' | 'APPROVED' })}
+                    className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                  >
+                    <option value="DRAFT">Draft</option>
+                    <option value="PENDING_APPROVAL">Pending Approval</option>
+                    {canApprove && !newPoExceedsThreshold && <option value="APPROVED">Approved</option>}
+                  </select>
+                  {renderPoStatusBadge(poForm.status)}
+                </div>
+              </div>
+              <div>
                 <label className="block text-xs font-medium text-slate-600 mb-1">Expected Delivery Date (optional)</label>
                 <input
                   type="date"
@@ -898,7 +1491,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
                   className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
                 />
               </div>
-              <div>
+              <div className="sm:col-span-2">
                 <label className="block text-xs font-medium text-slate-600 mb-1">Order Notes (optional)</label>
                 <input
                   type="text"
@@ -1020,12 +1613,21 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
                 <span className="text-slate-500">Estimated Order Total</span>
                 <span className="font-mono tabular-nums text-sm font-bold text-slate-900">{formatPHP(newPoTotal)}</span>
               </div>
+              {newPoExceedsThreshold && (
+                <div className="rounded-lg border border-violet-200 bg-violet-50 px-3 py-2 text-[11px] text-violet-900">
+                  Exceeds the <span className="font-mono font-semibold">{formatPHP(approvalThreshold)}</span> approval threshold — after submission, this PO requires Stage 1 verification and a Stage 2 Manager Digital Signature.
+                </div>
+              )}
             </div>
 
             <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
               <button type="button" onClick={() => setShowNewPo(false)} className="px-4 py-2 rounded-lg border text-xs">Cancel</button>
               <button type="submit" className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800">
-                Submit for Approval
+                {poForm.status === 'DRAFT'
+                  ? 'Save as Draft'
+                  : poForm.status === 'APPROVED'
+                    ? 'Create & Approve'
+                    : 'Submit for Approval'}
               </button>
             </div>
           </form>
@@ -1047,10 +1649,10 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
                 <h3 className="font-display text-base font-semibold text-slate-900">
                   {reviewEditable ? `Edit / Review Purchase Order — ${reviewPo.po_number}` : `Review Purchase Order — ${reviewPo.po_number}`}
                 </h3>
-                <p className="text-xs text-slate-500">
-                  Status: <span className={`font-semibold ${getStatusClass(reviewPo.status)}`}>{reviewPo.status}</span>
-                  {reviewPo.ordered_at ? ` · Ordered ${String(reviewPo.ordered_at).slice(0, 10)}` : ''}
-                </p>
+                <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                  {renderPoStatusBadge(reviewPo.status)}
+                  {reviewPo.ordered_at && <span>Ordered {String(reviewPo.ordered_at).slice(0, 10)}</span>}
+                </div>
               </div>
               <button
                 type="button"
@@ -1129,6 +1731,38 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
                 </select>
               </div>
               <div>
+                <label className="block text-xs font-medium text-slate-600 mb-1">Purchase Order Status</label>
+                {reviewEditable ? (
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={reviewForm.status}
+                      onChange={(e) => setReviewForm({ ...reviewForm, status: e.target.value as 'DRAFT' | 'PENDING_APPROVAL' | 'APPROVED' })}
+                      className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                    >
+                      <option value="DRAFT">Draft</option>
+                      <option value="PENDING_APPROVAL">Pending Approval</option>
+                      {canApprove && reviewPoTotal <= approvalThreshold && <option value="APPROVED">Approved</option>}
+                    </select>
+                    {renderPoStatusBadge(reviewForm.status)}
+                  </div>
+                ) : (
+                  <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                    {renderPoStatusBadge(reviewPo.status)}
+                    <span className="text-[11px] text-slate-500">
+                      {reviewPo.status === 'PAID'
+                        ? 'Settled'
+                        : reviewPo.status === 'RECEIVED'
+                          ? 'Goods Received'
+                          : reviewPo.status === 'PENDING_MANAGER_SIGNATURE'
+                            ? 'Awaiting Digital Signature'
+                            : reviewPo.status === 'CANCELLED'
+                              ? 'Cancelled'
+                              : 'Locked for Receiving'}
+                    </span>
+                  </div>
+                )}
+              </div>
+              <div>
                 <label className="block text-xs font-medium text-slate-600 mb-1">Expected Delivery Date</label>
                 <input
                   type="date"
@@ -1138,7 +1772,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
                   className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono disabled:bg-slate-50 disabled:text-slate-600"
                 />
               </div>
-              <div>
+              <div className="sm:col-span-2">
                 <label className="block text-xs font-medium text-slate-600 mb-1">Order / Review Notes</label>
                 <input
                   type="text"
@@ -1294,10 +1928,69 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
               <div className="flex items-center justify-between pt-1 text-xs">
                 <span className="text-slate-500">Total Purchase Order Amount</span>
                 <span className="font-mono tabular-nums text-base font-bold text-slate-900">
-                  {formatPHP(reviewEditable ? reviewPoTotal : reviewPo.total_amount)}
+                  {formatPHP(reviewDisplayTotal)}
                 </span>
               </div>
             </div>
+
+            {(reviewExceedsThreshold || reviewPo.stage1_approved_at || reviewPo.manager_signature_data || reviewPo.status === 'PENDING_MANAGER_SIGNATURE') && (
+              <div className="rounded-lg border border-violet-200 bg-violet-50/50 p-3 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-violet-900">
+                    <ShieldCheck className="w-4 h-4 text-violet-700" />
+                    Multi-Stage Approval Workflow
+                  </div>
+                  <span className="font-mono text-[11px] text-violet-800">
+                    Threshold: {formatPHP(approvalThreshold)}
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                  <div className="rounded-md border border-violet-200/80 bg-white p-2.5">
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Stage 1 · Initial Verification</div>
+                    <div className="mt-1 font-medium text-slate-900">
+                      {reviewPo.stage1_approved_by_name
+                        ? `Verified by ${reviewPo.stage1_approved_by_name}`
+                        : reviewPo.status === 'APPROVED' || reviewPo.status === 'PARTIAL' || reviewPo.status === 'RECEIVED' || reviewPo.status === 'PAID'
+                          ? 'Completed'
+                          : 'Awaiting Stage 1 Verification'}
+                    </div>
+                    {reviewPo.stage1_approved_at && (
+                      <div className="text-[11px] text-slate-500 mt-0.5">{formatAuditTimestamp(reviewPo.stage1_approved_at)}</div>
+                    )}
+                  </div>
+                  <div className="rounded-md border border-violet-200/80 bg-white p-2.5">
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Stage 2 · Manager Digital Signature</div>
+                    <div className="mt-1 font-medium text-slate-900">
+                      {reviewPo.manager_signature_data
+                        ? `Signed by ${reviewPo.manager_signer_name || 'Authorized Manager'}`
+                        : reviewPo.status === 'PENDING_MANAGER_SIGNATURE'
+                          ? 'Awaiting Manager Signature'
+                          : reviewExceedsThreshold
+                            ? 'Required after Stage 1'
+                            : 'Not required (under threshold)'}
+                    </div>
+                    {reviewPo.signed_at && (
+                      <div className="text-[11px] text-slate-500 mt-0.5">{formatAuditTimestamp(reviewPo.signed_at)}</div>
+                    )}
+                  </div>
+                </div>
+                {reviewPo.manager_signature_data && (
+                  <div className="rounded-md border border-slate-200 bg-white p-2.5">
+                    <div className="flex items-center justify-between text-[11px] text-slate-500 mb-1.5">
+                      <span>Captured Digital Signature</span>
+                      <span className="font-mono">{reviewPo.manager_signer_name}</span>
+                    </div>
+                    <div className="flex justify-center rounded border border-dashed border-slate-200 bg-slate-50/70 p-2">
+                      <img
+                        src={reviewPo.manager_signature_data}
+                        alt="Manager digital signature"
+                        className="max-h-20 object-contain"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
 
             <div className="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-slate-100">
               <div>
@@ -1341,10 +2034,23 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
                         className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-50"
                       >
                         <CheckCircle2 className="w-3.5 h-3.5" />
-                        {savingReview ? 'Approving...' : 'Save & Approve'}
+                        {savingReview
+                          ? 'Processing...'
+                          : reviewPoTotal > approvalThreshold
+                            ? 'Verify Stage 1 & Request Signature'
+                            : 'Save & Approve'}
                       </button>
                     )}
                   </>
+                )}
+                {reviewPo.status === 'PENDING_MANAGER_SIGNATURE' && canApprove && (
+                  <button
+                    type="button"
+                    onClick={() => openSignatureModal(reviewPo)}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-violet-700 text-white text-xs font-semibold hover:bg-violet-800"
+                  >
+                    <PenTool className="w-3.5 h-3.5" /> Sign &amp; Final Approve
+                  </button>
                 )}
                 {(reviewPo.status === 'APPROVED' || reviewPo.status === 'PARTIAL' || reviewPo.status === 'PARTIALLY_RECEIVED') && (
                   <button
@@ -1357,6 +2063,15 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
                     className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-emerald-600 text-white text-xs font-semibold hover:bg-emerald-700"
                   >
                     <PackageCheck className="w-3.5 h-3.5" /> Receive Goods
+                  </button>
+                )}
+                {reviewPo.status === 'RECEIVED' && canMarkPaid && (
+                  <button
+                    type="button"
+                    onClick={() => markPoPaid(reviewPo)}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-teal-600 text-white text-xs font-semibold hover:bg-teal-700"
+                  >
+                    <CheckCircle2 className="w-3.5 h-3.5" /> Mark as Paid
                   </button>
                 )}
               </div>
@@ -1768,6 +2483,47 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
               </div>
             </div>
 
+            {supplierModal === 'edit' && (() => {
+              const editedSupplier = (data.suppliers || []).find((s: any) => s.id === supplierEditId);
+              if (!editedSupplier) return null;
+              const supLogs = allSupplierAuditLogs.filter((l) => l.supplier_id === editedSupplier.id).slice(0, 3);
+              return (
+                <div className="rounded-lg border border-slate-200 bg-slate-50/80 p-3 space-y-2 text-xs">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Audit Trail</span>
+                      <p className="text-[11px] text-slate-700 mt-0.5">
+                        Last modified <span className="font-mono font-semibold text-slate-900">{formatAuditTimestamp(editedSupplier.updated_at)}</span> by{' '}
+                        <span className="font-semibold text-slate-900">{editedSupplier.updated_by_name || 'System Seed'}</span>
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setAuditSupplierTarget(editedSupplier)}
+                      className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100"
+                    >
+                      <History className="w-3 h-3" /> View History
+                    </button>
+                  </div>
+                  {supLogs.length > 0 && (
+                    <div className="space-y-1 border-t border-slate-200/80 pt-2">
+                      {supLogs.map((entry: any) => (
+                        <div key={entry.id} className="flex items-start justify-between gap-2 text-[11px]">
+                          <div className="text-slate-600 truncate">
+                            <span className="font-semibold text-slate-800">{entry.user_name || 'System'}:</span>{' '}
+                            <span>{entry.details || entry.action}</span>
+                          </div>
+                          <span className="font-mono text-[10px] text-slate-400 shrink-0">
+                            {formatAuditTimestamp(entry.logged_at)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
             <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
               <button
                 type="button"
@@ -1787,6 +2543,93 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
           </form>
         </div>
       )}
+
+      {/* Supplier Audit Trail Modal */}
+      {auditSupplierTarget && (() => {
+        const targetLogs = allSupplierAuditLogs.filter((l) => l.supplier_id === auditSupplierTarget.id);
+        return (
+          <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/45 p-4">
+            <div className="w-full max-w-2xl max-h-[85vh] overflow-y-auto rounded-xl bg-white p-5 space-y-4 border border-slate-200 shadow-xl">
+              <div className="flex items-start justify-between gap-3 border-b border-slate-100 pb-3">
+                <div>
+                  <h3 className="font-display text-base font-semibold text-slate-900">
+                    Supplier Audit Trail — {auditSupplierTarget.name}
+                  </h3>
+                  <p className="text-xs text-slate-500 font-mono mt-0.5">
+                    {[auditSupplierTarget.code, auditSupplierTarget.tin].filter(Boolean).join(' · ') || 'Supplier Profile'}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setAuditSupplierTarget(null)}
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                  <span className="block text-[11px] font-medium text-slate-500">Last Modified Date</span>
+                  <span className="mt-0.5 block font-mono font-semibold text-slate-900">
+                    {formatAuditTimestamp(auditSupplierTarget.updated_at)}
+                  </span>
+                </div>
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                  <span className="block text-[11px] font-medium text-slate-500">Last Modified By</span>
+                  <span className="mt-0.5 inline-flex items-center gap-1.5 font-semibold text-slate-900">
+                    <User className="w-3.5 h-3.5 text-slate-500" />
+                    {auditSupplierTarget.updated_by_name || 'System Seed'}
+                  </span>
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-slate-200 overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="border-b border-slate-200 bg-slate-50 text-slate-500">
+                    <tr>
+                      <th className="p-2.5 font-medium">Date &amp; Time</th>
+                      <th className="p-2.5 font-medium">Action</th>
+                      <th className="p-2.5 font-medium">User</th>
+                      <th className="p-2.5 font-medium">Changes / Details</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {targetLogs.length === 0 ? (
+                      <tr>
+                        <td colSpan={4} className="p-5 text-center text-xs text-slate-400">
+                          No detailed change events recorded after initial workspace setup.
+                        </td>
+                      </tr>
+                    ) : (
+                      targetLogs.map((log: any) => (
+                        <tr key={log.id} className="hover:bg-slate-50">
+                          <td className="p-2.5 font-mono text-[11px] text-slate-700 whitespace-nowrap">
+                            {formatAuditTimestamp(log.logged_at)}
+                          </td>
+                          <td className="p-2.5 whitespace-nowrap">{renderSupplierAuditActionBadge(log.action)}</td>
+                          <td className="p-2.5 font-medium text-slate-800 whitespace-nowrap">{log.user_name || 'System'}</td>
+                          <td className="p-2.5 text-slate-600">{log.details || '—'}</td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="flex justify-end pt-1">
+                <button
+                  type="button"
+                  onClick={() => setAuditSupplierTarget(null)}
+                  className="px-4 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Delete Supplier Confirmation Modal */}
       {deleteSupplierTarget && (
@@ -1825,6 +2668,188 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL' }:
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Configurable Financial Approval Threshold Modal */}
+      {showThresholdModal && (
+        <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/45 p-4">
+          <form onSubmit={saveApprovalThreshold} className="w-full max-w-md rounded-xl bg-white p-5 space-y-4 border border-slate-200 shadow-xl">
+            <div className="flex items-start justify-between gap-2 border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="font-display text-base font-semibold text-slate-900">PO Signature Threshold</h3>
+                <p className="text-xs text-slate-500">
+                  Set the order amount above which Stage 2 Manager Digital Signature is mandatory.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowThresholdModal(false)}
+                className="p-1 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {thresholdErr && (
+              <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{thresholdErr}</div>
+            )}
+
+            <div className="space-y-2">
+              <label className="block text-xs font-medium text-slate-700">Threshold Amount (PHP)</label>
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                required
+                value={thresholdInput}
+                onChange={(e) => setThresholdInput(e.target.value)}
+                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-mono font-semibold text-slate-900"
+              />
+              <div className="flex flex-wrap gap-1.5 pt-1">
+                {[5000, 10000, 25000, 50000].map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    onClick={() => setThresholdInput(String(preset))}
+                    className="rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-mono text-slate-700 hover:bg-slate-100"
+                  >
+                    {formatPHP(preset)}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setShowThresholdModal(false)}
+                className="px-4 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={savingThreshold}
+                className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-50"
+              >
+                {savingThreshold ? 'Saving...' : 'Save Threshold'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Stage 2 Manager Digital Signature Approval Modal */}
+      {signaturePo && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 p-4">
+          <form onSubmit={submitManagerSignature} className="w-full max-w-lg max-h-[92vh] overflow-y-auto rounded-xl bg-white p-5 space-y-4 border border-slate-200 shadow-2xl">
+            <div className="flex items-start justify-between gap-2 border-b border-slate-100 pb-3">
+              <div>
+                <div className="inline-flex items-center gap-1.5 rounded-md border border-violet-200 bg-violet-50 px-2 py-0.5 text-[11px] font-semibold text-violet-800 mb-1.5">
+                  <PenTool className="w-3 h-3" /> Stage 2 · Manager Digital Signature
+                </div>
+                <h3 className="font-display text-base font-semibold text-slate-900">
+                  Authorize {signaturePo.po_number}
+                </h3>
+                <p className="text-xs text-slate-500">
+                  {signaturePo.supplier_name} · {signaturePo.location_name}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSignaturePo(null)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {signatureErr && (
+              <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{signatureErr}</div>
+            )}
+
+            <div className="grid grid-cols-2 gap-2.5 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs">
+              <div>
+                <span className="block text-[11px] text-slate-500">Purchase Order Total</span>
+                <span className="font-mono text-sm font-bold text-slate-900">{formatPHP(signaturePo.total_amount)}</span>
+              </div>
+              <div>
+                <span className="block text-[11px] text-slate-500">Approval Threshold</span>
+                <span className="font-mono text-sm font-semibold text-violet-800">{formatPHP(approvalThreshold)}</span>
+              </div>
+              <div className="col-span-2 border-t border-slate-200 pt-2 text-[11px] text-slate-600">
+                Stage 1 Verified By: <span className="font-semibold text-slate-900">{signaturePo.stage1_approved_by_name || user.fullName}</span>
+                {signaturePo.stage1_approved_at ? ` · ${formatAuditTimestamp(signaturePo.stage1_approved_at)}` : ''}
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">Signing Manager Name</label>
+              <input
+                type="text"
+                required
+                value={signerName}
+                onChange={(e) => setSignerName(e.target.value)}
+                placeholder="Full name of authorizing manager"
+                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium text-slate-900"
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <label className="block text-xs font-medium text-slate-700">Draw Digital Signature</label>
+                <button
+                  type="button"
+                  onClick={clearSignatureCanvas}
+                  className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-50"
+                >
+                  <RotateCcw className="w-3 h-3" /> Clear Pad
+                </button>
+              </div>
+              <div className="relative rounded-lg border-2 border-dashed border-slate-300 bg-slate-50/50 overflow-hidden">
+                {!hasSignatureStroke && (
+                  <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-xs text-slate-400">
+                    Sign here using mouse or touch
+                  </div>
+                )}
+                <div className="pointer-events-none absolute left-6 right-6 bottom-6 border-b border-slate-300" />
+                <canvas
+                  ref={sigCanvasRef}
+                  width={520}
+                  height={170}
+                  onPointerDown={handleSigPointerDown}
+                  onPointerMove={handleSigPointerMove}
+                  onPointerUp={handleSigPointerUp}
+                  onPointerCancel={handleSigPointerUp}
+                  className="relative z-10 w-full h-40 touch-none cursor-crosshair block"
+                />
+              </div>
+              <p className="text-[11px] text-slate-500">
+                {hasSignatureStroke
+                  ? 'Signature captured and ready to attach to the purchase order approval record.'
+                  : 'Signature stroke required before final approval.'}
+              </p>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setSignaturePo(null)}
+                className="px-4 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
+              >
+                Leave Pending Signature
+              </button>
+              <button
+                type="submit"
+                disabled={submittingSignature}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-violet-700 text-white text-xs font-semibold hover:bg-violet-800 disabled:opacity-50"
+              >
+                <PenTool className="w-3.5 h-3.5" />
+                {submittingSignature ? 'Signing & Approving...' : 'Apply Signature & Approve'}
+              </button>
+            </div>
+          </form>
         </div>
       )}
     </div>

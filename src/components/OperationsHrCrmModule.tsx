@@ -1,7 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Download, Printer, Plus, Clock, Truck, ShieldCheck, Calendar, MapPin, Pencil, Trash2, X, Upload, Users, Camera, Check, ChefHat } from 'lucide-react';
+import { Download, Printer, Plus, Clock, Truck, ShieldCheck, Calendar, MapPin, Pencil, Trash2, X, Upload, Users, Camera, Check, ChefHat, ScanFace, KeyRound } from 'lucide-react';
 import { apiFetch, downloadCsv, formatNum, formatPHP } from '../lib/api.ts';
+import { captureSnapshotDataUrl, extractFaceDescriptorFromDataUrl, parseDescriptorJson } from '../lib/faceRecognition.ts';
 import { LocationRow } from '../types/erp.ts';
+import { FaceAttendanceKioskModal } from './FaceAttendanceKioskModal.tsx';
 import { AvatarBadge, resizeImageToDataUrl } from './SettingsUserControlModule.tsx';
 
 interface Props {
@@ -10,9 +12,19 @@ interface Props {
   activeLocationId?: string;
   onLocationChange?: (locationId: string) => void;
   onLocationsChanged?: () => Promise<void> | void;
+  quickAction?: { action: string; nonce: number } | null;
+  onQuickActionHandled?: () => void;
 }
 
-export function OperationsHrCrmModule({ mode, locations = [], activeLocationId = 'ALL', onLocationChange, onLocationsChanged }: Props) {
+export function OperationsHrCrmModule({
+  mode,
+  locations = [],
+  activeLocationId = 'ALL',
+  onLocationChange,
+  onLocationsChanged,
+  quickAction,
+  onQuickActionHandled,
+}: Props) {
   const [fleetData, setFleetData] = useState<any>(null);
   const [hrData, setHrData] = useState<any>(null);
   const [customers, setCustomers] = useState<any[]>([]);
@@ -52,7 +64,7 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
   const [ruleCfg, setRuleCfg] = useState<any>(null);
   const [fleetModal, setFleetModal] = useState<'add' | 'edit' | null>(null);
 
-  // Employee & Crew Photos Modal State (HR & PH Payroll)
+  // Employee & Crew Photos + Face Biometrics Modal State (HR & PH Payroll)
   const [empModal, setEmpModal] = useState<{ mode: 'create' | 'edit'; id?: string } | null>(null);
   const [empForm, setEmpForm] = useState({
     employeeCode: '',
@@ -63,11 +75,41 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
     payType: 'DAILY' as 'DAILY' | 'HOURLY' | 'MONTHLY',
     baseRate: '650',
     avatarUrl: '',
+    faceDescriptorJson: '',
+    faceEnrolledAt: '',
+    attendancePin: '',
     isActive: true,
   });
   const [empModalErr, setEmpModalErr] = useState('');
   const [savingEmp, setSavingEmp] = useState(false);
+  const [extractingFace, setExtractingFace] = useState(false);
+  const [faceEnrollStatus, setFaceEnrollStatus] = useState<{ ok: boolean; text: string } | null>(null);
+  const [showEmpCam, setShowEmpCam] = useState(false);
+  const [empCamErr, setEmpCamErr] = useState('');
   const empFileRef = useRef<HTMLInputElement>(null);
+  const empVideoRef = useRef<HTMLVideoElement | null>(null);
+  const empStreamRef = useRef<MediaStream | null>(null);
+
+  // Face Attendance Kiosk & Biometric Audit State
+  const [showFaceKiosk, setShowFaceKiosk] = useState(false);
+  const [useAttendanceDays, setUseAttendanceDays] = useState(false);
+  const [attendancePhotoPreview, setAttendancePhotoPreview] = useState<{ title: string; subtitle: string; src: string } | null>(null);
+  const [showPayrollModal, setShowPayrollModal] = useState(false);
+  const [runningPayroll, setRunningPayroll] = useState(false);
+  const [payrollModalErr, setPayrollModalErr] = useState('');
+  const [payrollForm, setPayrollForm] = useState(() => {
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = String(now.getMonth() + 1).padStart(2, '0');
+    const isFirstHalf = now.getDate() <= 15;
+    const lastDay = new Date(y, now.getMonth() + 1, 0).getDate();
+    return {
+      periodStart: `${y}-${m}-${isFirstHalf ? '01' : '16'}`,
+      periodEnd: `${y}-${m}-${isFirstHalf ? '15' : String(lastDay).padStart(2, '0')}`,
+      daysPerEmployee: '13',
+      useAttendanceDays: false,
+    };
+  });
   const [fleetForm, setFleetForm] = useState({
     locationId: '',
     type: 'FOOD_TRUCK' as 'FOOD_TRUCK' | 'COMMISSARY',
@@ -97,9 +139,60 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
     };
   };
 
-  // Employee & Crew Photo Handlers (HR & PH Payroll)
+  // Inline camera lifecycle inside Employee & Crew modal
+  useEffect(() => {
+    if (!empModal || !showEmpCam) {
+      if (empStreamRef.current) {
+        empStreamRef.current.getTracks().forEach((t) => t.stop());
+        empStreamRef.current = null;
+      }
+      return;
+    }
+    let cancelled = false;
+    setEmpCamErr('');
+    (async () => {
+      try {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error('Camera is not supported in this browser.');
+        }
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user', width: { ideal: 480 }, height: { ideal: 360 } },
+          audio: false,
+        });
+        if (cancelled) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        empStreamRef.current = stream;
+        if (empVideoRef.current) {
+          empVideoRef.current.srcObject = stream;
+          await empVideoRef.current.play().catch(() => undefined);
+        }
+      } catch (e: any) {
+        if (!cancelled) {
+          setEmpCamErr(
+            e?.name === 'NotAllowedError'
+              ? 'Camera permission denied. Allow access or upload a photo file instead.'
+              : e?.message || 'Unable to start camera',
+          );
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (empStreamRef.current) {
+        empStreamRef.current.getTracks().forEach((t) => t.stop());
+        empStreamRef.current = null;
+      }
+    };
+  }, [Boolean(empModal), showEmpCam]);
+
+  // Employee & Crew Photo + Face Biometrics Handlers (HR & PH Payroll)
   const openCreateEmployee = () => {
     setEmpModalErr('');
+    setFaceEnrollStatus(null);
+    setShowEmpCam(false);
+    setEmpCamErr('');
     const nextNum = (hrData?.employees?.length || 0) + 1;
     const defaultLoc =
       activeLocationId && activeLocationId !== 'ALL' && locations.some((l) => l.id === activeLocationId)
@@ -114,6 +207,9 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
       payType: 'DAILY',
       baseRate: '650',
       avatarUrl: '',
+      faceDescriptorJson: '',
+      faceEnrolledAt: '',
+      attendancePin: '',
       isActive: true,
     });
     setEmpModal({ mode: 'create' });
@@ -121,6 +217,16 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
 
   const openEditEmployee = (emp: any) => {
     setEmpModalErr('');
+    setShowEmpCam(false);
+    setEmpCamErr('');
+    const hasFace = Boolean(parseDescriptorJson(emp.face_descriptor_json));
+    setFaceEnrollStatus(
+      hasFace
+        ? { ok: true, text: 'On-device Face ID profile active' }
+        : emp.avatar_url
+          ? { ok: false, text: 'Photo uploaded without Face ID — click Re-Scan Photo or Take Live Photo' }
+          : null,
+    );
     setEmpForm({
       employeeCode: emp.employee_code || '',
       fullName: emp.full_name || '',
@@ -130,20 +236,64 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
       payType: (emp.pay_type as any) || 'DAILY',
       baseRate: String(emp.base_rate ?? 650),
       avatarUrl: emp.avatar_url || '',
+      faceDescriptorJson: emp.face_descriptor_json || '',
+      faceEnrolledAt: emp.face_enrolled_at || '',
+      attendancePin: emp.attendance_pin || '',
       isActive: emp.is_active !== 0,
     });
     setEmpModal({ mode: 'edit', id: emp.id });
   };
 
+  const enrollFaceFromDataUrl = async (dataUrl: string) => {
+    setExtractingFace(true);
+    setFaceEnrollStatus(null);
+    setEmpForm((f) => ({ ...f, avatarUrl: dataUrl }));
+    try {
+      const res = await extractFaceDescriptorFromDataUrl(dataUrl);
+      const enrolledAt = new Date().toISOString();
+      setEmpForm((f) => ({
+        ...f,
+        avatarUrl: dataUrl,
+        faceDescriptorJson: res.descriptorJson,
+        faceEnrolledAt: enrolledAt,
+      }));
+      setFaceEnrollStatus({ ok: true, text: `Face ID enrolled (${res.score}% detection clarity)` });
+    } catch (e: any) {
+      setEmpForm((f) => ({
+        ...f,
+        avatarUrl: dataUrl,
+        faceDescriptorJson: '',
+        faceEnrolledAt: '',
+      }));
+      setFaceEnrollStatus({
+        ok: false,
+        text: e?.message || 'Photo saved, but no clear front face was detected for Face ID.',
+      });
+    } finally {
+      setExtractingFace(false);
+    }
+  };
+
   const handleEmpPhotoUpload = async (file: File | undefined) => {
     if (!file) return;
     setEmpModalErr('');
+    setShowEmpCam(false);
     try {
       const dataUrl = await resizeImageToDataUrl(file, 256);
-      setEmpForm((f) => ({ ...f, avatarUrl: dataUrl }));
+      await enrollFaceFromDataUrl(dataUrl);
     } catch (e: any) {
       setEmpModalErr(e.message || 'Unable to process crew photo');
     }
+  };
+
+  const handleCaptureEmpLivePhoto = async () => {
+    if (!empVideoRef.current || empVideoRef.current.readyState < 2) {
+      setEmpCamErr('Camera feed is still warming up. Wait a moment and try again.');
+      return;
+    }
+    const snapshot = captureSnapshotDataUrl(empVideoRef.current, 256, true);
+    setShowEmpCam(false);
+    await enrollFaceFromDataUrl(snapshot);
   };
 
   const handleSaveEmployee = async (e: React.FormEvent) => {
@@ -161,6 +311,9 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
         payType: empForm.payType,
         baseRate: Number(empForm.baseRate || 0),
         avatarUrl: empForm.avatarUrl || null,
+        faceDescriptorJson: empForm.faceDescriptorJson || null,
+        faceEnrolledAt: empForm.faceEnrolledAt || null,
+        attendancePin: empForm.attendancePin.trim() || null,
         isActive: empForm.isActive,
       };
 
@@ -169,16 +322,17 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
           method: 'POST',
           body: JSON.stringify(payload),
         });
-        setMsg(`Added crew member ${payload.fullName}.`);
+        setMsg(`Added crew member ${payload.fullName}${payload.faceDescriptorJson ? ' with Face ID enrolled' : ''}.`);
       } else {
         await apiFetch(`/hr/employees/${empModal.id}`, {
           method: 'PUT',
           body: JSON.stringify(payload),
         });
-        setMsg(`Updated employee profile and crew photo for ${payload.fullName}.`);
+        setMsg(`Updated employee profile and biometrics for ${payload.fullName}.`);
       }
 
       setEmpModal(null);
+      setShowEmpCam(false);
       await loadHr();
     } catch (err: any) {
       setEmpModalErr(err.message || 'Unable to save employee details');
@@ -247,6 +401,19 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
       setErr(e.message || 'Unable to load HR & Payroll data');
     }
   };
+
+  useEffect(() => {
+    if (mode !== 'hr' || !quickAction || !hrData) return;
+    if (quickAction.action === 'new-payroll') {
+      setPayrollModalErr('');
+      setPayrollForm((f) => ({ ...f, useAttendanceDays }));
+      setShowPayrollModal(true);
+      onQuickActionHandled?.();
+    } else if (quickAction.action === 'new-employee') {
+      openCreateEmployee();
+      onQuickActionHandled?.();
+    }
+  }, [mode, quickAction, hrData]);
   const loadCrm = async () => {
     try {
       setErr('');
@@ -924,6 +1091,15 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
     const visibleEmployees = isHrLocFiltered
       ? (hrData.employees || []).filter((emp: any) => emp.location_id === activeLocationId)
       : hrData.employees || [];
+    const visibleAttendance = isHrLocFiltered
+      ? (hrData.attendance || []).filter((att: any) => att.location_id === activeLocationId)
+      : hrData.attendance || [];
+    const openShiftEmployeeIds = new Set<string>(
+      (hrData.attendance || []).filter((att: any) => !att.clock_out).map((att: any) => att.employee_id),
+    );
+    const enrolledFaceCount = visibleEmployees.filter((e: any) => Boolean(parseDescriptorJson(e.face_descriptor_json))).length;
+    const photoCount = visibleEmployees.filter((e: any) => Boolean(e.avatar_url)).length;
+
     const latestRun = hrData.payrollRuns?.[0] || null;
     const visiblePayrollItems = latestRun
       ? isHrLocFiltered
@@ -931,21 +1107,44 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
         : latestRun.items || []
       : [];
 
+    const formatPunchTime = (iso: string | null | undefined) => {
+      if (!iso) return '—';
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return iso;
+      return d.toLocaleString('en-PH', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    };
+
     return (
       <div className="space-y-6">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h1 className="font-display text-2xl font-semibold text-slate-900">Employees, Attendance &amp; PH Payroll</h1>
-            <p className="text-sm text-slate-500">Employee directory, crew photos, truck assignments, time tracking, and Philippine statutory payroll</p>
+            <p className="text-sm text-slate-500">On-device face attendance scanner, crew biometrics, truck assignments, and Philippine statutory payroll</p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setShowFaceKiosk(true)}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 whitespace-nowrap shrink-0 shadow-xs"
+            >
+              <ScanFace className="w-4 h-4" /> Face Attendance Kiosk
+            </button>
             <button
               type="button"
               onClick={openCreateEmployee}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 whitespace-nowrap shrink-0 shadow-xs"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 whitespace-nowrap shrink-0"
             >
               <Plus className="w-3.5 h-3.5" /> Add Employee &amp; Crew
             </button>
+            <label className="inline-flex items-center gap-1.5 px-2.5 py-2 rounded-lg border border-slate-200 bg-white text-[11px] font-medium text-slate-700 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={useAttendanceDays}
+                onChange={(e) => setUseAttendanceDays(e.target.checked)}
+                className="rounded border-slate-300 text-slate-900 focus:ring-slate-900"
+              />
+              <span>Use logged attendance</span>
+            </label>
             <button
               type="button"
               onClick={async () => {
@@ -953,9 +1152,16 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
                   setErr('');
                   const r = await apiFetch('/hr/payroll/run', {
                     method: 'POST',
-                    body: JSON.stringify({ periodStart: '2026-11-01', periodEnd: '2026-11-15', daysPerEmployee: 13 }),
+                    body: JSON.stringify({
+                      periodStart: '2026-11-01',
+                      periodEnd: '2026-11-15',
+                      daysPerEmployee: 13,
+                      useAttendanceDays,
+                    }),
                   });
-                  setMsg(`Payroll Run posted · Gross: ${formatPHP(r.totalGross)} · Net: ${formatPHP(r.totalNet)} (Journal Entry created)`);
+                  setMsg(
+                    `Payroll Run posted (${useAttendanceDays ? 'attendance-based' : '13-day cutoff'}) · Gross: ${formatPHP(r.totalGross)} · Net: ${formatPHP(r.totalNet)}`,
+                  );
                   await loadHr();
                 } catch (e: any) {
                   setErr(e.message);
@@ -971,22 +1177,31 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
         {/* HR & Crew Metrics */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <div className="rounded-xl border border-slate-200 bg-white p-3.5">
-            <p className="text-[11px] font-medium text-slate-500 uppercase tracking-wide">Total Employees</p>
-            <p className="font-display text-xl font-bold text-slate-900 mt-1">{visibleEmployees.length}</p>
+            <p className="text-[11px] font-medium text-slate-500">Total Employees</p>
+            <p className="font-display text-xl font-bold text-slate-900 mt-1 font-mono tabular-nums">{visibleEmployees.length}</p>
             <p className="text-[11px] text-slate-400 mt-0.5">{isHrLocFiltered ? 'At selected location' : 'All branches & trucks'}</p>
           </div>
           <div className="rounded-xl border border-slate-200 bg-white p-3.5">
-            <p className="text-[11px] font-medium text-slate-500 uppercase tracking-wide">Active Crew</p>
-            <p className="font-display text-xl font-bold text-emerald-600 mt-1">{visibleEmployees.filter((e: any) => e.is_active !== 0).length}</p>
-            <p className="text-[11px] text-slate-400 mt-0.5">Ready for dispatch / shift</p>
+            <p className="text-[11px] font-medium text-slate-500">Active &amp; On Shift</p>
+            <p className="font-display text-xl font-bold text-emerald-600 mt-1 font-mono tabular-nums">
+              {visibleEmployees.filter((e: any) => e.is_active !== 0).length}
+              <span className="text-xs font-normal text-slate-500 ml-1.5">
+                ({visibleEmployees.filter((e: any) => openShiftEmployeeIds.has(e.id)).length} clocked in)
+              </span>
+            </p>
+            <p className="text-[11px] text-slate-400 mt-0.5">Live attendance status</p>
           </div>
           <div className="rounded-xl border border-slate-200 bg-white p-3.5">
-            <p className="text-[11px] font-medium text-slate-500 uppercase tracking-wide">Crew Photos Uploaded</p>
-            <p className="font-display text-xl font-bold text-blue-600 mt-1">{visibleEmployees.filter((e: any) => Boolean(e.avatar_url)).length}</p>
-            <p className="text-[11px] text-slate-400 mt-0.5">{visibleEmployees.length ? Math.round((visibleEmployees.filter((e: any) => Boolean(e.avatar_url)).length / visibleEmployees.length) * 100) : 0}% crew photo coverage</p>
+            <p className="text-[11px] font-medium text-slate-500">Face Biometrics Ready</p>
+            <p className="font-display text-xl font-bold text-blue-600 mt-1 font-mono tabular-nums">
+              {enrolledFaceCount} <span className="text-xs font-normal text-slate-400">/ {visibleEmployees.length}</span>
+            </p>
+            <p className="text-[11px] text-slate-400 mt-0.5">
+              {photoCount} photo(s) · {visibleEmployees.length ? Math.round((enrolledFaceCount / visibleEmployees.length) * 100) : 0}% scanner-ready
+            </p>
           </div>
           <div className="rounded-xl border border-slate-200 bg-white p-3.5">
-            <p className="text-[11px] font-medium text-slate-500 uppercase tracking-wide">Location Scope</p>
+            <p className="text-[11px] font-medium text-slate-500">Location Scope</p>
             <p className="font-display text-sm font-semibold text-slate-800 mt-1 truncate">
               {isHrLocFiltered ? locations.find((l) => l.id === activeLocationId)?.name || 'Filtered Truck' : 'All Food Trucks & Commissary'}
             </p>
@@ -1001,15 +1216,15 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
           <div className="lg:col-span-7 rounded-xl border border-slate-200 bg-white overflow-x-auto">
             <div className="px-4 py-3 border-b border-slate-200 bg-slate-50/60 flex items-center justify-between">
               <div>
-                <h2 className="font-display text-xs font-semibold uppercase tracking-wide text-slate-700">Employee Directory &amp; Crew Roster</h2>
-                <p className="text-[11px] text-slate-500">Includes crew photos, assigned food trucks, and daily time clock</p>
+                <h2 className="font-display text-xs font-semibold uppercase tracking-wide text-slate-700">Employee Directory &amp; Crew Biometrics</h2>
+                <p className="text-[11px] text-slate-500">Crew photos, on-device Face ID status, truck assignments, and shift punches</p>
               </div>
               <span className="text-[11px] font-mono text-slate-500">{visibleEmployees.length} employee(s)</span>
             </div>
             <table className="w-full text-left text-xs">
               <thead className="border-b border-slate-100 text-slate-500 bg-slate-50">
                 <tr>
-                  <th className="p-3 font-medium">Crew Member &amp; Photo</th>
+                  <th className="p-3 font-medium">Crew Member &amp; Biometrics</th>
                   <th className="p-3 font-medium">Position · Truck</th>
                   <th className="p-3 font-medium">Status</th>
                   <th className="p-3 font-medium text-right">Daily Rate</th>
@@ -1023,83 +1238,106 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
                       No employees found for the selected truck / location. Click &ldquo;Add Employee &amp; Crew&rdquo; to register one.
                     </td>
                   </tr>
-                ) : visibleEmployees.map((emp: any) => (
-                  <tr key={emp.id} className="hover:bg-slate-50/50">
-                    <td className="p-3 font-semibold text-slate-900">
-                      <div className="flex items-center gap-2.5">
-                        <div className="relative shrink-0">
-                          <AvatarBadge name={emp.full_name} src={emp.avatar_url} size="sm" />
-                          {emp.avatar_url && (
-                            <span className="absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-full bg-emerald-500 ring-1 ring-white" title="Crew photo uploaded" />
-                          )}
+                ) : visibleEmployees.map((emp: any) => {
+                  const hasFaceId = Boolean(parseDescriptorJson(emp.face_descriptor_json));
+                  const onShift = openShiftEmployeeIds.has(emp.id);
+                  return (
+                    <tr key={emp.id} className="hover:bg-slate-50/50">
+                      <td className="p-3 font-semibold text-slate-900">
+                        <div className="flex items-center gap-2.5">
+                          <div className="shrink-0">
+                            <AvatarBadge name={emp.full_name} src={emp.avatar_url} size="sm" />
+                          </div>
+                          <div>
+                            <p className="font-medium text-slate-900 leading-tight">{emp.full_name}</p>
+                            <p className="text-[11px] font-normal text-slate-500">
+                              <span className="font-mono">{emp.employee_code}</span>
+                              <span aria-hidden="true"> · </span>
+                              <span className={hasFaceId ? 'text-emerald-700 font-medium' : emp.avatar_url ? 'text-amber-700' : 'text-slate-400'}>
+                                {hasFaceId ? 'Face ID Ready' : emp.avatar_url ? 'Photo Only' : 'No Face ID'}
+                              </span>
+                            </p>
+                          </div>
                         </div>
-                        <div>
-                          <p className="font-medium text-slate-900 leading-tight">{emp.full_name}</p>
-                          <p className="font-mono text-[11px] font-normal text-slate-500">{emp.employee_code}</p>
-                        </div>
-                      </div>
-                    </td>
-                    <td className="p-3 text-slate-600">
-                      <p className="font-medium text-slate-800">{emp.position}</p>
-                      <p className="text-[11px] text-slate-500">{emp.location_name || 'Commissary HQ'}</p>
-                    </td>
-                    <td className="p-3">
-                      <span
-                        className={`inline-block rounded px-2 py-0.5 text-[10px] font-semibold ${
-                          emp.is_active !== 0 ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'
-                        }`}
-                      >
-                        {emp.is_active !== 0 ? 'ACTIVE' : 'INACTIVE'}
-                      </span>
-                    </td>
-                    <td className="p-3 text-right font-mono tabular-nums text-slate-800">
-                      {formatPHP(emp.base_rate)}
-                      <span className="block text-[10px] text-slate-400 font-sans">{emp.pay_type || 'DAILY'}</span>
-                    </td>
-                    <td className="p-3 text-right whitespace-nowrap space-x-1.5">
-                      <button
-                        type="button"
-                        onClick={() => openEditEmployee(emp)}
-                        className="inline-flex items-center gap-1 rounded border border-slate-200 px-2 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100"
-                        title="Edit profile & upload crew photo"
-                      >
-                        <Pencil className="w-3 h-3 text-slate-500" /> Edit / Photo
-                      </button>
-                      <button
-                        type="button"
-                        onClick={async () => {
-                          try {
-                            setErr('');
-                            await apiFetch('/hr/attendance/clock', { method: 'POST', body: JSON.stringify({ employeeId: emp.id, action: 'CLOCK_IN' }) });
-                            setMsg(`${emp.full_name} clocked in.`);
-                            await loadHr();
-                          } catch (e: any) {
-                            setErr(e.message);
-                          }
-                        }}
-                        className="inline-flex items-center gap-1 rounded border border-slate-200 px-2 py-1 text-[11px] font-medium hover:bg-slate-100"
-                      >
-                        <Clock className="w-3 h-3" /> In
-                      </button>
-                      <button
-                        type="button"
-                        onClick={async () => {
-                          try {
-                            setErr('');
-                            await apiFetch('/hr/attendance/clock', { method: 'POST', body: JSON.stringify({ employeeId: emp.id, action: 'CLOCK_OUT', overtimeHours: 1 }) });
-                            setMsg(`${emp.full_name} clocked out.`);
-                            await loadHr();
-                          } catch (e: any) {
-                            setErr(e.message);
-                          }
-                        }}
-                        className="rounded border border-slate-200 px-2 py-1 text-[11px] font-medium hover:bg-slate-100"
-                      >
-                        Out
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                      </td>
+                      <td className="p-3 text-slate-600">
+                        <p className="font-medium text-slate-800">{emp.position}</p>
+                        <p className="text-[11px] text-slate-500">{emp.location_name || 'Commissary HQ'}</p>
+                      </td>
+                      <td className="p-3">
+                        <p className={`text-[11px] font-semibold ${emp.is_active !== 0 ? 'text-emerald-700' : 'text-slate-400'}`}>
+                          {emp.is_active !== 0 ? 'Active' : 'Inactive'}
+                        </p>
+                        {onShift && (
+                          <p className="text-[11px] text-blue-700 font-medium">On Shift</p>
+                        )}
+                      </td>
+                      <td className="p-3 text-right font-mono tabular-nums text-slate-800">
+                        {formatPHP(emp.base_rate)}
+                        <span className="block text-[10px] text-slate-400 font-sans">{emp.pay_type || 'DAILY'}</span>
+                      </td>
+                      <td className="p-3 text-right whitespace-nowrap space-x-1.5">
+                        <button
+                          type="button"
+                          onClick={() => openEditEmployee(emp)}
+                          className="inline-flex items-center gap-1 rounded border border-slate-200 px-2 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100"
+                          title="Edit profile, Face ID & PIN"
+                        >
+                          <Pencil className="w-3 h-3 text-slate-500" /> Edit / Face
+                        </button>
+                        <button
+                          type="button"
+                          disabled={onShift}
+                          onClick={async () => {
+                            try {
+                              setErr('');
+                              await apiFetch('/hr/attendance/clock', {
+                                method: 'POST',
+                                body: JSON.stringify({
+                                  employeeId: emp.id,
+                                  action: 'CLOCK_IN',
+                                  locationId: emp.location_id || null,
+                                  verificationMethod: 'MANUAL',
+                                }),
+                              });
+                              setMsg(`${emp.full_name} clocked in.`);
+                              await loadHr();
+                            } catch (e: any) {
+                              setErr(e.message);
+                            }
+                          }}
+                          className="inline-flex items-center gap-1 rounded border border-slate-200 px-2 py-1 text-[11px] font-medium hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          <Clock className="w-3 h-3" /> In
+                        </button>
+                        <button
+                          type="button"
+                          disabled={!onShift}
+                          onClick={async () => {
+                            try {
+                              setErr('');
+                              await apiFetch('/hr/attendance/clock', {
+                                method: 'POST',
+                                body: JSON.stringify({
+                                  employeeId: emp.id,
+                                  action: 'CLOCK_OUT',
+                                  verificationMethod: 'MANUAL',
+                                }),
+                              });
+                              setMsg(`${emp.full_name} clocked out.`);
+                              await loadHr();
+                            } catch (e: any) {
+                              setErr(e.message);
+                            }
+                          }}
+                          className="rounded border border-slate-200 px-2 py-1 text-[11px] font-medium hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          Out
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -1142,6 +1380,129 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
               </button>
             </div>
           )}
+        </div>
+
+        {/* Attendance & Biometric Photo Audit Log */}
+        <div className="rounded-xl border border-slate-200 bg-white overflow-x-auto">
+          <div className="px-4 py-3 border-b border-slate-200 bg-slate-50/60 flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="font-display text-xs font-semibold uppercase tracking-wide text-slate-700">Attendance &amp; Biometric Punch Audit</h2>
+              <p className="text-[11px] text-slate-500">Time In / Time Out log with face verification score, overtime computation, and photo snapshots</p>
+            </div>
+            <span className="text-[11px] font-mono text-slate-500">{visibleAttendance.length} punch record(s)</span>
+          </div>
+          <table className="w-full text-left text-xs">
+            <thead className="border-b border-slate-100 text-slate-500 bg-slate-50">
+              <tr>
+                <th className="p-3 font-medium">Crew Member</th>
+                <th className="p-3 font-medium">Station / Truck</th>
+                <th className="p-3 font-medium">Time In</th>
+                <th className="p-3 font-medium">Time Out</th>
+                <th className="p-3 font-medium text-right">Worked · OT</th>
+                <th className="p-3 font-medium">Status</th>
+                <th className="p-3 font-medium">Verification</th>
+                <th className="p-3 font-medium text-right">Photo Proof</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {visibleAttendance.length === 0 ? (
+                <tr>
+                  <td colSpan={8} className="p-6 text-center text-xs text-slate-400">
+                    No attendance punches recorded yet. Launch &ldquo;Face Attendance Kiosk&rdquo; or use quick In / Out buttons.
+                  </td>
+                </tr>
+              ) : visibleAttendance.map((att: any) => {
+                const methodLabel =
+                  att.verification_method === 'FACE_SCAN'
+                    ? `Face Scan${att.match_confidence ? ` · ${att.match_confidence}%` : ''}`
+                    : att.verification_method === 'PIN_FALLBACK'
+                      ? 'PIN Fallback'
+                      : 'Manual';
+                return (
+                  <tr key={att.id} className="hover:bg-slate-50/50">
+                    <td className="p-3">
+                      <p className="font-medium text-slate-900">{att.full_name || 'Unknown Employee'}</p>
+                      <p className="text-[11px] font-mono text-slate-500">{att.employee_code || '—'}</p>
+                    </td>
+                    <td className="p-3 text-slate-600">{att.location_name || 'Commissary HQ'}</td>
+                    <td className="p-3 font-mono text-slate-700 whitespace-nowrap">{formatPunchTime(att.clock_in)}</td>
+                    <td className="p-3 font-mono whitespace-nowrap">
+                      {att.clock_out ? (
+                        <span className="text-slate-700">{formatPunchTime(att.clock_out)}</span>
+                      ) : (
+                        <span className="font-sans font-medium text-blue-700">On Shift</span>
+                      )}
+                    </td>
+                    <td className="p-3 text-right font-mono tabular-nums text-slate-800 whitespace-nowrap">
+                      {att.clock_out ? (
+                        <>
+                          {Number(att.worked_hours || 0).toFixed(2)}h
+                          {Number(att.overtime_hours || 0) > 0 && (
+                            <span className="text-amber-700 ml-1">({Number(att.overtime_hours).toFixed(2)}h OT)</span>
+                          )}
+                        </>
+                      ) : (
+                        '—'
+                      )}
+                    </td>
+                    <td className="p-3">
+                      <span
+                        className={`text-[11px] font-semibold ${
+                          att.status === 'LATE'
+                            ? 'text-amber-700'
+                            : att.status === 'ABSENT'
+                              ? 'text-red-700'
+                              : 'text-emerald-700'
+                        }`}
+                      >
+                        {att.status}
+                      </span>
+                    </td>
+                    <td className="p-3 text-slate-600 whitespace-nowrap">{methodLabel}</td>
+                    <td className="p-3 text-right">
+                      <div className="inline-flex items-center justify-end gap-1.5">
+                        {att.clock_in_photo && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setAttendancePhotoPreview({
+                                title: `${att.full_name} — Time In Snapshot`,
+                                subtitle: `${formatPunchTime(att.clock_in)} · ${methodLabel}`,
+                                src: att.clock_in_photo,
+                              })
+                            }
+                            className="group relative rounded border border-slate-200 overflow-hidden hover:ring-2 hover:ring-slate-900"
+                            title="View Time In photo proof"
+                          >
+                            <img src={att.clock_in_photo} alt="Time in proof" className="w-7 h-7 object-cover" />
+                          </button>
+                        )}
+                        {att.clock_out_photo && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setAttendancePhotoPreview({
+                                title: `${att.full_name} — Time Out Snapshot`,
+                                subtitle: `${formatPunchTime(att.clock_out)} · ${methodLabel}`,
+                                src: att.clock_out_photo,
+                              })
+                            }
+                            className="group relative rounded border border-slate-200 overflow-hidden hover:ring-2 hover:ring-slate-900"
+                            title="View Time Out photo proof"
+                          >
+                            <img src={att.clock_out_photo} alt="Time out proof" className="w-7 h-7 object-cover" />
+                          </button>
+                        )}
+                        {!att.clock_in_photo && !att.clock_out_photo && (
+                          <span className="text-[11px] text-slate-400">—</span>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
 
         {hrData.payrollRuns.length > 0 && (
@@ -1216,50 +1577,113 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
               )}
 
               <form onSubmit={handleSaveEmployee} className="space-y-4">
-                {/* Photo Upload Section */}
-                <div className="flex items-center gap-4 p-3.5 rounded-xl border border-slate-200 bg-slate-50/60">
-                  <div className="relative group shrink-0">
-                    <AvatarBadge name={empForm.fullName || 'Crew'} src={empForm.avatarUrl} size="lg" />
-                    <button
-                      type="button"
-                      onClick={() => empFileRef.current?.click()}
-                      className="absolute inset-0 rounded-full bg-black/40 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-                      title="Upload crew photo"
-                    >
-                      <Camera className="w-5 h-5" />
-                    </button>
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs font-semibold text-slate-900">Crew Member Photo</p>
-                    <p className="text-[11px] text-slate-500 mt-0.5">
-                      JPG or PNG image. Automatically cropped and optimized for food truck crew badges.
-                    </p>
-                    <div className="flex items-center gap-2 mt-2">
+                {/* Photo & Biometric Enrollment Section */}
+                <div className="p-3.5 rounded-xl border border-slate-200 bg-slate-50/60 space-y-3">
+                  <div className="flex items-center gap-4">
+                    <div className="relative group shrink-0">
+                      <AvatarBadge name={empForm.fullName || 'Crew'} src={empForm.avatarUrl} size="lg" />
                       <button
                         type="button"
                         onClick={() => empFileRef.current?.click()}
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white text-xs font-medium text-slate-700 hover:bg-slate-100"
+                        className="absolute inset-0 rounded-full bg-black/40 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                        title="Upload crew photo"
                       >
-                        <Upload className="w-3.5 h-3.5" /> {empForm.avatarUrl ? 'Change Photo' : 'Upload Crew Photo'}
+                        <Camera className="w-5 h-5" />
                       </button>
-                      {empForm.avatarUrl && (
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-semibold text-slate-900">Crew Photo &amp; On-Device Face ID</p>
+                      <p className="text-[11px] text-slate-500 mt-0.5">
+                        Upload a clear front portrait or take a live webcam photo to enroll 128-D face recognition.
+                      </p>
+                      <div className="flex flex-wrap items-center gap-2 mt-2">
                         <button
                           type="button"
-                          onClick={() => setEmpForm((f) => ({ ...f, avatarUrl: '' }))}
-                          className="px-2.5 py-1.5 rounded-lg text-xs font-medium text-red-600 hover:bg-red-50"
+                          onClick={() => empFileRef.current?.click()}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white text-xs font-medium text-slate-700 hover:bg-slate-100"
                         >
-                          Remove Photo
+                          <Upload className="w-3.5 h-3.5" /> {empForm.avatarUrl ? 'Change Photo' : 'Upload Photo'}
                         </button>
+                        <button
+                          type="button"
+                          onClick={() => setShowEmpCam((prev) => !prev)}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white text-xs font-medium text-slate-700 hover:bg-slate-100"
+                        >
+                          <Camera className="w-3.5 h-3.5" /> {showEmpCam ? 'Close Camera' : 'Take Live Photo'}
+                        </button>
+                        {empForm.avatarUrl && !empForm.faceDescriptorJson && !extractingFace && (
+                          <button
+                            type="button"
+                            onClick={() => enrollFaceFromDataUrl(empForm.avatarUrl)}
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-blue-200 bg-blue-50 text-xs font-medium text-blue-700 hover:bg-blue-100"
+                          >
+                            <ScanFace className="w-3.5 h-3.5" /> Re-Scan Photo
+                          </button>
+                        )}
+                        {empForm.avatarUrl && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEmpForm((f) => ({ ...f, avatarUrl: '', faceDescriptorJson: '', faceEnrolledAt: '' }));
+                              setFaceEnrollStatus(null);
+                            }}
+                            className="px-2.5 py-1.5 rounded-lg text-xs font-medium text-red-600 hover:bg-red-50"
+                          >
+                            Remove
+                          </button>
+                        )}
+                      </div>
+                      <input
+                        ref={empFileRef}
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={(e) => handleEmpPhotoUpload(e.target.files?.[0])}
+                      />
+                    </div>
+                  </div>
+
+                  {showEmpCam && (
+                    <div className="rounded-lg border border-slate-200 bg-slate-950 p-2.5 space-y-2">
+                      {empCamErr ? (
+                        <p className="text-xs text-amber-300 text-center py-4">{empCamErr}</p>
+                      ) : (
+                        <>
+                          <video
+                            ref={empVideoRef}
+                            muted
+                            playsInline
+                            className="w-full max-h-52 rounded object-cover -scale-x-100 bg-slate-900"
+                          />
+                          <div className="flex justify-end gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setShowEmpCam(false)}
+                              className="px-3 py-1.5 rounded-md border border-slate-600 text-xs text-slate-200 hover:bg-slate-800"
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleCaptureEmpLivePhoto}
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-emerald-600 text-white text-xs font-semibold hover:bg-emerald-500"
+                            >
+                              <Camera className="w-3.5 h-3.5" /> Capture &amp; Enroll Face
+                            </button>
+                          </div>
+                        </>
                       )}
                     </div>
-                    <input
-                      ref={empFileRef}
-                      type="file"
-                      accept="image/*"
-                      className="hidden"
-                      onChange={(e) => handleEmpPhotoUpload(e.target.files?.[0])}
-                    />
-                  </div>
+                  )}
+
+                  {extractingFace && (
+                    <p className="text-[11px] text-slate-600 font-medium">Analyzing facial landmarks on-device...</p>
+                  )}
+                  {!extractingFace && faceEnrollStatus && (
+                    <p className={`text-[11px] font-medium ${faceEnrollStatus.ok ? 'text-emerald-700' : 'text-amber-700'}`}>
+                      {faceEnrollStatus.text}
+                    </p>
+                  )}
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
@@ -1354,6 +1778,21 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
                       />
                     </div>
                   </div>
+                  <div className="sm:col-span-2">
+                    <label className="block font-medium text-slate-700 mb-1 flex items-center gap-1.5">
+                      <KeyRound className="w-3.5 h-3.5 text-slate-500" />
+                      Attendance Fallback PIN (Optional, 4–12 digits)
+                    </label>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      maxLength={12}
+                      placeholder="e.g. 1234 (used when grill smoke or night lighting blocks face scan)"
+                      value={empForm.attendancePin}
+                      onChange={(e) => setEmpForm({ ...empForm, attendancePin: e.target.value.replace(/\s+/g, '') })}
+                      className="w-full rounded-lg border border-slate-200 px-3 py-2 font-mono tracking-widest"
+                    />
+                  </div>
                 </div>
 
                 <div className="flex items-center gap-2 pt-1">
@@ -1372,14 +1811,17 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
                 <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
                   <button
                     type="button"
-                    onClick={() => setEmpModal(null)}
+                    onClick={() => {
+                      setShowEmpCam(false);
+                      setEmpModal(null);
+                    }}
                     className="px-4 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
                   >
                     Cancel
                   </button>
                   <button
                     type="submit"
-                    disabled={savingEmp}
+                    disabled={savingEmp || extractingFace}
                     className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-50"
                   >
                     {savingEmp ? 'Saving...' : empModal.mode === 'create' ? 'Add Employee & Crew' : 'Save Changes'}
@@ -1387,6 +1829,174 @@ export function OperationsHrCrmModule({ mode, locations = [], activeLocationId =
                 </div>
               </form>
             </div>
+          </div>
+        )}
+
+        {/* Face Attendance Kiosk Modal */}
+        <FaceAttendanceKioskModal
+          isOpen={showFaceKiosk}
+          onClose={() => setShowFaceKiosk(false)}
+          employees={hrData.employees || []}
+          attendance={hrData.attendance || []}
+          locations={locations}
+          defaultLocationId={activeLocationId}
+          onPunchSuccess={loadHr}
+          onAutoEnrollSuccess={loadHr}
+        />
+
+        {/* Attendance Snapshot Proof Lightbox */}
+        {attendancePhotoPreview && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+            onClick={() => setAttendancePhotoPreview(null)}
+          >
+            <div
+              className="w-full max-w-sm rounded-xl bg-white border border-slate-200 p-4 space-y-3 shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-900">{attendancePhotoPreview.title}</h3>
+                  <p className="text-xs text-slate-500">{attendancePhotoPreview.subtitle}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setAttendancePhotoPreview(null)}
+                  className="p-1 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <img
+                src={attendancePhotoPreview.src}
+                alt={attendancePhotoPreview.title}
+                className="w-full rounded-lg border border-slate-200 object-cover"
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Start New Payroll Run Modal */}
+        {showPayrollModal && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4"
+            onClick={() => setShowPayrollModal(false)}
+          >
+            <form
+              onClick={(e) => e.stopPropagation()}
+              onSubmit={async (e) => {
+                e.preventDefault();
+                setPayrollModalErr('');
+                setRunningPayroll(true);
+                try {
+                  const r = await apiFetch('/hr/payroll/run', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                      periodStart: payrollForm.periodStart,
+                      periodEnd: payrollForm.periodEnd,
+                      daysPerEmployee: Number(payrollForm.daysPerEmployee || 13),
+                      useAttendanceDays: payrollForm.useAttendanceDays,
+                    }),
+                  });
+                  setUseAttendanceDays(payrollForm.useAttendanceDays);
+                  setShowPayrollModal(false);
+                  setMsg(
+                    `Payroll Run posted (${payrollForm.periodStart} to ${payrollForm.periodEnd}) · Gross: ${formatPHP(r.totalGross)} · Net: ${formatPHP(r.totalNet)}`,
+                  );
+                  await loadHr();
+                } catch (err: any) {
+                  setPayrollModalErr(err.message || 'Unable to post payroll run');
+                } finally {
+                  setRunningPayroll(false);
+                }
+              }}
+              className="w-full max-w-md rounded-xl bg-white p-5 border border-slate-200 shadow-2xl space-y-4"
+            >
+              <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                <div>
+                  <h3 className="font-display text-base font-semibold text-slate-900">Start New Payroll Run</h3>
+                  <p className="text-xs text-slate-500">Compute gross pay, SSS, PhilHealth, Pag-IBIG &amp; net pay</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowPayrollModal(false)}
+                  className="p-1 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {payrollModalErr && (
+                <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">
+                  {payrollModalErr}
+                </div>
+              )}
+
+              <div className="grid grid-cols-2 gap-3 text-xs">
+                <div>
+                  <label className="block font-medium text-slate-700 mb-1">Period Start *</label>
+                  <input
+                    type="date"
+                    required
+                    value={payrollForm.periodStart}
+                    onChange={(e) => setPayrollForm((f) => ({ ...f, periodStart: e.target.value }))}
+                    className="w-full rounded-lg border border-slate-200 px-3 py-2 font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block font-medium text-slate-700 mb-1">Period End *</label>
+                  <input
+                    type="date"
+                    required
+                    value={payrollForm.periodEnd}
+                    onChange={(e) => setPayrollForm((f) => ({ ...f, periodEnd: e.target.value }))}
+                    className="w-full rounded-lg border border-slate-200 px-3 py-2 font-mono"
+                  />
+                </div>
+                <div className="col-span-2">
+                  <label className="flex items-center gap-2 cursor-pointer select-none py-1">
+                    <input
+                      type="checkbox"
+                      checked={payrollForm.useAttendanceDays}
+                      onChange={(e) => setPayrollForm((f) => ({ ...f, useAttendanceDays: e.target.checked }))}
+                      className="rounded border-slate-300 text-slate-900 focus:ring-slate-900"
+                    />
+                    <span className="font-medium text-slate-700">Calculate worked days from logged Attendance punches</span>
+                  </label>
+                </div>
+                {!payrollForm.useAttendanceDays && (
+                  <div className="col-span-2">
+                    <label className="block font-medium text-slate-700 mb-1">Fixed Days per Employee</label>
+                    <input
+                      type="number"
+                      min="1"
+                      max="31"
+                      required
+                      value={payrollForm.daysPerEmployee}
+                      onChange={(e) => setPayrollForm((f) => ({ ...f, daysPerEmployee: e.target.value }))}
+                      className="w-full rounded-lg border border-slate-200 px-3 py-2 font-mono"
+                    />
+                  </div>
+                )}
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setShowPayrollModal(false)}
+                  className="px-4 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={runningPayroll}
+                  className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-50"
+                >
+                  {runningPayroll ? 'Posting Payroll...' : 'Post Payroll Run'}
+                </button>
+              </div>
+            </form>
           </div>
         )}
       </div>

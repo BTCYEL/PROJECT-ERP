@@ -43,6 +43,7 @@ export interface AuthUser {
   permissions: string[];
   assignedLocationId?: string | null;
   avatarUrl?: string | null;
+  hasPin?: boolean;
 }
 
 export interface LocationRow {
@@ -53,4 +54,5 @@ export interface LocationRow {
   address: string;
   is_active: number;
   kds_enabled?: number;
+  daily_sales_target?: number;
 }

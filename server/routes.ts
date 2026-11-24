@@ -133,17 +133,65 @@ export const apiRouter = Router();
 // ==========================================
 // 1. AUTHENTICATION & SESSIONS
 // ==========================================
+const MAX_FAILED_ATTEMPTS = 5;
+const LOCKOUT_MS = 5 * 60 * 1000;
+
+function checkSqlLockout(user: any): string | null {
+  if (!user?.locked_until) return null;
+  const until = new Date(user.locked_until).getTime();
+  if (!Number.isFinite(until) || until <= Date.now()) return null;
+  const secs = Math.max(1, Math.ceil((until - Date.now()) / 1000));
+  const mins = Math.floor(secs / 60);
+  const rem = secs % 60;
+  return mins > 0 ? `${mins}m ${rem}s` : `${rem}s`;
+}
+
+function recordSqlFailure(user: any, action: string): { locked: boolean; remaining: number } {
+  const next = Number(user.failed_login_attempts || 0) + 1;
+  const locked = next >= MAX_FAILED_ATTEMPTS;
+  const lockedUntil = locked ? new Date(Date.now() + LOCKOUT_MS).toISOString() : null;
+  db.prepare('UPDATE users SET failed_login_attempts = ?, locked_until = ? WHERE id = ?').run(
+    locked ? MAX_FAILED_ATTEMPTS : next,
+    lockedUntil,
+    user.id,
+  );
+  writeAuditLog(user.id, user.full_name, locked ? 'ACCOUNT_LOCKED' : action, 'User', user.id, {
+    attempts: next,
+    lockedUntil,
+  });
+  return { locked, remaining: Math.max(0, MAX_FAILED_ATTEMPTS - next) };
+}
+
+function clearSqlFailures(userId: string) {
+  db.prepare('UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = ?').run(userId);
+}
+
 apiRouter.post('/auth/login', (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) {
-    res.status(400).json({ error: 'Email and password are required' });
+    res.status(400).json({ error: 'Work email and password are required' });
     return;
   }
-  const user = db.prepare('SELECT id, password_hash, full_name FROM users WHERE lower(email) = lower(?)').get(email) as any;
-  if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+  const user = db.prepare('SELECT id, password_hash, full_name, failed_login_attempts, locked_until, is_active FROM users WHERE lower(email) = lower(?) AND is_active = 1').get(email) as any;
+  if (!user) {
     res.status(401).json({ error: 'Invalid email or password' });
     return;
   }
+  const lockLeft = checkSqlLockout(user);
+  if (lockLeft) {
+    res.status(423).json({ error: `Account temporarily locked. Try again in ${lockLeft} or ask an Owner/Admin to unlock.` });
+    return;
+  }
+  if (!bcrypt.compareSync(password, user.password_hash)) {
+    const fail = recordSqlFailure(user, 'LOGIN_FAILED');
+    res.status(fail.locked ? 423 : 401).json({
+      error: fail.locked
+        ? 'Too many failed attempts. Account locked for 5 minutes.'
+        : `Invalid email or password. (${fail.remaining} attempt${fail.remaining === 1 ? '' : 's'} left before 5m lockout)`,
+    });
+    return;
+  }
+  clearSqlFailures(user.id);
   const token = randomUUID();
   db.prepare("INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, datetime('now', '+7 days'))").run(token, user.id);
   const authUser = loadUserWithPermissions(user.id);
@@ -151,29 +199,109 @@ apiRouter.post('/auth/login', (req, res) => {
   res.json({ token, user: authUser });
 });
 
-apiRouter.post('/auth/demo-switch', (req, res) => {
-  const { userId } = req.body || {};
-  const authUser = loadUserWithPermissions(userId);
-  if (!authUser) {
-    res.status(404).json({ error: 'User not found' });
+apiRouter.post('/auth/pin-login', (req, res) => {
+  const { userId, pin } = req.body || {};
+  if (!userId || !/^\d{4,6}$/.test(String(pin || '').trim())) {
+    res.status(400).json({ error: 'Operator and 4–6 digit Shift PIN are required' });
     return;
   }
+  const user = db.prepare('SELECT id, full_name, shift_pin_hash, failed_login_attempts, locked_until FROM users WHERE id = ? AND is_active = 1').get(userId) as any;
+  if (!user) {
+    res.status(404).json({ error: 'Operator account not found or inactive' });
+    return;
+  }
+  const lockLeft = checkSqlLockout(user);
+  if (lockLeft) {
+    res.status(423).json({ error: `Operator locked for ${lockLeft} due to repeated failed attempts.` });
+    return;
+  }
+  if (!user.shift_pin_hash) {
+    res.status(400).json({ error: `No Shift PIN is configured for ${user.full_name}. Use Work Email & Password.` });
+    return;
+  }
+  if (!bcrypt.compareSync(String(pin).trim(), user.shift_pin_hash)) {
+    const fail = recordSqlFailure(user, 'PIN_LOGIN_FAILED');
+    res.status(fail.locked ? 423 : 401).json({
+      error: fail.locked
+        ? 'Too many failed attempts. Account locked for 5 minutes.'
+        : `Incorrect Shift PIN. (${fail.remaining} attempt${fail.remaining === 1 ? '' : 's'} left before 5m lockout)`,
+    });
+    return;
+  }
+  clearSqlFailures(user.id);
   const token = randomUUID();
-  db.prepare("INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, datetime('now', '+7 days'))").run(token, authUser.id);
-  writeAuditLog(authUser.id, authUser.fullName, 'ROLE_SWITCH', 'User', authUser.id, { role: authUser.roleCode });
+  db.prepare("INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, datetime('now', '+7 days'))").run(token, user.id);
+  const authUser = loadUserWithPermissions(user.id);
+  writeAuditLog(user.id, user.full_name, 'PIN_LOGIN', 'Session', token.slice(0, 8), { role: authUser?.roleCode });
   res.json({ token, user: authUser });
 });
 
-apiRouter.get('/auth/demo-accounts', (_req, res) => {
+apiRouter.post('/auth/unlock', authMiddleware, (req, res) => {
+  const { userId, mode, secret } = req.body || {};
+  const user = db.prepare('SELECT id, full_name, password_hash, shift_pin_hash, failed_login_attempts, locked_until FROM users WHERE id = ? AND is_active = 1').get(userId || req.authUser?.id) as any;
+  if (!user) {
+    res.status(404).json({ error: 'Operator account not found' });
+    return;
+  }
+  const lockLeft = checkSqlLockout(user);
+  if (lockLeft) {
+    res.status(423).json({ error: `Terminal locked for ${lockLeft} due to failed attempts.` });
+    return;
+  }
+  if (mode === 'pin') {
+    if (!user.shift_pin_hash) {
+      res.status(400).json({ error: 'No Shift PIN configured for this account' });
+      return;
+    }
+    if (!bcrypt.compareSync(String(secret || '').trim(), user.shift_pin_hash)) {
+      const fail = recordSqlFailure(user, 'UNLOCK_PIN_FAILED');
+      res.status(fail.locked ? 423 : 401).json({
+        error: fail.locked ? 'Too many failed attempts. Locked for 5 minutes.' : `Incorrect Shift PIN. (${fail.remaining} attempts left)`,
+      });
+      return;
+    }
+  } else {
+    if (!secret || !bcrypt.compareSync(String(secret), user.password_hash)) {
+      const fail = recordSqlFailure(user, 'UNLOCK_FAILED');
+      res.status(fail.locked ? 423 : 401).json({
+        error: fail.locked ? 'Too many failed attempts. Locked for 5 minutes.' : `Incorrect password. (${fail.remaining} attempts left)`,
+      });
+      return;
+    }
+  }
+  clearSqlFailures(user.id);
+  const authUser = loadUserWithPermissions(user.id);
+  writeAuditLog(user.id, user.full_name, 'SESSION_UNLOCK', 'Session', user.id, { mode });
+  res.json({ ok: true, user: authUser });
+});
+
+apiRouter.get('/auth/operators', (_req, res) => {
   const rows = db
     .prepare(`
-      SELECT u.id, u.email, u.full_name, u.avatar_url, r.code AS role_code, r.name AS role_name
+      SELECT u.id, u.full_name, u.avatar_url, u.assigned_location_id, u.shift_pin_hash, u.locked_until,
+             r.code AS role_code, r.name AS role_name
       FROM users u JOIN roles r ON r.id = u.role_id
       WHERE u.is_active = 1
       ORDER BY CASE r.code WHEN 'SUPER_ADMIN' THEN 0 WHEN 'BUSINESS_OWNER' THEN 1 ELSE 2 END, u.full_name ASC
     `)
-    .all();
-  res.json(rows);
+    .all() as any[];
+  res.json(
+    rows.map((u) => {
+      const lockLeft = checkSqlLockout(u);
+      return {
+        id: u.id,
+        full_name: u.full_name,
+        avatar_url: u.avatar_url,
+        role_code: u.role_code,
+        role_name: u.role_name,
+        assigned_location_id: u.assigned_location_id || null,
+        has_pin: Boolean(u.shift_pin_hash),
+        is_locked: Boolean(lockLeft),
+        locked_until: lockLeft ? u.locked_until : null,
+        is_google_owner: false,
+      };
+    }),
+  );
 });
 
 apiRouter.get('/auth/me', authMiddleware, (req, res) => {
@@ -871,7 +999,48 @@ apiRouter.post('/inventory/reconcile', requirePerm(PERMISSIONS.INVENTORY_ADJUST)
 // 6. PROCUREMENT & SUPPLIERS (WORKFLOW B)
 // ==========================================
 apiRouter.get('/procurement', requirePerm(PERMISSIONS.PO_CREATE), (_req, res) => {
-  const suppliers = db.prepare('SELECT * FROM suppliers WHERE is_active = 1 ORDER BY name ASC').all();
+  const allSupplierRows = db.prepare('SELECT * FROM suppliers ORDER BY name ASC').all() as any[];
+  const supplierNameMap = new Map(allSupplierRows.map((s) => [s.id, s]));
+  const supplierAuditRows = db
+    .prepare("SELECT * FROM audit_logs WHERE entity_type = 'Supplier' ORDER BY created_at DESC LIMIT 200")
+    .all() as any[];
+
+  const latestBySupplier = new Map<string, any>();
+  const countBySupplier = new Map<string, number>();
+  for (const log of supplierAuditRows) {
+    if (!latestBySupplier.has(log.entity_id)) latestBySupplier.set(log.entity_id, log);
+    countBySupplier.set(log.entity_id, (countBySupplier.get(log.entity_id) || 0) + 1);
+  }
+
+  const suppliers = allSupplierRows
+    .filter((s) => Number(s.is_active) === 1)
+    .map((s) => {
+      const latest = latestBySupplier.get(s.id);
+      return {
+        ...s,
+        updated_at: s.updated_at || latest?.created_at || s.created_at || null,
+        updated_by: s.updated_by || latest?.user_id || null,
+        updated_by_name: s.updated_by_name || latest?.user_name || 'System Seed',
+        created_at: s.created_at || null,
+        audit_count: countBySupplier.get(s.id) || 0,
+      };
+    });
+
+  const supplierAuditLogs = supplierAuditRows.map((log) => {
+    const sup = supplierNameMap.get(log.entity_id);
+    return {
+      id: log.id,
+      supplier_id: log.entity_id,
+      supplier_name: sup?.name || 'Supplier',
+      supplier_code: sup?.code || '',
+      action: log.action,
+      user_id: log.user_id || null,
+      user_name: log.user_name || 'System',
+      details: log.details || '',
+      logged_at: log.created_at,
+    };
+  });
+
   const priceComparison = db
     .prepare(`
       SELECT si.*, s.name AS supplier_name, ii.name AS item_name, u.code AS uom_code
@@ -893,18 +1062,23 @@ apiRouter.get('/procurement', requirePerm(PERMISSIONS.PO_CREATE), (_req, res) =>
         ORDER BY po.ordered_at DESC
       `)
       .all() as any[]
-  ).map((po) => ({
-    ...po,
-    items: db
-      .prepare(`
-        SELECT poi.*, ii.name AS item_name, u.code AS uom_code
-        FROM purchase_order_items poi
-        JOIN inventory_items ii ON ii.id = poi.inventory_item_id
-        JOIN uoms u ON u.id = ii.base_uom_id
-        WHERE poi.purchase_order_id = ?
-      `)
-      .all(po.id),
-  }));
+  ).map((po) => {
+    const linkedInvs = db.prepare('SELECT status FROM supplier_invoices WHERE purchase_order_id = ?').all(po.id) as { status: string }[];
+    const allLinkedPaid = linkedInvs.length > 0 && linkedInvs.every((x) => x.status === 'PAID');
+    return {
+      ...po,
+      status: po.status === 'RECEIVED' && allLinkedPaid ? 'PAID' : po.status,
+      items: db
+        .prepare(`
+          SELECT poi.*, ii.name AS item_name, u.code AS uom_code
+          FROM purchase_order_items poi
+          JOIN inventory_items ii ON ii.id = poi.inventory_item_id
+          JOIN uoms u ON u.id = ii.base_uom_id
+          WHERE poi.purchase_order_id = ?
+        `)
+        .all(po.id),
+    };
+  });
 
   const invoices = db
     .prepare(`
@@ -915,7 +1089,28 @@ apiRouter.get('/procurement', requirePerm(PERMISSIONS.PO_CREATE), (_req, res) =>
     `)
     .all();
 
-  res.json({ suppliers, priceComparison, purchaseOrders, invoices });
+  const thresholdRow = db.prepare("SELECT value FROM app_settings WHERE key = 'po_approval_threshold'").get() as { value?: string } | undefined;
+  const parsedThreshold = Number(thresholdRow?.value);
+  const approvalThreshold = Number.isFinite(parsedThreshold) && parsedThreshold >= 0 ? round2(parsedThreshold) : 10000;
+
+  res.json({ approvalThreshold, suppliers, supplierAuditLogs, priceComparison, purchaseOrders, invoices });
+});
+
+apiRouter.put('/procurement/approval-config', requirePerm(PERMISSIONS.PO_APPROVE), (req, res) => {
+  try {
+    const raw = Number(req.body?.approvalThreshold);
+    if (!Number.isFinite(raw) || raw < 0) {
+      throw new Error('Approval threshold must be a valid non-negative amount');
+    }
+    const nextThreshold = round2(raw);
+    db.prepare("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('po_approval_threshold', ?)").run(String(nextThreshold));
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'UPDATE_PO_APPROVAL_THRESHOLD', 'PurchaseOrderConfig', 'po_approval_threshold', {
+      approvalThreshold: nextThreshold,
+    });
+    res.json({ ok: true, approvalThreshold: nextThreshold });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 apiRouter.post('/procurement/suppliers', requirePerm(PERMISSIONS.PO_CREATE), (req, res) => {
@@ -925,9 +1120,15 @@ apiRouter.post('/procurement/suppliers', requirePerm(PERMISSIONS.PO_CREATE), (re
     if (!cleanName) throw new Error('Supplier name is required');
     const id = randomUUID();
     const cleanCode = String(code || `SUP-${Date.now().toString().slice(-4)}`).trim();
-    db.prepare('INSERT INTO suppliers (id, code, name, contact_person, phone, email, address, tin, payment_terms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(id, cleanCode, cleanName, contactPerson || '', phone || '', email || '', address || '', tin || '', Math.max(0, Math.round(Number(paymentTerms || 0))));
-    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'CREATE_SUPPLIER', 'Supplier', id, { code: cleanCode, name: cleanName });
+    const nowIso = new Date().toISOString();
+    const cleanTerms = Math.max(0, Math.round(Number(paymentTerms || 0)));
+    db.prepare('INSERT INTO suppliers (id, code, name, contact_person, phone, email, address, tin, payment_terms, updated_by, updated_by_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(id, cleanCode, cleanName, contactPerson || '', phone || '', email || '', address || '', tin || '', cleanTerms, req.authUser!.id, req.authUser!.fullName, nowIso, nowIso);
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'CREATE_SUPPLIER', 'Supplier', id, {
+      code: cleanCode,
+      name: cleanName,
+      paymentTerms: `${cleanTerms} days`,
+    });
     res.status(201).json({ id });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -947,22 +1148,50 @@ apiRouter.put('/procurement/suppliers/:id', requirePerm(PERMISSIONS.PO_CREATE), 
     if (!cleanName) throw new Error('Supplier name is required');
     if (!cleanCode) throw new Error('Supplier code is required');
 
+    const nextContact = String(contactPerson ?? existing.contact_person ?? '').trim();
+    const nextPhone = String(phone ?? existing.phone ?? '').trim();
+    const nextEmail = String(email ?? existing.email ?? '').trim();
+    const nextAddress = String(address ?? existing.address ?? '').trim();
+    const nextTin = String(tin ?? existing.tin ?? '').trim();
+    const nextTerms = Math.max(0, Math.round(Number(paymentTerms ?? existing.payment_terms ?? 0)));
+    const nowIso = new Date().toISOString();
+
+    const changes: string[] = [];
+    if (cleanCode !== String(existing.code || '')) changes.push(`Code: ${existing.code || '—'} -> ${cleanCode}`);
+    if (cleanName !== String(existing.name || '')) changes.push(`Name: ${existing.name || '—'} -> ${cleanName}`);
+    if (nextContact !== String(existing.contact_person || '')) changes.push(`Contact: ${existing.contact_person || '—'} -> ${nextContact || '—'}`);
+    if (nextPhone !== String(existing.phone || '')) changes.push(`Phone: ${existing.phone || '—'} -> ${nextPhone || '—'}`);
+    if (nextEmail !== String(existing.email || '')) changes.push(`Email: ${existing.email || '—'} -> ${nextEmail || '—'}`);
+    if (nextAddress !== String(existing.address || '')) changes.push(`Address: ${existing.address || '—'} -> ${nextAddress || '—'}`);
+    if (nextTin !== String(existing.tin || '')) changes.push(`TIN: ${existing.tin || '—'} -> ${nextTin || '—'}`);
+    if (nextTerms !== Number(existing.payment_terms || 0)) changes.push(`Terms: ${existing.payment_terms || 0}d -> ${nextTerms}d`);
+
     db.prepare(`
       UPDATE suppliers
-      SET code = ?, name = ?, contact_person = ?, phone = ?, email = ?, address = ?, tin = ?, payment_terms = ?
+      SET code = ?, name = ?, contact_person = ?, phone = ?, email = ?, address = ?, tin = ?, payment_terms = ?, updated_by = ?, updated_by_name = ?, updated_at = ?
       WHERE id = ?
     `).run(
       cleanCode,
       cleanName,
-      contactPerson ?? existing.contact_person ?? '',
-      phone ?? existing.phone ?? '',
-      email ?? existing.email ?? '',
-      address ?? existing.address ?? '',
-      tin ?? existing.tin ?? '',
-      Math.max(0, Math.round(Number(paymentTerms ?? existing.payment_terms ?? 0))),
+      nextContact,
+      nextPhone,
+      nextEmail,
+      nextAddress,
+      nextTin,
+      nextTerms,
+      req.authUser!.id,
+      req.authUser!.fullName,
+      nowIso,
       existing.id,
     );
-    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'UPDATE_SUPPLIER', 'Supplier', existing.id, { code: cleanCode, name: cleanName });
+    writeAuditLog(
+      req.authUser!.id,
+      req.authUser!.fullName,
+      'UPDATE_SUPPLIER',
+      'Supplier',
+      existing.id,
+      changes.length > 0 ? changes.join(' | ') : `Reviewed supplier profile (${cleanName})`,
+    );
     res.json({ ok: true, id: existing.id });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -979,14 +1208,19 @@ apiRouter.delete('/procurement/suppliers/:id', requirePerm(PERMISSIONS.PO_CREATE
     const poRef = db.prepare('SELECT COUNT(*) AS cnt FROM purchase_orders WHERE supplier_id = ?').get(existing.id) as { cnt: number };
     const invRef = db.prepare('SELECT COUNT(*) AS cnt FROM supplier_invoices WHERE supplier_id = ?').get(existing.id) as { cnt: number };
     const hasHistory = (poRef?.cnt || 0) > 0 || (invRef?.cnt || 0) > 0;
+    const nowIso = new Date().toISOString();
 
     if (hasHistory) {
-      db.prepare('UPDATE suppliers SET is_active = 0 WHERE id = ?').run(existing.id);
+      db.prepare('UPDATE suppliers SET is_active = 0, updated_by = ?, updated_by_name = ?, updated_at = ? WHERE id = ?')
+        .run(req.authUser!.id, req.authUser!.fullName, nowIso, existing.id);
     } else {
       db.prepare('DELETE FROM supplier_items WHERE supplier_id = ?').run(existing.id);
       db.prepare('DELETE FROM suppliers WHERE id = ?').run(existing.id);
     }
-    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'DELETE_SUPPLIER', 'Supplier', existing.id, { name: existing.name, archived: hasHistory });
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'DELETE_SUPPLIER', 'Supplier', existing.id, {
+      name: existing.name,
+      archived: hasHistory,
+    });
     res.json({ ok: true, archived: hasHistory });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -995,31 +1229,264 @@ apiRouter.delete('/procurement/suppliers/:id', requirePerm(PERMISSIONS.PO_CREATE
 
 apiRouter.post('/procurement/purchase-orders', requirePerm(PERMISSIONS.PO_CREATE), (req, res) => {
   try {
-    const { supplierId, locationId, expectedAt, notes, items } = req.body;
+    const { supplierId, locationId, expectedAt, notes, items, status } = req.body;
     if (!items?.length) throw new Error('PO requires at least one item');
-    const poId = randomUUID();
-    const poNumber = `PO-${Date.now().toString().slice(-6)}`;
+    const requestedStatus = String(status || 'PENDING_APPROVAL').toUpperCase();
+    if (!['DRAFT', 'PENDING_APPROVAL', 'APPROVED'].includes(requestedStatus)) {
+      throw new Error('Invalid initial purchase order status');
+    }
+    const thresholdRow = db.prepare("SELECT value FROM app_settings WHERE key = 'po_approval_threshold'").get() as { value?: string } | undefined;
+    const parsedThreshold = Number(thresholdRow?.value);
+    const approvalThreshold = Number.isFinite(parsedThreshold) && parsedThreshold >= 0 ? round2(parsedThreshold) : 10000;
     const totalAmount = round2(items.reduce((s: number, i: any) => s + Number(i.orderedQty) * Number(i.unitCost), 0));
 
+    if (requestedStatus === 'APPROVED') {
+      const canApprove =
+        req.authUser!.roleCode === 'SUPER_ADMIN' ||
+        req.authUser!.roleCode === 'BUSINESS_OWNER' ||
+        req.authUser!.permissions.includes(PERMISSIONS.PO_APPROVE);
+      if (!canApprove) {
+        res.status(403).json({ error: 'Insufficient permission to approve purchase orders' });
+        return;
+      }
+      if (totalAmount > approvalThreshold) {
+        throw new Error(
+          `Order total (${totalAmount.toFixed(2)}) exceeds the ${approvalThreshold.toFixed(2)} threshold. Submit for Stage 1 verification and Stage 2 Manager Digital Signature.`,
+        );
+      }
+    }
+
+    const poId = randomUUID();
+    const poNumber = `PO-${Date.now().toString().slice(-6)}`;
+
     db.transaction(() => {
-      db.prepare('INSERT INTO purchase_orders (id, po_number, supplier_id, location_id, status, total_amount, notes, expected_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(poId, poNumber, supplierId, locationId, 'PENDING_APPROVAL', totalAmount, notes || '', expectedAt || null);
+      db.prepare('INSERT INTO purchase_orders (id, po_number, supplier_id, location_id, status, total_amount, approved_by, notes, expected_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(
+          poId,
+          poNumber,
+          supplierId,
+          locationId,
+          requestedStatus,
+          totalAmount,
+          requestedStatus === 'APPROVED' ? req.authUser!.id : null,
+          notes || '',
+          expectedAt || null,
+        );
       const ins = db.prepare('INSERT INTO purchase_order_items (id, purchase_order_id, inventory_item_id, ordered_qty, unit_cost) VALUES (?, ?, ?, ?, ?)');
       for (const i of items) {
         ins.run(randomUUID(), poId, i.inventoryItemId, Number(i.orderedQty), Number(i.unitCost));
       }
-      writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'CREATE_PO', 'PurchaseOrder', poId, { poNumber, totalAmount });
+      writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'CREATE_PO', 'PurchaseOrder', poId, {
+        poNumber,
+        totalAmount,
+        status: requestedStatus,
+      });
     })();
-    res.status(201).json({ id: poId, poNumber });
+    res.status(201).json({ id: poId, poNumber, status: requestedStatus });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.put('/procurement/purchase-orders/:id', (req, res) => {
+  try {
+    const po = db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(req.params.id) as any;
+    if (!po) {
+      res.status(404).json({ error: 'Purchase order not found' });
+      return;
+    }
+
+    const { supplierId, locationId, expectedAt, notes, items, approve, status } = req.body || {};
+    const requestedStatus = status ? String(status).toUpperCase() : undefined;
+
+    if (requestedStatus === 'PAID' && (po.status === 'RECEIVED' || po.status === 'PARTIAL' || po.status === 'PARTIALLY_RECEIVED')) {
+      const canFinance =
+        req.authUser!.roleCode === 'SUPER_ADMIN' ||
+        req.authUser!.roleCode === 'BUSINESS_OWNER' ||
+        req.authUser!.permissions.includes(PERMISSIONS.FINANCE_VIEW) ||
+        req.authUser!.permissions.includes(PERMISSIONS.PO_APPROVE);
+      if (!canFinance) {
+        res.status(403).json({ error: 'Insufficient permission to mark purchase order as paid' });
+        return;
+      }
+      db.prepare("UPDATE purchase_orders SET status = 'PAID' WHERE id = ?").run(po.id);
+      writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'MARK_PO_PAID', 'PurchaseOrder', po.id, { poNumber: po.po_number });
+      res.json({ ok: true, id: po.id, poNumber: po.po_number, status: 'PAID', totalAmount: po.total_amount });
+      return;
+    }
+
+    if (po.status !== 'DRAFT' && po.status !== 'PENDING_APPROVAL') {
+      throw new Error('Only draft or pending purchase orders can be edited');
+    }
+    if (!supplierId || !locationId) throw new Error('Supplier and delivery location are required');
+    if (!Array.isArray(items) || items.length === 0) throw new Error('PO requires at least one item');
+
+    const thresholdRow = db.prepare("SELECT value FROM app_settings WHERE key = 'po_approval_threshold'").get() as { value?: string } | undefined;
+    const parsedThreshold = Number(thresholdRow?.value);
+    const approvalThreshold = Number.isFinite(parsedThreshold) && parsedThreshold >= 0 ? round2(parsedThreshold) : 10000;
+    const totalAmount = round2(items.reduce((s: number, i: any) => s + Number(i.orderedQty) * Number(i.unitCost), 0));
+    const wantsApproval = Boolean(approve) || requestedStatus === 'APPROVED' || requestedStatus === 'PENDING_MANAGER_SIGNATURE';
+
+    if (wantsApproval) {
+      const canApprove =
+        req.authUser!.roleCode === 'SUPER_ADMIN' ||
+        req.authUser!.roleCode === 'BUSINESS_OWNER' ||
+        req.authUser!.permissions.includes(PERMISSIONS.PO_APPROVE);
+      if (!canApprove) {
+        res.status(403).json({ error: 'Insufficient permission to approve purchase orders' });
+        return;
+      }
+    }
+
+    const requiresSignature = wantsApproval && totalAmount > approvalThreshold;
+    const nextStatus = wantsApproval
+      ? requiresSignature
+        ? 'PENDING_MANAGER_SIGNATURE'
+        : 'APPROVED'
+      : requestedStatus === 'DRAFT'
+        ? 'DRAFT'
+        : 'PENDING_APPROVAL';
+    const nowIso = new Date().toISOString();
+
+    db.transaction(() => {
+      db.prepare(`
+        UPDATE purchase_orders
+        SET supplier_id = ?, location_id = ?, status = ?, total_amount = ?,
+            approved_by = COALESCE(?, approved_by),
+            stage1_approved_by = COALESCE(?, stage1_approved_by),
+            stage1_approved_by_name = COALESCE(?, stage1_approved_by_name),
+            stage1_approved_at = COALESCE(?, stage1_approved_at),
+            notes = ?, expected_at = ?
+        WHERE id = ?
+      `).run(
+        supplierId,
+        locationId,
+        nextStatus,
+        totalAmount,
+        nextStatus === 'APPROVED' ? req.authUser!.id : null,
+        nextStatus === 'PENDING_MANAGER_SIGNATURE' ? req.authUser!.id : null,
+        nextStatus === 'PENDING_MANAGER_SIGNATURE' ? req.authUser!.fullName : null,
+        nextStatus === 'PENDING_MANAGER_SIGNATURE' ? nowIso : null,
+        notes || '',
+        expectedAt || null,
+        po.id,
+      );
+      db.prepare('DELETE FROM purchase_order_items WHERE purchase_order_id = ?').run(po.id);
+      const ins = db.prepare('INSERT INTO purchase_order_items (id, purchase_order_id, inventory_item_id, ordered_qty, unit_cost) VALUES (?, ?, ?, ?, ?)');
+      for (const i of items) {
+        ins.run(String(i.id || randomUUID()), po.id, i.inventoryItemId, Number(i.orderedQty), Number(i.unitCost));
+      }
+      writeAuditLog(
+        req.authUser!.id,
+        req.authUser!.fullName,
+        nextStatus === 'PENDING_MANAGER_SIGNATURE'
+          ? 'STAGE1_APPROVE_PO'
+          : nextStatus === 'APPROVED'
+            ? 'REVIEW_AND_APPROVE_PO'
+            : 'EDIT_PO',
+        'PurchaseOrder',
+        po.id,
+        { poNumber: po.po_number, totalAmount, status: nextStatus },
+      );
+    })();
+    res.json({ ok: true, id: po.id, poNumber: po.po_number, status: nextStatus, requiresSignature, totalAmount });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
 
 apiRouter.post('/procurement/purchase-orders/:id/approve', requirePerm(PERMISSIONS.PO_APPROVE), (req, res) => {
-  db.prepare("UPDATE purchase_orders SET status = 'APPROVED', approved_by = ? WHERE id = ?").run(req.authUser!.id, req.params.id);
-  writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'APPROVE_PO', 'PurchaseOrder', req.params.id);
-  res.json({ ok: true });
+  try {
+    const po = db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(req.params.id) as any;
+    if (!po) {
+      res.status(404).json({ error: 'Purchase order not found' });
+      return;
+    }
+
+    const thresholdRow = db.prepare("SELECT value FROM app_settings WHERE key = 'po_approval_threshold'").get() as { value?: string } | undefined;
+    const parsedThreshold = Number(thresholdRow?.value);
+    const approvalThreshold = Number.isFinite(parsedThreshold) && parsedThreshold >= 0 ? round2(parsedThreshold) : 10000;
+    const totalAmount = round2(Number(po.total_amount || 0));
+    const nowIso = new Date().toISOString();
+
+    if (po.status === 'DRAFT' || po.status === 'PENDING_APPROVAL') {
+      if (totalAmount > approvalThreshold) {
+        db.prepare(`
+          UPDATE purchase_orders
+          SET status = 'PENDING_MANAGER_SIGNATURE', stage1_approved_by = ?, stage1_approved_by_name = ?, stage1_approved_at = ?
+          WHERE id = ?
+        `).run(req.authUser!.id, req.authUser!.fullName, nowIso, po.id);
+        writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'STAGE1_APPROVE_PO', 'PurchaseOrder', po.id, {
+          poNumber: po.po_number,
+          totalAmount,
+          approvalThreshold,
+        });
+        res.json({ ok: true, status: 'PENDING_MANAGER_SIGNATURE', requiresSignature: true });
+        return;
+      }
+
+      db.prepare("UPDATE purchase_orders SET status = 'APPROVED', approved_by = ? WHERE id = ?").run(req.authUser!.id, po.id);
+      writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'APPROVE_PO', 'PurchaseOrder', po.id, {
+        poNumber: po.po_number,
+        totalAmount,
+      });
+      res.json({ ok: true, status: 'APPROVED', requiresSignature: false });
+      return;
+    }
+
+    if (po.status === 'PENDING_MANAGER_SIGNATURE') {
+      const signatureData = String(req.body?.signatureData || '').trim();
+      const signerName = String(req.body?.signerName || req.authUser!.fullName || '').trim().slice(0, 150);
+      if (!signatureData.startsWith('data:image/') || signatureData.length < 30 || signatureData.length > 200000) {
+        throw new Error('A valid drawn manager digital signature is required for this purchase order');
+      }
+      if (!signerName) {
+        throw new Error('Manager signer name is required');
+      }
+      db.prepare(`
+        UPDATE purchase_orders
+        SET status = 'APPROVED', approved_by = ?, manager_signature_data = ?, manager_signer_name = ?, signed_at = ?
+        WHERE id = ?
+      `).run(req.authUser!.id, signatureData, signerName, nowIso, po.id);
+      writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'STAGE2_SIGN_APPROVE_PO', 'PurchaseOrder', po.id, {
+        poNumber: po.po_number,
+        signerName,
+        totalAmount,
+        signedAt: nowIso,
+      });
+      res.json({ ok: true, status: 'APPROVED', signedAt: nowIso });
+      return;
+    }
+
+    res.status(400).json({ error: 'Only draft, pending approval, or signature-pending purchase orders can be approved' });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/procurement/purchase-orders/:id/cancel', requirePerm(PERMISSIONS.PO_CREATE), (req, res) => {
+  try {
+    const po = db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(req.params.id) as any;
+    if (!po) {
+      res.status(404).json({ error: 'Purchase order not found' });
+      return;
+    }
+    if (po.status !== 'DRAFT' && po.status !== 'PENDING_APPROVAL' && po.status !== 'PENDING_MANAGER_SIGNATURE' && po.status !== 'APPROVED') {
+      throw new Error('Only draft, pending, signature-pending, or unreceived approved purchase orders can be cancelled');
+    }
+    const items = db.prepare('SELECT received_qty FROM purchase_order_items WHERE purchase_order_id = ?').all(po.id) as any[];
+    if (items.some((x) => Number(x.received_qty || 0) > 0)) {
+      throw new Error('Cannot cancel a purchase order that already has received goods');
+    }
+    const reason = String(req.body?.reason || '').trim();
+    const cancelNote = reason ? `Cancelled: ${reason}` : 'Cancelled by user';
+    const nextNotes = po.notes ? `${po.notes} | ${cancelNote}` : cancelNote;
+    db.prepare("UPDATE purchase_orders SET status = 'CANCELLED', notes = ? WHERE id = ?").run(nextNotes, po.id);
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'CANCEL_PO', 'PurchaseOrder', po.id, { poNumber: po.po_number, reason: reason || null });
+    res.json({ ok: true, id: po.id, status: 'CANCELLED' });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 apiRouter.post('/procurement/purchase-orders/:id/receive', requirePerm(PERMISSIONS.GRN_RECEIVE), (req, res) => {
@@ -1111,8 +1578,17 @@ apiRouter.post('/procurement/invoices/:id/pay', requirePerm(PERMISSIONS.FINANCE_
       const payNo = `PAY-${Date.now().toString().slice(-6)}`;
       db.prepare('INSERT INTO supplier_payments (id, payment_number, supplier_invoice_id, amount, method, reference_no, paid_by) VALUES (?, ?, ?, ?, ?, ?, ?)')
         .run(randomUUID(), payNo, inv.id, payAmt, req.body.method || 'BANK_TRANSFER', req.body.referenceNo || '', req.authUser!.id);
+      const nextInvStatus = newPaid >= inv.total_amount ? 'PAID' : 'PARTIAL';
       db.prepare('UPDATE supplier_invoices SET paid_amount = ?, status = ? WHERE id = ?')
-        .run(newPaid, newPaid >= inv.total_amount ? 'PAID' : 'PARTIAL', inv.id);
+        .run(newPaid, nextInvStatus, inv.id);
+
+      if (nextInvStatus === 'PAID' && inv.purchase_order_id) {
+        const linkedPo = db.prepare('SELECT status FROM purchase_orders WHERE id = ?').get(inv.purchase_order_id) as { status: string } | undefined;
+        const poInvs = db.prepare('SELECT status FROM supplier_invoices WHERE purchase_order_id = ?').all(inv.purchase_order_id) as { status: string }[];
+        if (linkedPo?.status === 'RECEIVED' && poInvs.length > 0 && poInvs.every((x) => x.status === 'PAID')) {
+          db.prepare("UPDATE purchase_orders SET status = 'PAID' WHERE id = ?").run(inv.purchase_order_id);
+        }
+      }
 
       const jeId = randomUUID();
       db.prepare('INSERT INTO journal_entries (id, entry_number, entry_date, description, reference_type, reference_id) VALUES (?, ?, ?, ?, ?, ?)')
@@ -1339,13 +1815,14 @@ apiRouter.get('/fleet', requirePerm(PERMISSIONS.FLEET_MANAGE), (_req, res) => {
 
 apiRouter.post('/fleet/trucks', requirePerm(PERMISSIONS.FLEET_MANAGE), (req, res) => {
   try {
-    const { code, name, type, address, plateNumber, makeModel, currentSite, odometerKm, status, kdsEnabled } = req.body;
+    const { code, name, type, address, plateNumber, makeModel, currentSite, odometerKm, status, kdsEnabled, dailySalesTarget } = req.body;
     const locType = type === 'COMMISSARY' ? 'COMMISSARY' : 'FOOD_TRUCK';
     const nextKds = kdsEnabled !== undefined ? (kdsEnabled ? 1 : 0) : (locType === 'FOOD_TRUCK' ? 1 : 0);
+    const nextTarget = Math.max(0, Number(dailySalesTarget ?? (locType === 'FOOD_TRUCK' ? 15000 : 5000)) || 0);
     const locId = randomUUID();
     const trkId = locType === 'FOOD_TRUCK' ? randomUUID() : null;
     db.transaction(() => {
-      db.prepare('INSERT INTO locations (id, code, name, type, address, kds_enabled) VALUES (?, ?, ?, ?, ?, ?)').run(locId, code, name, locType, address || currentSite || '', nextKds);
+      db.prepare('INSERT INTO locations (id, code, name, type, address, kds_enabled, daily_sales_target) VALUES (?, ?, ?, ?, ?, ?, ?)').run(locId, code, name, locType, address || currentSite || '', nextKds, nextTarget);
       if (locType === 'FOOD_TRUCK' && trkId) {
         db.prepare('INSERT INTO food_trucks (id, location_id, plate_number, make_model, status, current_site, odometer_km) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
           trkId,
@@ -1372,12 +1849,13 @@ apiRouter.put('/fleet/locations/:id', requirePerm(PERMISSIONS.FLEET_MANAGE), (re
       res.status(404).json({ error: 'Location not found' });
       return;
     }
-    const { code, name, type, address, plateNumber, makeModel, currentSite, odometerKm, status, kdsEnabled } = req.body || {};
+    const { code, name, type, address, plateNumber, makeModel, currentSite, odometerKm, status, kdsEnabled, dailySalesTarget } = req.body || {};
     const nextType = type === 'COMMISSARY' || type === 'FOOD_TRUCK' ? type : existingLoc.type;
     const nextKds = kdsEnabled !== undefined ? (kdsEnabled ? 1 : 0) : existingLoc.kds_enabled;
+    const nextTarget = dailySalesTarget !== undefined ? Math.max(0, Number(dailySalesTarget) || 0) : Number(existingLoc.daily_sales_target || 0);
     db.transaction(() => {
-      db.prepare('UPDATE locations SET code = ?, name = ?, type = ?, address = ?, kds_enabled = ? WHERE id = ?')
-        .run(code ?? existingLoc.code, name ?? existingLoc.name, nextType, address ?? existingLoc.address ?? '', nextKds, existingLoc.id);
+      db.prepare('UPDATE locations SET code = ?, name = ?, type = ?, address = ?, kds_enabled = ?, daily_sales_target = ? WHERE id = ?')
+        .run(code ?? existingLoc.code, name ?? existingLoc.name, nextType, address ?? existingLoc.address ?? '', nextKds, nextTarget, existingLoc.id);
       if (nextType === 'FOOD_TRUCK') {
         const existingTrk = db.prepare('SELECT * FROM food_trucks WHERE location_id = ?').get(existingLoc.id) as any;
         if (existingTrk) {
@@ -1409,6 +1887,26 @@ apiRouter.patch('/fleet/locations/:id/kds', requirePerm(PERMISSIONS.FLEET_MANAGE
   db.prepare('UPDATE locations SET kds_enabled = ? WHERE id = ?').run(nextKds, existingLoc.id);
   writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'TOGGLE_LOCATION_KDS', 'Location', existingLoc.id, { kdsEnabled: Boolean(nextKds) });
   res.json({ ok: true, id: existingLoc.id, kds_enabled: nextKds });
+});
+
+apiRouter.patch('/fleet/locations/:id/target', requirePerm(PERMISSIONS.FLEET_MANAGE), (req, res) => {
+  const existingLoc = db.prepare('SELECT * FROM locations WHERE id = ?').get(req.params.id) as any;
+  if (!existingLoc) {
+    res.status(404).json({ error: 'Location not found' });
+    return;
+  }
+  const rawTarget = Number(req.body?.dailySalesTarget);
+  if (!Number.isFinite(rawTarget) || rawTarget < 0) {
+    res.status(400).json({ error: 'Daily sales target must be a valid non-negative amount' });
+    return;
+  }
+  const nextTarget = Math.round(rawTarget * 100) / 100;
+  db.prepare('UPDATE locations SET daily_sales_target = ? WHERE id = ?').run(nextTarget, existingLoc.id);
+  writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'UPDATE_LOCATION_SALES_TARGET', 'Location', existingLoc.id, {
+    name: existingLoc.name,
+    dailySalesTarget: nextTarget,
+  });
+  res.json({ ok: true, id: existingLoc.id, daily_sales_target: nextTarget });
 });
 
 apiRouter.post('/fleet/assignments', requirePerm(PERMISSIONS.FLEET_MANAGE), (req, res) => {
@@ -1454,13 +1952,61 @@ apiRouter.post('/fleet/maintenance', requirePerm(PERMISSIONS.FLEET_MANAGE), (req
 // ==========================================
 // 10. HR, ATTENDANCE & CONFIGURABLE PH PAYROLL
 // ==========================================
+apiRouter.get('/attendance/kiosk', (_req, res) => {
+  const employees = db
+    .prepare(
+      `SELECT e.id, e.employee_code, e.full_name, e.department, e.position, e.location_id,
+              e.avatar_url, e.face_descriptor_json, e.face_enrolled_at,
+              CASE WHEN e.attendance_pin IS NOT NULL AND trim(e.attendance_pin) != '' THEN 1 ELSE 0 END AS has_pin,
+              e.is_active, l.name AS location_name
+       FROM employees e
+       LEFT JOIN locations l ON l.id = e.location_id
+       ORDER BY e.employee_code ASC`,
+    )
+    .all();
+  const attendance = db
+    .prepare(`
+      SELECT a.id, a.employee_id, a.clock_in, a.clock_out, a.worked_hours, a.overtime_hours,
+             a.status, a.verification_method, a.match_confidence, a.clock_in_photo, a.clock_out_photo,
+             e.full_name, e.employee_code, e.avatar_url AS employee_avatar_url,
+             COALESCE(a.location_id, e.location_id) AS resolved_location_id,
+             COALESCE(l.name, el.name, 'Commissary HQ') AS location_name
+      FROM attendance_logs a
+      JOIN employees e ON e.id = a.employee_id
+      LEFT JOIN locations l ON l.id = a.location_id
+      LEFT JOIN locations el ON el.id = e.location_id
+      ORDER BY a.clock_in DESC
+      LIMIT 60
+    `)
+    .all()
+    .map((row: any) => ({
+      ...row,
+      location_id: row.resolved_location_id || null,
+    }));
+  res.json({ employees, attendance });
+});
+
 apiRouter.get('/hr', requirePerm(PERMISSIONS.HR_MANAGE), (_req, res) => {
   const employees = db
     .prepare('SELECT e.*, l.name AS location_name FROM employees e LEFT JOIN locations l ON l.id = e.location_id ORDER BY e.employee_code ASC')
     .all();
   const attendance = db
-    .prepare('SELECT a.*, e.full_name, e.employee_code FROM attendance_logs a JOIN employees e ON e.id = a.employee_id ORDER BY a.clock_in DESC LIMIT 40')
-    .all();
+    .prepare(`
+      SELECT a.*, e.full_name, e.employee_code, e.avatar_url AS employee_avatar_url,
+             COALESCE(a.location_id, e.location_id) AS resolved_location_id,
+             COALESCE(l.name, el.name, 'Commissary HQ') AS location_name
+      FROM attendance_logs a
+      JOIN employees e ON e.id = a.employee_id
+      LEFT JOIN locations l ON l.id = a.location_id
+      LEFT JOIN locations el ON el.id = e.location_id
+      ORDER BY a.clock_in DESC
+      LIMIT 60
+    `)
+    .all()
+    .map((row: any) => ({
+      ...row,
+      location_id: row.resolved_location_id || null,
+    }));
   const rules = db.prepare('SELECT * FROM payroll_rules WHERE is_active = 1').get() as any;
   const payrollRuns = (db.prepare('SELECT * FROM payroll_runs ORDER BY created_at DESC LIMIT 10').all() as any[]).map((pr) => ({
     ...pr,
@@ -1478,10 +2024,39 @@ apiRouter.get('/hr', requirePerm(PERMISSIONS.HR_MANAGE), (_req, res) => {
 
 apiRouter.post('/hr/employees', requirePerm(PERMISSIONS.HR_MANAGE), (req, res) => {
   try {
-    const { employeeCode, fullName, department, position, locationId, payType, baseRate, avatarUrl, isActive } = req.body;
+    const {
+      employeeCode,
+      fullName,
+      department,
+      position,
+      locationId,
+      payType,
+      baseRate,
+      avatarUrl,
+      faceDescriptorJson,
+      faceEnrolledAt,
+      attendancePin,
+      isActive,
+    } = req.body;
     const id = randomUUID();
-    db.prepare('INSERT INTO employees (id, employee_code, full_name, department, position, location_id, pay_type, base_rate, avatar_url, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(id, employeeCode || `EMP-${Date.now().toString().slice(-3)}`, fullName, department, position, locationId || null, payType || 'DAILY', Number(baseRate), avatarUrl || null, isActive !== false ? 1 : 0);
+    const cleanPin = attendancePin ? String(attendancePin).trim().slice(0, 12) : null;
+    db.prepare(
+      'INSERT INTO employees (id, employee_code, full_name, department, position, location_id, pay_type, base_rate, avatar_url, face_descriptor_json, face_enrolled_at, attendance_pin, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run(
+      id,
+      employeeCode || `EMP-${Date.now().toString().slice(-3)}`,
+      fullName,
+      department,
+      position,
+      locationId || null,
+      payType || 'DAILY',
+      Number(baseRate),
+      avatarUrl || null,
+      faceDescriptorJson || null,
+      faceEnrolledAt || (faceDescriptorJson ? new Date().toISOString() : null),
+      cleanPin,
+      isActive !== false ? 1 : 0,
+    );
     res.status(201).json({ id });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -1497,7 +2072,20 @@ apiRouter.put('/hr/employees/:id', requirePerm(PERMISSIONS.HR_MANAGE), (req, res
       return;
     }
 
-    const { employeeCode, fullName, department, position, locationId, payType, baseRate, avatarUrl, isActive } = req.body || {};
+    const {
+      employeeCode,
+      fullName,
+      department,
+      position,
+      locationId,
+      payType,
+      baseRate,
+      avatarUrl,
+      faceDescriptorJson,
+      faceEnrolledAt,
+      attendancePin,
+      isActive,
+    } = req.body || {};
     const cleanName = String(fullName ?? existing.full_name).trim();
     const cleanCode = String(employeeCode ?? existing.employee_code).trim();
     if (!cleanName) throw new Error('Employee full name is required');
@@ -1507,11 +2095,27 @@ apiRouter.put('/hr/employees/:id', requirePerm(PERMISSIONS.HR_MANAGE), (req, res
     if (dup) throw new Error(`Employee code "${cleanCode}" is already used by another employee`);
 
     const nextAvatar = avatarUrl !== undefined ? (avatarUrl ? String(avatarUrl) : null) : existing.avatar_url;
+    const nextDescriptor =
+      faceDescriptorJson !== undefined
+        ? faceDescriptorJson
+          ? String(faceDescriptorJson)
+          : null
+        : existing.face_descriptor_json;
+    const nextEnrolledAt =
+      faceEnrolledAt !== undefined
+        ? faceEnrolledAt || null
+        : faceDescriptorJson !== undefined
+          ? faceDescriptorJson
+            ? new Date().toISOString()
+            : null
+          : existing.face_enrolled_at;
+    const nextPin =
+      attendancePin !== undefined ? (attendancePin ? String(attendancePin).trim().slice(0, 12) : null) : existing.attendance_pin;
     const nextActive = isActive === undefined ? existing.is_active : isActive ? 1 : 0;
 
     db.prepare(`
       UPDATE employees
-      SET employee_code = ?, full_name = ?, department = ?, position = ?, location_id = ?, pay_type = ?, base_rate = ?, avatar_url = ?, is_active = ?
+      SET employee_code = ?, full_name = ?, department = ?, position = ?, location_id = ?, pay_type = ?, base_rate = ?, avatar_url = ?, face_descriptor_json = ?, face_enrolled_at = ?, attendance_pin = ?, is_active = ?
       WHERE id = ?
     `).run(
       cleanCode,
@@ -1522,6 +2126,9 @@ apiRouter.put('/hr/employees/:id', requirePerm(PERMISSIONS.HR_MANAGE), (req, res
       payType || existing.pay_type,
       Number(baseRate ?? existing.base_rate),
       nextAvatar,
+      nextDescriptor,
+      nextEnrolledAt,
+      nextPin,
       nextActive,
       empId,
     );
@@ -1532,23 +2139,151 @@ apiRouter.put('/hr/employees/:id', requirePerm(PERMISSIONS.HR_MANAGE), (req, res
   }
 });
 
-apiRouter.post('/hr/attendance/clock', requirePerm(PERMISSIONS.HR_MANAGE), (req, res) => {
-  const { employeeId, action, overtimeHours } = req.body;
-  if (action === 'CLOCK_IN') {
-    const id = randomUUID();
-    db.prepare('INSERT INTO attendance_logs (id, employee_id, clock_in, status) VALUES (?, ?, ?, ?)')
-      .run(id, employeeId, new Date().toISOString(), 'PRESENT');
-    res.status(201).json({ id });
-    return;
+apiRouter.post('/hr/attendance/clock', (req, res) => {
+  try {
+    const {
+      employeeId,
+      action = 'AUTO',
+      overtimeHours,
+      locationId,
+      verificationMethod = 'MANUAL',
+      matchConfidence = null,
+      snapshotPhoto = null,
+      pinCode,
+      status: requestedStatus,
+      notes,
+    } = req.body || {};
+
+    const emp = db.prepare('SELECT * FROM employees WHERE id = ?').get(employeeId) as any;
+    if (!emp) {
+      res.status(404).json({ error: 'Employee not found' });
+      return;
+    }
+
+    const method = ['FACE_SCAN', 'PIN_FALLBACK', 'MANUAL'].includes(String(verificationMethod).toUpperCase())
+      ? String(verificationMethod).toUpperCase()
+      : 'MANUAL';
+
+    if (
+      method === 'MANUAL' &&
+      req.authUser &&
+      req.authUser.roleCode !== 'SUPER_ADMIN' &&
+      req.authUser.roleCode !== 'BUSINESS_OWNER' &&
+      !req.authUser.permissions.includes(PERMISSIONS.HR_MANAGE)
+    ) {
+      res.status(403).json({ error: 'Manual clock overrides require HR Manager access. Use Face Scan or PIN Fallback.' });
+      return;
+    }
+
+    if (method === 'PIN_FALLBACK') {
+      const configuredPin = String(emp.attendance_pin || '').trim();
+      const submittedPin = String(pinCode || '').trim();
+      if (!configuredPin) {
+        throw new Error(`No Attendance PIN is configured for ${emp.full_name}. Set one in Edit Employee first.`);
+      }
+      if (!submittedPin || submittedPin !== configuredPin) {
+        throw new Error('Incorrect Attendance PIN');
+      }
+    }
+
+    const openLog = db
+      .prepare('SELECT * FROM attendance_logs WHERE employee_id = ? AND clock_out IS NULL ORDER BY clock_in DESC LIMIT 1')
+      .get(employeeId) as any;
+
+    const resolvedAction = action === 'AUTO' ? (openLog ? 'CLOCK_OUT' : 'CLOCK_IN') : action;
+    const nowIso = new Date().toISOString();
+    const confidenceVal =
+      matchConfidence !== null && matchConfidence !== undefined && Number.isFinite(Number(matchConfidence))
+        ? Math.max(0, Math.min(100, Math.round(Number(matchConfidence))))
+        : null;
+
+    if (resolvedAction === 'CLOCK_IN') {
+      if (openLog) {
+        throw new Error(`${emp.full_name} is already clocked in (since ${openLog.clock_in})`);
+      }
+      const id = randomUUID();
+      const nextStatus = requestedStatus === 'LATE' ? 'LATE' : 'PRESENT';
+      const resolvedLoc = locationId || emp.location_id || null;
+      db.prepare(`
+        INSERT INTO attendance_logs (id, employee_id, location_id, clock_in, status, verification_method, match_confidence, clock_in_photo, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        id,
+        employeeId,
+        resolvedLoc,
+        nowIso,
+        nextStatus,
+        method,
+        confidenceVal,
+        snapshotPhoto || null,
+        notes || (method === 'PIN_FALLBACK' ? 'PIN fallback punch' : null),
+      );
+      writeAuditLog(req.authUser!.id, req.authUser!.fullName, `${method}_CLOCK_IN`, 'AttendanceLog', id, {
+        employeeName: emp.full_name,
+        employeeCode: emp.employee_code,
+        locationId: resolvedLoc,
+        confidence: confidenceVal,
+        status: nextStatus,
+      });
+      res.status(201).json({
+        id,
+        action: 'CLOCK_IN',
+        employeeId: emp.id,
+        employeeName: emp.full_name,
+        employeeCode: emp.employee_code,
+        clockIn: nowIso,
+        clockOut: null,
+        workedHours: 0,
+        overtimeHours: 0,
+        status: nextStatus,
+        verificationMethod: method,
+        matchConfidence: confidenceVal,
+      });
+      return;
+    }
+
+    if (!openLog) {
+      res.status(400).json({ error: `No active clock-in found for ${emp.full_name}` });
+      return;
+    }
+
+    const elapsedHrs = Math.max(0, round2((new Date(nowIso).getTime() - new Date(openLog.clock_in).getTime()) / 3600000));
+    const resolvedOt =
+      overtimeHours !== undefined && overtimeHours !== null
+        ? Math.max(0, round2(Number(overtimeHours)))
+        : Math.max(0, round2(elapsedHrs - 8));
+
+    db.prepare(`
+      UPDATE attendance_logs
+      SET clock_out = ?, worked_hours = ?, overtime_hours = ?, clock_out_photo = COALESCE(?, clock_out_photo), notes = COALESCE(?, notes)
+      WHERE id = ?
+    `).run(nowIso, elapsedHrs, resolvedOt, snapshotPhoto || null, notes || null, openLog.id);
+
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, `${method}_CLOCK_OUT`, 'AttendanceLog', openLog.id, {
+      employeeName: emp.full_name,
+      employeeCode: emp.employee_code,
+      workedHours: elapsedHrs,
+      overtimeHours: resolvedOt,
+      confidence: confidenceVal,
+    });
+
+    res.json({
+      id: openLog.id,
+      action: 'CLOCK_OUT',
+      employeeId: emp.id,
+      employeeName: emp.full_name,
+      employeeCode: emp.employee_code,
+      clockIn: openLog.clock_in,
+      clockOut: nowIso,
+      workedHours: elapsedHrs,
+      overtimeHours: resolvedOt,
+      status: openLog.status,
+      verificationMethod: method,
+      matchConfidence: confidenceVal,
+    });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
   }
-  const openLog = db.prepare('SELECT id FROM attendance_logs WHERE employee_id = ? AND clock_out IS NULL ORDER BY clock_in DESC LIMIT 1').get(employeeId) as any;
-  if (!openLog) {
-    res.status(400).json({ error: 'No active clock-in found for employee' });
-    return;
-  }
-  db.prepare('UPDATE attendance_logs SET clock_out = ?, overtime_hours = ? WHERE id = ?')
-    .run(new Date().toISOString(), Number(overtimeHours || 0), openLog.id);
-  res.json({ ok: true });
 });
 
 apiRouter.put('/hr/payroll-rules', requirePerm(PERMISSIONS.PAYROLL_RUN), (req, res) => {
@@ -1559,7 +2294,7 @@ apiRouter.put('/hr/payroll-rules', requirePerm(PERMISSIONS.PAYROLL_RUN), (req, r
 });
 
 apiRouter.post('/hr/payroll/run', requirePerm(PERMISSIONS.PAYROLL_RUN), (req, res) => {
-  const { periodStart, periodEnd, daysPerEmployee } = req.body;
+  const { periodStart, periodEnd, daysPerEmployee, useAttendanceDays } = req.body;
   const rulesRow = db.prepare('SELECT rule_json FROM payroll_rules WHERE is_active = 1').get() as any;
   const cfg = JSON.parse(rulesRow.rule_json);
 
@@ -1572,14 +2307,16 @@ apiRouter.post('/hr/payroll/run', requirePerm(PERMISSIONS.PAYROLL_RUN), (req, re
 
     const items: any[] = [];
     for (const emp of employees) {
-      const days = Number(daysPerEmployee ?? 13);
-      const otHours = (
-        db
-          .prepare('SELECT COALESCE(SUM(overtime_hours), 0) AS ot FROM attendance_logs WHERE employee_id = ?')
-          .get(emp.id) as any
-      ).ot;
+      const empLogs = db.prepare('SELECT * FROM attendance_logs WHERE employee_id = ?').all(emp.id) as any[];
+      const periodLogs = empLogs.filter((a) => {
+        const d = String(a.clock_in || '').slice(0, 10);
+        return (!periodStart || d >= periodStart) && (!periodEnd || d <= periodEnd);
+      });
+      const uniqueAttendanceDays = new Set(periodLogs.map((a) => String(a.clock_in || '').slice(0, 10))).size;
+      const days = useAttendanceDays ? uniqueAttendanceDays : Number(daysPerEmployee ?? 13);
+      const otHours = periodLogs.reduce((s, a) => s + Number(a.overtime_hours || 0), 0);
 
-      const dailyRate = emp.pay_type === 'MONTHLY' ? emp.base_rate / 26 : emp.base_rate;
+      const dailyRate = emp.pay_type === 'HOURLY' ? emp.base_rate * 8 : emp.pay_type === 'MONTHLY' ? emp.base_rate / 26 : emp.base_rate;
       const hourlyRate = dailyRate / 8;
       const otPay = round2(otHours * hourlyRate * (cfg.overtimeMultiplier || 1.25));
       const gross = round2(days * dailyRate + otPay);
@@ -1770,16 +2507,38 @@ apiRouter.get('/admin/governance', requirePerm(PERMISSIONS.DASHBOARD_VIEW), (req
 // 12. USER CONTROL SETTINGS (OWNER & SUPER_ADMIN ONLY)
 // ==========================================
 apiRouter.get('/settings/users-control', requireOwnerOrSuperAdmin, (_req, res) => {
-  const users = db
+  const rawUsers = db
     .prepare(`
-      SELECT u.id, u.email, u.full_name, u.role_id, u.assigned_location_id, u.avatar_url, u.is_active, u.created_at,
+      SELECT u.id, u.email, u.full_name, u.role_id, u.assigned_location_id, u.avatar_url,
+             u.shift_pin_hash, u.failed_login_attempts, u.locked_until, u.is_active, u.created_at,
              r.code AS role_code, r.name AS role_name, l.name AS location_name
       FROM users u
       JOIN roles r ON r.id = u.role_id
       LEFT JOIN locations l ON l.id = u.assigned_location_id
       ORDER BY u.is_active DESC, u.full_name ASC
     `)
-    .all();
+    .all() as any[];
+
+  const users = rawUsers.map((u) => {
+    const lockLeft = checkSqlLockout(u);
+    return {
+      id: u.id,
+      email: u.email,
+      full_name: u.full_name,
+      role_id: u.role_id,
+      assigned_location_id: u.assigned_location_id,
+      avatar_url: u.avatar_url,
+      has_pin: Boolean(u.shift_pin_hash),
+      failed_login_attempts: Number(u.failed_login_attempts || 0),
+      is_locked: Boolean(lockLeft),
+      locked_until: lockLeft ? u.locked_until : null,
+      is_active: u.is_active,
+      created_at: u.created_at,
+      role_code: u.role_code,
+      role_name: u.role_name,
+      location_name: u.location_name,
+    };
+  });
 
   const employees = db
     .prepare(`
@@ -1798,13 +2557,15 @@ apiRouter.get('/settings/users-control', requireOwnerOrSuperAdmin, (_req, res) =
 
 apiRouter.post('/settings/users', requireOwnerOrSuperAdmin, (req, res) => {
   try {
-    const { email, password, fullName, roleId, assignedLocationId, avatarUrl, isActive } = req.body || {};
+    const { email, password, shiftPin, fullName, roleId, assignedLocationId, avatarUrl, isActive } = req.body || {};
     const cleanEmail = String(email || '').trim().toLowerCase();
     const cleanName = String(fullName || '').trim();
     if (!cleanEmail) throw new Error('Email is required');
     if (!cleanName) throw new Error('Full name is required');
     if (!password || String(password).length < 6) throw new Error('Password must be at least 6 characters');
     if (!roleId) throw new Error('Role is required');
+    const cleanPin = String(shiftPin || '').trim();
+    if (cleanPin && !/^\d{4,6}$/.test(cleanPin)) throw new Error('Shift PIN must be 4 to 6 numeric digits');
 
     const dup = db.prepare('SELECT id FROM users WHERE lower(email) = lower(?)').get(cleanEmail);
     if (dup) throw new Error(`A user with email "${cleanEmail}" already exists`);
@@ -1814,15 +2575,17 @@ apiRouter.post('/settings/users', requireOwnerOrSuperAdmin, (req, res) => {
 
     const id = randomUUID();
     const hash = bcrypt.hashSync(String(password), 10);
+    const pinHash = cleanPin ? bcrypt.hashSync(cleanPin, 10) : null;
     db.prepare(`
-      INSERT INTO users (id, email, password_hash, full_name, role_id, assigned_location_id, avatar_url, is_active)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(id, cleanEmail, hash, cleanName, roleId, assignedLocationId || null, avatarUrl || null, isActive === false ? 0 : 1);
+      INSERT INTO users (id, email, password_hash, shift_pin_hash, full_name, role_id, assigned_location_id, avatar_url, is_active)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, cleanEmail, hash, pinHash, cleanName, roleId, assignedLocationId || null, avatarUrl || null, isActive === false ? 0 : 1);
 
     writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'CREATE_USER', 'User', id, {
       email: cleanEmail,
       fullName: cleanName,
       roleCode: roleRow.code,
+      hasPin: Boolean(pinHash),
     });
     res.status(201).json({ id });
   } catch (err: any) {
@@ -1841,7 +2604,7 @@ apiRouter.put('/settings/users/:id', requireOwnerOrSuperAdmin, (req, res) => {
       return;
     }
 
-    const { email, password, fullName, roleId, assignedLocationId, avatarUrl, isActive } = req.body || {};
+    const { email, password, shiftPin, clearPin, unlockAccount, fullName, roleId, assignedLocationId, avatarUrl, isActive } = req.body || {};
     const cleanEmail = String(email ?? existing.email).trim().toLowerCase();
     const cleanName = String(fullName ?? existing.full_name).trim();
     const nextRoleId = roleId || existing.role_id;
@@ -1849,6 +2612,8 @@ apiRouter.put('/settings/users/:id', requireOwnerOrSuperAdmin, (req, res) => {
 
     if (!cleanEmail) throw new Error('Email is required');
     if (!cleanName) throw new Error('Full name is required');
+    const cleanPin = String(shiftPin || '').trim();
+    if (cleanPin && !/^\d{4,6}$/.test(cleanPin)) throw new Error('Shift PIN must be 4 to 6 numeric digits');
 
     const dup = db.prepare('SELECT id FROM users WHERE lower(email) = lower(?) AND id != ?').get(cleanEmail, targetId);
     if (dup) throw new Error(`Email "${cleanEmail}" is already used by another account`);
@@ -1864,27 +2629,28 @@ apiRouter.put('/settings/users/:id', requireOwnerOrSuperAdmin, (req, res) => {
     }
 
     const nextAvatar = avatarUrl !== undefined ? (avatarUrl ? String(avatarUrl) : null) : existing.avatar_url;
-    if (password && String(password).trim().length > 0) {
-      if (String(password).length < 6) throw new Error('New password must be at least 6 characters');
-      const hash = bcrypt.hashSync(String(password), 10);
-      db.prepare(`
-        UPDATE users
-        SET email = ?, password_hash = ?, full_name = ?, role_id = ?, assigned_location_id = ?, avatar_url = ?, is_active = ?
-        WHERE id = ?
-      `).run(cleanEmail, hash, cleanName, nextRoleId, assignedLocationId || null, nextAvatar, nextActive, targetId);
-    } else {
-      db.prepare(`
-        UPDATE users
-        SET email = ?, full_name = ?, role_id = ?, assigned_location_id = ?, avatar_url = ?, is_active = ?
-        WHERE id = ?
-      `).run(cleanEmail, cleanName, nextRoleId, assignedLocationId || null, nextAvatar, nextActive, targetId);
-    }
+    const nextPwdHash =
+      password && String(password).trim().length > 0
+        ? (() => {
+            if (String(password).length < 6) throw new Error('New password must be at least 6 characters');
+            return bcrypt.hashSync(String(password), 10);
+          })()
+        : existing.password_hash;
+    const nextPinHash = clearPin ? null : cleanPin ? bcrypt.hashSync(cleanPin, 10) : existing.shift_pin_hash;
+    const nextFails = unlockAccount ? 0 : Number(existing.failed_login_attempts || 0);
+    const nextLock = unlockAccount ? null : existing.locked_until;
+
+    db.prepare(`
+      UPDATE users
+      SET email = ?, password_hash = ?, shift_pin_hash = ?, failed_login_attempts = ?, locked_until = ?, full_name = ?, role_id = ?, assigned_location_id = ?, avatar_url = ?, is_active = ?
+      WHERE id = ?
+    `).run(cleanEmail, nextPwdHash, nextPinHash, nextFails, nextLock, cleanName, nextRoleId, assignedLocationId || null, nextAvatar, nextActive, targetId);
 
     if (nextActive === 0) {
       db.prepare('DELETE FROM sessions WHERE user_id = ?').run(targetId);
     }
 
-    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'UPDATE_USER', 'User', targetId, {
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, unlockAccount ? 'UNLOCK_USER' : 'UPDATE_USER', 'User', targetId, {
       email: cleanEmail,
       fullName: cleanName,
       roleCode: nextRole.code,

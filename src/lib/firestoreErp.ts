@@ -17,7 +17,10 @@ import { auth, db, handleFirestoreError, OperationType } from './firebase.ts';
 import { AuthUser, PERMISSIONS, RoleCode } from '../types/erp.ts';
 
 const ACTIVE_USER_SESSION_KEY = 'maximus_bbq_active_erp_user_id';
+const SIGNED_OUT_SESSION_KEY = 'maximus_bbq_erp_signed_out';
 const BOOTSTRAP_ADMIN_EMAIL = 'norielescobio@gmail.com';
+const MAX_FAILED_LOGIN_ATTEMPTS = 5;
+const LOCKOUT_DURATION_MS = 5 * 60 * 1000;
 
 const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 const round4 = (n: number) => Math.round((n + Number.EPSILON) * 10000) / 10000;
@@ -60,6 +63,40 @@ async function verifyPassword(password: string, storedHash: string): Promise<boo
     return candidate === storedHash;
   }
   return password === storedHash;
+}
+
+async function hashShiftPin(userDocId: string, pin: string): Promise<string> {
+  const cleanPin = String(pin || '').trim();
+  if (!/^\d{4,6}$/.test(cleanPin)) {
+    throw new Error('Shift PIN must be 4 to 6 numeric digits');
+  }
+  const data = new TextEncoder().encode(`maximus_erp_pin:${userDocId}:${cleanPin}`);
+  const buf = await crypto.subtle.digest('SHA-256', data);
+  const hex = Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+  return `pin256:${hex}`;
+}
+
+async function verifyShiftPin(userDocId: string, pin: string, storedHash: string): Promise<boolean> {
+  if (!storedHash || !/^\d{4,6}$/.test(String(pin || '').trim())) return false;
+  const candidate = await hashShiftPin(userDocId, String(pin).trim());
+  return candidate === storedHash;
+}
+
+function getLockRemainingMs(erpUser: any): number {
+  if (!erpUser?.lockedUntil) return 0;
+  const untilMs = new Date(erpUser.lockedUntil).getTime();
+  if (!Number.isFinite(untilMs)) return 0;
+  return Math.max(0, untilMs - Date.now());
+}
+
+function formatLockDuration(ms: number): string {
+  const secs = Math.max(1, Math.ceil(ms / 1000));
+  const mins = Math.floor(secs / 60);
+  const rem = secs % 60;
+  if (mins > 0) return `${mins}m ${rem}s`;
+  return `${rem}s`;
 }
 
 function formatDetailsText(details?: Record<string, unknown> | string | null): string | null {
@@ -415,15 +452,16 @@ async function seedWorkspaceFirestore(firebaseUser: User): Promise<void> {
     pettyCashFunds,
     financialPeriods,
     payrollRule,
+    poApprovalThreshold: 10000,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   });
 
   // 2. Locations (no updatedAt)
   const locs = [
-    { id: 'loc_commissary', code: 'COM-01', name: 'Central Commissary Kitchen', type: 'COMMISSARY', address: 'Pasig Food Hub, Metro Manila', kdsEnabled: false },
-    { id: 'loc_truck_1', code: 'TRK-01', name: 'Truck 01 — BGC High Street', type: 'FOOD_TRUCK', address: '7th Ave & Bonifacio High St, Taguig', kdsEnabled: true },
-    { id: 'loc_truck_2', code: 'TRK-02', name: 'Truck 02 — Ayala Triangle', type: 'FOOD_TRUCK', address: 'Makati Ave Night Market, Makati', kdsEnabled: true },
+    { id: 'loc_commissary', code: 'COM-01', name: 'Central Commissary Kitchen', type: 'COMMISSARY', address: 'Pasig Food Hub, Metro Manila', kdsEnabled: false, dailySalesTarget: 5000 },
+    { id: 'loc_truck_1', code: 'TRK-01', name: 'Truck 01 — BGC High Street', type: 'FOOD_TRUCK', address: '7th Ave & Bonifacio High St, Taguig', kdsEnabled: true, dailySalesTarget: 15000 },
+    { id: 'loc_truck_2', code: 'TRK-02', name: 'Truck 02 — Ayala Triangle', type: 'FOOD_TRUCK', address: 'Makati Ave Night Market, Makati', kdsEnabled: true, dailySalesTarget: 12000 },
   ];
   for (const l of locs) {
     const docId = toDocId(l.id, uid);
@@ -436,6 +474,7 @@ async function seedWorkspaceFirestore(firebaseUser: User): Promise<void> {
       address: l.address,
       isActive: true,
       kdsEnabled: l.kdsEnabled,
+      dailySalesTarget: l.dailySalesTarget,
       createdAt: serverTimestamp(),
     });
   }
@@ -820,7 +859,10 @@ async function seedWorkspaceFirestore(firebaseUser: User): Promise<void> {
       id: docId,
       ownerUid: uid,
       isActive: true,
+      updatedBy: null,
+      updatedByName: 'System Seed',
       createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
     });
   }
 
@@ -1174,6 +1216,7 @@ function toAuthUser(erpUser: any, snap: WorkspaceSnapshot): AuthUser {
     permissions: role?.permissions || [],
     assignedLocationId: erpUser.assignedLocationId ? toLogicalId(erpUser.assignedLocationId, snap.uid) : null,
     avatarUrl: erpUser.avatarUrl || null,
+    hasPin: Boolean(erpUser.shiftPinHash),
   };
 }
 
@@ -1194,7 +1237,41 @@ export function setActiveErpUserId(id: string | null) {
   }
 }
 
+export function isSignedOutSession(): boolean {
+  try {
+    return sessionStorage.getItem(SIGNED_OUT_SESSION_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+export function setSignedOutSession(signedOut: boolean) {
+  try {
+    if (signedOut) sessionStorage.setItem(SIGNED_OUT_SESSION_KEY, '1');
+    else sessionStorage.removeItem(SIGNED_OUT_SESSION_KEY);
+  } catch {
+    // ignore storage restrictions
+  }
+}
+
+function resolveOptionalErpUser(snap: WorkspaceSnapshot): AuthUser | null {
+  if (isSignedOutSession()) return null;
+  const activeUsers = snap.erpUsers.filter((u) => u.isActive);
+  if (!activeUsers.length) return null;
+  const storedLogicalId = getActiveErpUserId();
+  if (storedLogicalId) {
+    const match = activeUsers.find((u) => toLogicalId(u.id, snap.uid) === storedLogicalId || u.id === storedLogicalId);
+    if (match) return toAuthUser(match, snap);
+  }
+  const fbEmail = (auth.currentUser?.email || '').toLowerCase();
+  const byEmail = activeUsers.find((u) => String(u.email || '').toLowerCase() === fbEmail);
+  return byEmail ? toAuthUser(byEmail, snap) : null;
+}
+
 function resolveCurrentErpUser(snap: WorkspaceSnapshot): AuthUser {
+  if (isSignedOutSession()) {
+    throw new Error('SIGNED_OUT');
+  }
   const activeUsers = snap.erpUsers.filter((u) => u.isActive);
   if (!activeUsers.length) throw new Error('No active ERP user accounts found');
 
@@ -1944,8 +2021,50 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
   const snap = await loadSnapshot();
   const uid = snap.uid;
 
+  const recordFailureAndThrow = async (found: any, action: string, baseMsg: string) => {
+    const prevFails = Number(found.failedLoginAttempts || 0);
+    const nextFails = prevFails + 1;
+    const isNowLocked = nextFails >= MAX_FAILED_LOGIN_ATTEMPTS;
+    const lockedUntilIso = isNowLocked ? new Date(Date.now() + LOCKOUT_DURATION_MS).toISOString() : null;
+    try {
+      await updateDoc(doc(db, 'erp_users', found.id), {
+        failedLoginAttempts: isNowLocked ? MAX_FAILED_LOGIN_ATTEMPTS : nextFails,
+        lockedUntil: lockedUntilIso,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `erp_users/${found.id}`);
+    }
+    const logicalId = toLogicalId(found.id, uid);
+    await addAuditLog(uid, logicalId, found.fullName, isNowLocked ? 'ACCOUNT_LOCKED' : action, 'User', logicalId, {
+      attempts: nextFails,
+      lockedUntil: lockedUntilIso,
+    });
+    invalidateWorkspaceCache();
+    if (isNowLocked) {
+      throw new Error('Too many failed attempts. Account locked for 5 minutes.');
+    }
+    const remaining = MAX_FAILED_LOGIN_ATTEMPTS - nextFails;
+    throw new Error(`${baseMsg} (${remaining} attempt${remaining === 1 ? '' : 's'} left before 5m lockout)`);
+  };
+
+  const resetFailuresIfNeeded = async (found: any) => {
+    if (Number(found.failedLoginAttempts || 0) > 0 || found.lockedUntil) {
+      try {
+        await updateDoc(doc(db, 'erp_users', found.id), {
+          failedLoginAttempts: 0,
+          lockedUntil: null,
+          updatedAt: serverTimestamp(),
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `erp_users/${found.id}`);
+      }
+    }
+  };
+
   // 1. AUTH ROUTES
-  if (pathname === '/auth/demo-accounts' && method === 'GET') {
+  if (pathname === '/auth/operators' && method === 'GET') {
+    const fbEmail = (auth.currentUser?.email || '').trim().toLowerCase();
     const active = snap.erpUsers
       .filter((u) => u.isActive)
       .sort((a, b) => {
@@ -1953,55 +2072,142 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         const rDiff = rank(a.roleCode) - rank(b.roleCode);
         return rDiff !== 0 ? rDiff : String(a.fullName).localeCompare(String(b.fullName));
       })
-      .map((u) => ({
-        id: toLogicalId(u.id, uid),
-        email: u.email,
-        full_name: u.fullName,
-        avatar_url: u.avatarUrl || null,
-        role_code: u.roleCode,
-        role_name: u.roleName,
-      }));
+      .map((u) => {
+        const lockRemaining = getLockRemainingMs(u);
+        return {
+          id: toLogicalId(u.id, uid),
+          full_name: u.fullName,
+          avatar_url: u.avatarUrl || null,
+          role_code: u.roleCode,
+          role_name: u.roleName,
+          assigned_location_id: u.assignedLocationId ? toLogicalId(u.assignedLocationId, uid) : null,
+          has_pin: Boolean(u.shiftPinHash),
+          is_locked: lockRemaining > 0,
+          locked_until: lockRemaining > 0 ? u.lockedUntil : null,
+          is_google_owner: Boolean(fbEmail && String(u.email || '').toLowerCase() === fbEmail),
+        };
+      });
     return active as T;
   }
 
   if (pathname === '/auth/login' && method === 'POST') {
     const email = String(body.email || '').trim().toLowerCase();
     const password = String(body.password || '');
-    if (!email || !password) throw new Error('Email and password are required');
+    if (!email || !password) throw new Error('Work email and password are required');
     const found = snap.erpUsers.find((u) => String(u.email || '').toLowerCase() === email && u.isActive);
-    if (!found || !(await verifyPassword(password, found.passwordHash))) {
+    if (!found) {
       throw new Error('Invalid email or password');
     }
+    const lockRemaining = getLockRemainingMs(found);
+    if (lockRemaining > 0) {
+      throw new Error(`Account temporarily locked. Try again in ${formatLockDuration(lockRemaining)} or ask an Owner/Admin to unlock.`);
+    }
+    if (!(await verifyPassword(password, found.passwordHash))) {
+      await recordFailureAndThrow(found, 'LOGIN_FAILED', 'Invalid email or password.');
+    }
+    await resetFailuresIfNeeded(found);
     const authUser = toAuthUser(found, snap);
+    setSignedOutSession(false);
     setActiveErpUserId(authUser.id);
     await addAuditLog(uid, authUser.id, authUser.fullName, 'LOGIN', 'Session', authUser.id);
     invalidateWorkspaceCache();
     return { token: 'firebase-session', user: authUser } as T;
   }
 
-  if (pathname === '/auth/demo-switch' && method === 'POST') {
-    const targetId = String(body.userId || '');
+  if (pathname === '/auth/pin-login' && method === 'POST') {
+    const targetId = String(body.userId || '').trim();
+    const pin = String(body.pin || '').trim();
+    if (!targetId) throw new Error('Select an operator first');
+    if (!/^\d{4,6}$/.test(pin)) throw new Error('Enter a valid 4–6 digit Shift PIN');
     const found = snap.erpUsers.find((u) => (toLogicalId(u.id, uid) === targetId || u.id === targetId) && u.isActive);
-    if (!found) throw new Error('User not found');
+    if (!found) throw new Error('Operator account not found or inactive');
+
+    const lockRemaining = getLockRemainingMs(found);
+    if (lockRemaining > 0) {
+      throw new Error(`Operator locked for ${formatLockDuration(lockRemaining)} due to repeated failed attempts.`);
+    }
+    if (!found.shiftPinHash) {
+      throw new Error(`No Shift PIN is configured for ${found.fullName}. Use Work Email & Password or set a PIN in User Control.`);
+    }
+    if (!(await verifyShiftPin(found.id, pin, found.shiftPinHash))) {
+      await recordFailureAndThrow(found, 'PIN_LOGIN_FAILED', 'Incorrect Shift PIN.');
+    }
+    await resetFailuresIfNeeded(found);
     const authUser = toAuthUser(found, snap);
+    setSignedOutSession(false);
     setActiveErpUserId(authUser.id);
-    await addAuditLog(uid, authUser.id, authUser.fullName, 'ROLE_SWITCH', 'User', authUser.id, { role: authUser.roleCode });
+    await addAuditLog(uid, authUser.id, authUser.fullName, 'PIN_LOGIN', 'Session', authUser.id, { role: authUser.roleCode });
     invalidateWorkspaceCache();
     return { token: 'firebase-session', user: authUser } as T;
   }
 
+  if (pathname === '/auth/google-sso' && method === 'POST') {
+    const fbEmail = (auth.currentUser?.email || '').trim().toLowerCase();
+    if (!fbEmail || !auth.currentUser?.emailVerified) {
+      throw new Error('Verified Google session is required');
+    }
+    const found = snap.erpUsers.find((u) => String(u.email || '').toLowerCase() === fbEmail && u.isActive);
+    if (!found) {
+      throw new Error(`No active ERP operator account matches ${fbEmail}`);
+    }
+    const lockRemaining = getLockRemainingMs(found);
+    if (lockRemaining > 0) {
+      throw new Error(`Account temporarily locked. Try again in ${formatLockDuration(lockRemaining)}.`);
+    }
+    await resetFailuresIfNeeded(found);
+    const authUser = toAuthUser(found, snap);
+    setSignedOutSession(false);
+    setActiveErpUserId(authUser.id);
+    await addAuditLog(uid, authUser.id, authUser.fullName, 'GOOGLE_SSO_LOGIN', 'Session', authUser.id);
+    invalidateWorkspaceCache();
+    return { token: 'firebase-session', user: authUser } as T;
+  }
+
+  if (pathname === '/auth/unlock' && method === 'POST') {
+    const targetId = String(body.userId || '').trim();
+    const mode = String(body.mode || 'password');
+    const secret = String(body.secret || '');
+    const found = snap.erpUsers.find((u) => (toLogicalId(u.id, uid) === targetId || u.id === targetId) && u.isActive);
+    if (!found) throw new Error('Operator account not found');
+    const lockRemaining = getLockRemainingMs(found);
+    if (lockRemaining > 0) {
+      throw new Error(`Terminal locked for ${formatLockDuration(lockRemaining)} due to failed attempts.`);
+    }
+
+    if (mode === 'google') {
+      const fbEmail = (auth.currentUser?.email || '').trim().toLowerCase();
+      if (!fbEmail || !auth.currentUser?.emailVerified || fbEmail !== String(found.email || '').toLowerCase()) {
+        throw new Error('Google account does not match the locked operator');
+      }
+    } else if (mode === 'pin') {
+      if (!found.shiftPinHash) throw new Error('No Shift PIN configured for this account');
+      if (!(await verifyShiftPin(found.id, secret, found.shiftPinHash))) {
+        await recordFailureAndThrow(found, 'UNLOCK_PIN_FAILED', 'Incorrect Shift PIN.');
+      }
+    } else {
+      if (!secret || !(await verifyPassword(secret, found.passwordHash))) {
+        await recordFailureAndThrow(found, 'UNLOCK_FAILED', 'Incorrect password.');
+      }
+    }
+
+    await resetFailuresIfNeeded(found);
+    const authUser = toAuthUser(found, snap);
+    await addAuditLog(uid, authUser.id, authUser.fullName, 'SESSION_UNLOCK', 'Session', authUser.id, { mode });
+    invalidateWorkspaceCache();
+    return { ok: true, user: authUser } as T;
+  }
+
   if (pathname === '/auth/logout' && method === 'POST') {
+    const current = resolveOptionalErpUser(snap);
+    if (current) {
+      await addAuditLog(uid, current.id, current.fullName, 'LOGOUT', 'Session', current.id).catch(() => {});
+    }
     setActiveErpUserId(null);
+    setSignedOutSession(true);
     return { ok: true } as T;
   }
 
-  const user = resolveCurrentErpUser(snap);
-
-  if (pathname === '/auth/me' && method === 'GET') {
-    return user as T;
-  }
-
-  // 2. LOCATIONS, NOTIFICATIONS & DASHBOARD
+  // Pre-login workspace endpoints (safe with Firebase Cloud Auth; required by LoginView & Attendance Kiosk)
   if (pathname === '/locations' && method === 'GET') {
     const rows = snap.locations
       .filter((l) => l.isActive)
@@ -2014,8 +2220,215 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         address: l.address || '',
         is_active: l.isActive ? 1 : 0,
         kds_enabled: isLocationKdsEnabled(l) ? 1 : 0,
+        daily_sales_target: Number(l.dailySalesTarget ?? (l.type === 'FOOD_TRUCK' ? (l.code === 'TRK-02' ? 12000 : 15000) : 5000)),
       }));
     return rows as T;
+  }
+
+  if (pathname === '/attendance/kiosk' && method === 'GET') {
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const empMap = new Map(snap.employees.map((e) => [e.id, e]));
+
+    const employees = [...snap.employees]
+      .sort((a, b) => String(a.employeeCode).localeCompare(String(b.employeeCode)))
+      .map((e) => ({
+        id: toLogicalId(e.id, uid),
+        employee_code: e.employeeCode,
+        full_name: e.fullName,
+        department: e.department,
+        position: e.position,
+        location_id: e.locationId ? toLogicalId(e.locationId, uid) : null,
+        location_name: e.locationId ? locMap.get(e.locationId)?.name || '' : '',
+        avatar_url: e.avatarUrl || null,
+        face_descriptor_json: e.faceDescriptorJson || null,
+        face_enrolled_at: e.faceEnrolledAt || null,
+        has_pin: Boolean(String(e.attendancePin || '').trim()),
+        is_active: e.isActive ? 1 : 0,
+      }));
+
+    const attendance = [...snap.attendanceLogs]
+      .sort((a, b) => String(b.clockIn).localeCompare(String(a.clockIn)))
+      .slice(0, 60)
+      .map((a) => {
+        const emp = empMap.get(a.employeeId);
+        const resolvedLocId = a.locationId || emp?.locationId || null;
+        return {
+          id: toLogicalId(a.id, uid),
+          employee_id: toLogicalId(a.employeeId, uid),
+          clock_in: a.clockIn,
+          clock_out: a.clockOut,
+          worked_hours: Number(a.workedHours || 0),
+          overtime_hours: Number(a.overtimeHours || 0),
+          status: a.status,
+          verification_method: a.verificationMethod || 'MANUAL',
+          match_confidence: a.matchConfidence ?? null,
+          clock_in_photo: a.clockInPhoto || null,
+          clock_out_photo: a.clockOutPhoto || null,
+          full_name: emp?.fullName || '',
+          employee_code: emp?.employeeCode || '',
+          employee_avatar_url: emp?.avatarUrl || null,
+          location_id: resolvedLocId ? toLogicalId(resolvedLocId, uid) : null,
+          location_name: resolvedLocId ? locMap.get(resolvedLocId)?.name || 'Commissary HQ' : 'Commissary HQ',
+        };
+      });
+
+    return { employees, attendance } as T;
+  }
+
+  if (pathname === '/hr/attendance/clock' && method === 'POST') {
+    const {
+      employeeId,
+      action = 'AUTO',
+      overtimeHours,
+      locationId,
+      verificationMethod = 'MANUAL',
+      matchConfidence = null,
+      snapshotPhoto = null,
+      pinCode,
+      status: requestedStatus,
+      notes,
+    } = body || {};
+    const empDocId = toDocId(employeeId, uid);
+    const emp = snap.employees.find((e) => e.id === empDocId);
+    if (!emp) throw new Error('Employee not found');
+
+    const methodCode = ['FACE_SCAN', 'PIN_FALLBACK', 'MANUAL'].includes(String(verificationMethod).toUpperCase())
+      ? String(verificationMethod).toUpperCase()
+      : 'MANUAL';
+
+    let actorUser = resolveOptionalErpUser(snap);
+    if (methodCode === 'MANUAL') {
+      actorUser = resolveCurrentErpUser(snap);
+      assertPerm(actorUser, PERMISSIONS.HR_MANAGE);
+    }
+
+    if (methodCode === 'PIN_FALLBACK') {
+      const configuredPin = String(emp.attendancePin || '').trim();
+      const submittedPin = String(pinCode || '').trim();
+      if (!configuredPin) {
+        throw new Error(`No Attendance PIN is configured for ${emp.fullName}. Set one in Edit Employee first.`);
+      }
+      if (!submittedPin || submittedPin !== configuredPin) {
+        throw new Error('Incorrect Attendance PIN');
+      }
+    }
+
+    const openLog = [...snap.attendanceLogs]
+      .filter((a) => a.employeeId === empDocId && !a.clockOut)
+      .sort((a, b) => String(b.clockIn).localeCompare(String(a.clockIn)))[0];
+
+    const resolvedAction = action === 'AUTO' ? (openLog ? 'CLOCK_OUT' : 'CLOCK_IN') : action;
+    const nowIso = new Date().toISOString();
+    const confidenceVal =
+      matchConfidence !== null && matchConfidence !== undefined && Number.isFinite(Number(matchConfidence))
+        ? Math.max(0, Math.min(100, Math.round(Number(matchConfidence))))
+        : null;
+    const safePhoto = snapshotPhoto ? String(snapshotPhoto).slice(0, 120000) : null;
+    const actorId = actorUser?.id || 'kiosk_terminal';
+    const actorName = actorUser?.fullName || 'Attendance Kiosk';
+
+    if (resolvedAction === 'CLOCK_IN') {
+      if (openLog) {
+        throw new Error(`${emp.fullName} is already clocked in (since ${openLog.clockIn})`);
+      }
+      const id = toDocId(crypto.randomUUID(), uid);
+      const nextStatus = requestedStatus === 'LATE' ? 'LATE' : 'PRESENT';
+      const resolvedLocDocId = locationId ? toDocId(String(locationId), uid) : emp.locationId || null;
+      try {
+        await setDoc(doc(db, 'attendance_logs', id), {
+          id,
+          ownerUid: uid,
+          employeeId: empDocId,
+          locationId: resolvedLocDocId,
+          clockIn: nowIso,
+          clockOut: null,
+          workedHours: 0,
+          overtimeHours: 0,
+          status: nextStatus,
+          verificationMethod: methodCode,
+          matchConfidence: confidenceVal,
+          clockInPhoto: safePhoto,
+          clockOutPhoto: null,
+          notes: notes ? String(notes).slice(0, 300) : methodCode === 'PIN_FALLBACK' ? 'PIN fallback punch' : null,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.CREATE, `attendance_logs/${id}`);
+      }
+      await addAuditLog(uid, actorId, actorName, `${methodCode}_CLOCK_IN`, 'AttendanceLog', toLogicalId(id, uid), {
+        employeeName: emp.fullName,
+        employeeCode: emp.employeeCode,
+        locationId: resolvedLocDocId ? toLogicalId(resolvedLocDocId, uid) : null,
+        confidence: confidenceVal,
+        status: nextStatus,
+      });
+      invalidateWorkspaceCache();
+      return {
+        id: toLogicalId(id, uid),
+        action: 'CLOCK_IN',
+        employeeId: toLogicalId(emp.id, uid),
+        employeeName: emp.fullName,
+        employeeCode: emp.employeeCode,
+        clockIn: nowIso,
+        clockOut: null,
+        workedHours: 0,
+        overtimeHours: 0,
+        status: nextStatus,
+        verificationMethod: methodCode,
+        matchConfidence: confidenceVal,
+      } as T;
+    }
+
+    if (!openLog) throw new Error(`No active clock-in found for ${emp.fullName}`);
+    const elapsedHrs = Math.max(0, round2((new Date(nowIso).getTime() - new Date(openLog.clockIn).getTime()) / 3600000));
+    const resolvedOt =
+      overtimeHours !== undefined && overtimeHours !== null
+        ? Math.max(0, round2(Number(overtimeHours)))
+        : Math.max(0, round2(elapsedHrs - 8));
+
+    const updatePayload: Record<string, any> = {
+      clockOut: nowIso,
+      workedHours: elapsedHrs,
+      overtimeHours: resolvedOt,
+      updatedAt: serverTimestamp(),
+    };
+    if (safePhoto) updatePayload.clockOutPhoto = safePhoto;
+    if (notes) updatePayload.notes = String(notes).slice(0, 300);
+
+    try {
+      await updateDoc(doc(db, 'attendance_logs', openLog.id), updatePayload);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `attendance_logs/${openLog.id}`);
+    }
+    await addAuditLog(uid, actorId, actorName, `${methodCode}_CLOCK_OUT`, 'AttendanceLog', toLogicalId(openLog.id, uid), {
+      employeeName: emp.fullName,
+      employeeCode: emp.employeeCode,
+      workedHours: elapsedHrs,
+      overtimeHours: resolvedOt,
+      confidence: confidenceVal,
+    });
+    invalidateWorkspaceCache();
+    return {
+      id: toLogicalId(openLog.id, uid),
+      action: 'CLOCK_OUT',
+      employeeId: toLogicalId(emp.id, uid),
+      employeeName: emp.fullName,
+      employeeCode: emp.employeeCode,
+      clockIn: openLog.clockIn,
+      clockOut: nowIso,
+      workedHours: elapsedHrs,
+      overtimeHours: resolvedOt,
+      status: openLog.status,
+      verificationMethod: methodCode,
+      matchConfidence: confidenceVal,
+    } as T;
+  }
+
+  const user = resolveCurrentErpUser(snap);
+
+  if (pathname === '/auth/me' && method === 'GET') {
+    return user as T;
   }
 
   if (pathname === '/notifications' && method === 'GET') {
@@ -2149,7 +2562,7 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     const avgTicket = completedSales.length > 0 ? round2(totalSales / completedSales.length) : 0;
     const pendingPOs = snap.purchaseOrders.filter(
       (po) =>
-        ['PENDING_APPROVAL', 'APPROVED', 'PARTIAL', 'PARTIALLY_RECEIVED'].includes(po.status) &&
+        ['PENDING_APPROVAL', 'PENDING_MANAGER_SIGNATURE', 'APPROVED', 'PARTIAL', 'PARTIALLY_RECEIVED'].includes(po.status) &&
         (!locFilter || po.locationId === locFilter),
     ).length;
 
@@ -3055,26 +3468,71 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
   }
 
   // 6. PROCUREMENT & AP
+  const getApprovalThreshold = () => {
+    const val = Number(snap.meta?.poApprovalThreshold);
+    return Number.isFinite(val) && val >= 0 ? round2(val) : 10000;
+  };
+
   if (pathname === '/procurement' && method === 'GET') {
     assertAnyPerm(user, PERMISSIONS.PO_CREATE, PERMISSIONS.PO_APPROVE);
+    const approvalThreshold = getApprovalThreshold();
     const supMap = new Map(snap.suppliers.map((s) => [s.id, s]));
     const locMap = new Map(snap.locations.map((l) => [l.id, l]));
     const itemMap = new Map(snap.inventoryItems.map((i) => [i.id, i]));
 
+    const supplierAuditLogs = [...snap.auditLogs]
+      .filter((log) => log.entityType === 'Supplier')
+      .map((log) => {
+        const logicalSupId = toLogicalId(String(log.entityId || ''), uid);
+        const sup = supMap.get(toDocId(logicalSupId, uid)) || supMap.get(String(log.entityId || ''));
+        return {
+          id: toLogicalId(log.id, uid),
+          supplier_id: logicalSupId,
+          supplier_name: sup?.name || 'Supplier',
+          supplier_code: sup?.code || '',
+          action: log.action,
+          user_id: log.userId ? toLogicalId(String(log.userId), uid) : null,
+          user_name: log.userName || 'System',
+          details: log.details || '',
+          logged_at: log.loggedAt || tsToIso(log.createdAt),
+        };
+      })
+      .sort((a, b) => String(b.logged_at).localeCompare(String(a.logged_at)));
+
+    const latestAuditBySupplier = new Map<string, any>();
+    const auditCountBySupplier = new Map<string, number>();
+    for (const entry of supplierAuditLogs) {
+      if (!latestAuditBySupplier.has(entry.supplier_id)) {
+        latestAuditBySupplier.set(entry.supplier_id, entry);
+      }
+      auditCountBySupplier.set(entry.supplier_id, (auditCountBySupplier.get(entry.supplier_id) || 0) + 1);
+    }
+
     const suppliers = snap.suppliers
       .filter((s) => s.isActive)
       .sort((a, b) => String(a.name).localeCompare(String(b.name)))
-      .map((s) => ({
-        id: toLogicalId(s.id, uid),
-        code: s.code,
-        name: s.name,
-        contact_person: s.contactPerson,
-        phone: s.phone,
-        email: s.email,
-        address: s.address,
-        tin: s.tin,
-        payment_terms: s.paymentTerms,
-      }));
+      .map((s) => {
+        const logicalId = toLogicalId(s.id, uid);
+        const latestAudit = latestAuditBySupplier.get(logicalId);
+        const createdIso = s.createdAt ? tsToIso(s.createdAt) : null;
+        const updatedIso = s.updatedAt ? tsToIso(s.updatedAt) : latestAudit?.logged_at || createdIso;
+        return {
+          id: logicalId,
+          code: s.code,
+          name: s.name,
+          contact_person: s.contactPerson,
+          phone: s.phone,
+          email: s.email,
+          address: s.address,
+          tin: s.tin,
+          payment_terms: s.paymentTerms,
+          created_at: createdIso,
+          updated_at: updatedIso,
+          updated_by: s.updatedBy ? toLogicalId(String(s.updatedBy), uid) : latestAudit?.user_id || null,
+          updated_by_name: s.updatedByName || latestAudit?.user_name || 'System Seed',
+          audit_count: auditCountBySupplier.get(logicalId) || 0,
+        };
+      });
 
     const seedPricePairs = [
       ['si_1', 'sup_1', 'ing_pork', 0.34, 1],
@@ -3103,35 +3561,54 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
       })
       .filter(Boolean);
 
+    const poInvoicesMap = new Map<string, any[]>();
+    for (const inv of snap.supplierInvoices) {
+      if (!inv.purchaseOrderId) continue;
+      const arr = poInvoicesMap.get(inv.purchaseOrderId) || [];
+      arr.push(inv);
+      poInvoicesMap.set(inv.purchaseOrderId, arr);
+    }
+
     const purchaseOrders = [...snap.purchaseOrders]
       .sort((a, b) => String(b.orderedAt).localeCompare(String(a.orderedAt)))
-      .map((po) => ({
-        id: toLogicalId(po.id, uid),
-        po_number: po.poNumber,
-        supplier_id: toLogicalId(po.supplierId, uid),
-        location_id: toLogicalId(po.locationId, uid),
-        status: po.status,
-        total_amount: po.totalAmount,
-        approved_by: po.approvedBy ? toLogicalId(po.approvedBy, uid) : null,
-        notes: po.notes,
-        ordered_at: po.orderedAt,
-        expected_at: po.expectedAt,
-        supplier_name: supMap.get(po.supplierId)?.name || 'Supplier',
-        location_name: locMap.get(po.locationId)?.name || 'Location',
-        items: (po.items || []).map((pi: any) => {
-          const item = itemMap.get(pi.inventoryItemId);
-          return {
-            id: pi.id,
-            purchase_order_id: toLogicalId(po.id, uid),
-            inventory_item_id: toLogicalId(pi.inventoryItemId, uid),
-            ordered_qty: pi.orderedQty,
-            received_qty: pi.receivedQty,
-            unit_cost: pi.unitCost,
-            item_name: item?.name || 'Item',
-            uom_code: item?.uomCode || '',
-          };
-        }),
-      }));
+      .map((po) => {
+        const linkedInvs = poInvoicesMap.get(po.id) || [];
+        const allLinkedPaid = linkedInvs.length > 0 && linkedInvs.every((inv) => inv.status === 'PAID');
+        const resolvedStatus = po.status === 'RECEIVED' && allLinkedPaid ? 'PAID' : po.status;
+        return {
+          id: toLogicalId(po.id, uid),
+          po_number: po.poNumber,
+          supplier_id: toLogicalId(po.supplierId, uid),
+          location_id: toLogicalId(po.locationId, uid),
+          status: resolvedStatus,
+          total_amount: po.totalAmount,
+          approved_by: po.approvedBy ? toLogicalId(po.approvedBy, uid) : null,
+          stage1_approved_by: po.stage1ApprovedBy ? toLogicalId(po.stage1ApprovedBy, uid) : null,
+          stage1_approved_by_name: po.stage1ApprovedByName || null,
+          stage1_approved_at: po.stage1ApprovedAt || null,
+          manager_signature_data: po.managerSignatureData || null,
+          manager_signer_name: po.managerSignerName || null,
+          signed_at: po.signedAt || null,
+          notes: po.notes,
+          ordered_at: po.orderedAt,
+          expected_at: po.expectedAt,
+          supplier_name: supMap.get(po.supplierId)?.name || 'Supplier',
+          location_name: locMap.get(po.locationId)?.name || 'Location',
+          items: (po.items || []).map((pi: any) => {
+            const item = itemMap.get(pi.inventoryItemId);
+            return {
+              id: pi.id,
+              purchase_order_id: toLogicalId(po.id, uid),
+              inventory_item_id: toLogicalId(pi.inventoryItemId, uid),
+              ordered_qty: pi.orderedQty,
+              received_qty: pi.receivedQty,
+              unit_cost: pi.unitCost,
+              item_name: item?.name || 'Item',
+              uom_code: item?.uomCode || '',
+            };
+          }),
+        };
+      });
 
     const poMap = new Map(snap.purchaseOrders.map((p) => [p.id, p]));
     const grnByInvNoMap = new Map(snap.goodsReceipts.map((g) => [`SI-${g.grnNumber}`, g]));
@@ -3194,7 +3671,29 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         };
       });
 
-    return { suppliers, priceComparison, purchaseOrders, invoices } as T;
+    return { approvalThreshold, suppliers, supplierAuditLogs, priceComparison, purchaseOrders, invoices } as T;
+  }
+
+  if (pathname === '/procurement/approval-config' && method === 'PUT') {
+    assertPerm(user, PERMISSIONS.PO_APPROVE);
+    const raw = Number(body?.approvalThreshold);
+    if (!Number.isFinite(raw) || raw < 0) {
+      throw new Error('Approval threshold must be a valid non-negative amount');
+    }
+    const nextThreshold = round2(raw);
+    try {
+      await updateDoc(doc(db, 'workspace_meta', `ws_${uid}`), {
+        poApprovalThreshold: nextThreshold,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `workspace_meta/ws_${uid}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_PO_APPROVAL_THRESHOLD', 'PurchaseOrderConfig', 'po_approval_threshold', {
+      approvalThreshold: nextThreshold,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true, approvalThreshold: nextThreshold } as T;
   }
 
   if (pathname === '/procurement/suppliers' && method === 'POST') {
@@ -3207,6 +3706,9 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
 
     const logicalId = crypto.randomUUID();
     const docId = toDocId(logicalId, uid);
+    const cleanTerms = Math.max(0, Math.round(Number(paymentTerms || 0)));
+    const actorName = String(user.fullName || user.email || 'Unknown User').trim().slice(0, 150);
+    const actorDocId = toDocId(user.id, uid);
     try {
       await setDoc(doc(db, 'suppliers', docId), {
         id: docId,
@@ -3218,14 +3720,21 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         email: String(email || '').trim().slice(0, 160),
         address: String(address || '').trim().slice(0, 300),
         tin: String(tin || '').trim().slice(0, 40),
-        paymentTerms: Math.max(0, Math.round(Number(paymentTerms || 0))),
+        paymentTerms: cleanTerms,
         isActive: true,
+        updatedBy: actorDocId,
+        updatedByName: actorName,
         createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
       });
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, `suppliers/${docId}`);
     }
-    await addAuditLog(uid, user.id, user.fullName, 'CREATE_SUPPLIER', 'Supplier', logicalId, { code: cleanCode, name: cleanName });
+    await addAuditLog(uid, user.id, user.fullName, 'CREATE_SUPPLIER', 'Supplier', logicalId, {
+      code: cleanCode,
+      name: cleanName,
+      paymentTerms: `${cleanTerms} days`,
+    });
     invalidateWorkspaceCache();
     return { id: logicalId } as T;
   }
@@ -3243,24 +3752,51 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     if (!cleanName) throw new Error('Supplier name is required');
     if (!cleanCode) throw new Error('Supplier code is required');
 
+    const nextContact = String(contactPerson ?? existingSup.contactPerson ?? '').trim().slice(0, 120);
+    const nextPhone = String(phone ?? existingSup.phone ?? '').trim().slice(0, 40);
+    const nextEmail = String(email ?? existingSup.email ?? '').trim().slice(0, 160);
+    const nextAddress = String(address ?? existingSup.address ?? '').trim().slice(0, 300);
+    const nextTin = String(tin ?? existingSup.tin ?? '').trim().slice(0, 40);
+    const nextTerms = Math.max(0, Math.round(Number(paymentTerms ?? existingSup.paymentTerms ?? 0)));
+    const actorName = String(user.fullName || user.email || 'Unknown User').trim().slice(0, 150);
+    const actorDocId = toDocId(user.id, uid);
+
+    const changes: string[] = [];
+    if (cleanCode !== String(existingSup.code || '')) changes.push(`Code: ${existingSup.code || '—'} -> ${cleanCode}`);
+    if (cleanName !== String(existingSup.name || '')) changes.push(`Name: ${existingSup.name || '—'} -> ${cleanName}`);
+    if (nextContact !== String(existingSup.contactPerson || '')) changes.push(`Contact: ${existingSup.contactPerson || '—'} -> ${nextContact || '—'}`);
+    if (nextPhone !== String(existingSup.phone || '')) changes.push(`Phone: ${existingSup.phone || '—'} -> ${nextPhone || '—'}`);
+    if (nextEmail !== String(existingSup.email || '')) changes.push(`Email: ${existingSup.email || '—'} -> ${nextEmail || '—'}`);
+    if (nextAddress !== String(existingSup.address || '')) changes.push(`Address: ${existingSup.address || '—'} -> ${nextAddress || '—'}`);
+    if (nextTin !== String(existingSup.tin || '')) changes.push(`TIN: ${existingSup.tin || '—'} -> ${nextTin || '—'}`);
+    if (nextTerms !== Number(existingSup.paymentTerms || 0)) changes.push(`Terms: ${existingSup.paymentTerms || 0}d -> ${nextTerms}d`);
+
     try {
       await updateDoc(doc(db, 'suppliers', existingSup.id), {
         code: cleanCode,
         name: cleanName,
-        contactPerson: String(contactPerson ?? existingSup.contactPerson ?? '').trim().slice(0, 120),
-        phone: String(phone ?? existingSup.phone ?? '').trim().slice(0, 40),
-        email: String(email ?? existingSup.email ?? '').trim().slice(0, 160),
-        address: String(address ?? existingSup.address ?? '').trim().slice(0, 300),
-        tin: String(tin ?? existingSup.tin ?? '').trim().slice(0, 40),
-        paymentTerms: Math.max(0, Math.round(Number(paymentTerms ?? existingSup.paymentTerms ?? 0))),
+        contactPerson: nextContact,
+        phone: nextPhone,
+        email: nextEmail,
+        address: nextAddress,
+        tin: nextTin,
+        paymentTerms: nextTerms,
+        updatedBy: actorDocId,
+        updatedByName: actorName,
+        updatedAt: serverTimestamp(),
       });
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `suppliers/${existingSup.id}`);
     }
-    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_SUPPLIER', 'Supplier', toLogicalId(existingSup.id, uid), {
-      code: cleanCode,
-      name: cleanName,
-    });
+    await addAuditLog(
+      uid,
+      user.id,
+      user.fullName,
+      'UPDATE_SUPPLIER',
+      'Supplier',
+      toLogicalId(existingSup.id, uid),
+      changes.length > 0 ? changes.join(' | ') : `Reviewed supplier profile (${cleanName})`,
+    );
     invalidateWorkspaceCache();
     return { ok: true, id: toLogicalId(existingSup.id, uid) } as T;
   }
@@ -3275,10 +3811,17 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     const hasHistory =
       snap.purchaseOrders.some((p) => p.supplierId === existingSup.id) ||
       snap.supplierInvoices.some((inv) => inv.supplierId === existingSup.id);
+    const actorName = String(user.fullName || user.email || 'Unknown User').trim().slice(0, 150);
+    const actorDocId = toDocId(user.id, uid);
 
     try {
       if (hasHistory) {
-        await updateDoc(doc(db, 'suppliers', existingSup.id), { isActive: false });
+        await updateDoc(doc(db, 'suppliers', existingSup.id), {
+          isActive: false,
+          updatedBy: actorDocId,
+          updatedByName: actorName,
+          updatedAt: serverTimestamp(),
+        });
       } else {
         await deleteDoc(doc(db, 'suppliers', existingSup.id));
       }
@@ -3295,12 +3838,27 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
 
   if (pathname === '/procurement/purchase-orders' && method === 'POST') {
     assertPerm(user, PERMISSIONS.PO_CREATE);
-    const { supplierId, locationId, expectedAt, notes, items } = body || {};
+    const { supplierId, locationId, expectedAt, notes, items, status } = body || {};
     if (!items?.length) throw new Error('PO requires at least one item');
+    const requestedStatus = String(status || 'PENDING_APPROVAL').toUpperCase();
+    if (!['DRAFT', 'PENDING_APPROVAL', 'APPROVED'].includes(requestedStatus)) {
+      throw new Error('Invalid initial purchase order status');
+    }
+    const approvalThreshold = getApprovalThreshold();
+    const totalAmount = round2(items.reduce((s: number, i: any) => s + Number(i.orderedQty) * Number(i.unitCost), 0));
+
+    if (requestedStatus === 'APPROVED') {
+      assertPerm(user, PERMISSIONS.PO_APPROVE);
+      if (totalAmount > approvalThreshold) {
+        throw new Error(
+          `Order total (${totalAmount.toFixed(2)}) exceeds the ${approvalThreshold.toFixed(2)} threshold. Submit for Stage 1 verification and Stage 2 Manager Digital Signature.`,
+        );
+      }
+    }
+
     const logicalId = crypto.randomUUID();
     const poDocId = toDocId(logicalId, uid);
     const poNumber = `PO-${Date.now().toString().slice(-6)}`;
-    const totalAmount = round2(items.reduce((s: number, i: any) => s + Number(i.orderedQty) * Number(i.unitCost), 0));
 
     try {
       await setDoc(doc(db, 'purchase_orders', poDocId), {
@@ -3309,10 +3867,10 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         poNumber,
         supplierId: toDocId(supplierId, uid),
         locationId: toDocId(locationId, uid),
-        status: 'PENDING_APPROVAL',
+        status: requestedStatus,
         totalAmount,
-        approvedBy: null,
-        notes: notes || '',
+        approvedBy: requestedStatus === 'APPROVED' ? toDocId(user.id, uid) : null,
+        notes: String(notes || '').slice(0, 500),
         items: items.map((i: any) => ({
           id: crypto.randomUUID(),
           inventoryItemId: toDocId(i.inventoryItemId, uid),
@@ -3328,22 +3886,47 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, `purchase_orders/${poDocId}`);
     }
-    await addAuditLog(uid, user.id, user.fullName, 'CREATE_PO', 'PurchaseOrder', logicalId, { poNumber, totalAmount });
+    await addAuditLog(uid, user.id, user.fullName, 'CREATE_PO', 'PurchaseOrder', logicalId, {
+      poNumber,
+      totalAmount,
+      status: requestedStatus,
+    });
     invalidateWorkspaceCache();
-    return { id: logicalId, poNumber } as T;
+    return { id: logicalId, poNumber, status: requestedStatus } as T;
   }
 
   if (pathname.startsWith('/procurement/purchase-orders/') && method === 'PUT') {
-    assertAnyPerm(user, PERMISSIONS.PO_CREATE, PERMISSIONS.PO_APPROVE);
+    assertAnyPerm(user, PERMISSIONS.PO_CREATE, PERMISSIONS.PO_APPROVE, PERMISSIONS.FINANCE_VIEW);
     const id = pathname.split('/')[3];
     const poDocId = toDocId(id, uid);
     const po = snap.purchaseOrders.find((p) => p.id === poDocId);
     if (!po) throw new Error('Purchase order not found');
-    if (po.status !== 'PENDING_APPROVAL') {
-      throw new Error('Only pending purchase orders can be edited');
+
+    const { supplierId, locationId, expectedAt, notes, items, approve, status } = body || {};
+    const requestedStatus = status ? String(status).toUpperCase() : undefined;
+
+    if (requestedStatus === 'PAID' && (po.status === 'RECEIVED' || po.status === 'PARTIAL' || po.status === 'PARTIALLY_RECEIVED')) {
+      assertAnyPerm(user, PERMISSIONS.FINANCE_VIEW, PERMISSIONS.PO_APPROVE);
+      try {
+        await updateDoc(doc(db, 'purchase_orders', poDocId), {
+          status: 'PAID',
+          updatedAt: serverTimestamp(),
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `purchase_orders/${poDocId}`);
+      }
+      await addAuditLog(uid, user.id, user.fullName, 'MARK_PO_PAID', 'PurchaseOrder', id, {
+        poNumber: po.poNumber,
+        status: 'PAID',
+      });
+      invalidateWorkspaceCache();
+      return { ok: true, id, poNumber: po.poNumber, status: 'PAID', totalAmount: po.totalAmount } as T;
     }
 
-    const { supplierId, locationId, expectedAt, notes, items, approve } = body || {};
+    if (po.status !== 'DRAFT' && po.status !== 'PENDING_APPROVAL') {
+      throw new Error('Only draft or pending purchase orders can be edited');
+    }
+
     if (!supplierId || !locationId) throw new Error('Supplier and delivery location are required');
     if (!Array.isArray(items) || items.length === 0) throw new Error('PO requires at least one item');
 
@@ -3365,12 +3948,28 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
       };
     });
 
-    if (approve) {
+    const approvalThreshold = getApprovalThreshold();
+    const totalAmount = round2(normalizedItems.reduce((s: number, i: any) => s + i.orderedQty * i.unitCost, 0));
+    const wantsApproval = Boolean(approve) || requestedStatus === 'APPROVED' || requestedStatus === 'PENDING_MANAGER_SIGNATURE';
+
+    if (wantsApproval) {
       assertPerm(user, PERMISSIONS.PO_APPROVE);
+    } else {
+      assertAnyPerm(user, PERMISSIONS.PO_CREATE, PERMISSIONS.PO_APPROVE);
     }
 
-    const totalAmount = round2(normalizedItems.reduce((s: number, i: any) => s + i.orderedQty * i.unitCost, 0));
-    const nextStatus = approve ? 'APPROVED' : 'PENDING_APPROVAL';
+    const requiresSignature = wantsApproval && totalAmount > approvalThreshold;
+    const nextStatus = wantsApproval
+      ? requiresSignature
+        ? 'PENDING_MANAGER_SIGNATURE'
+        : 'APPROVED'
+      : requestedStatus === 'DRAFT'
+        ? 'DRAFT'
+        : 'PENDING_APPROVAL';
+
+    const actorName = String(user.fullName || user.email || 'Manager').trim().slice(0, 150);
+    const nowIso = new Date().toISOString();
+
     const updates: Record<string, any> = {
       supplierId: toDocId(supplierId, uid),
       locationId: toDocId(locationId, uid),
@@ -3378,11 +3977,15 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
       notes: String(notes || '').slice(0, 500),
       items: normalizedItems,
       totalAmount,
+      status: nextStatus,
       updatedAt: serverTimestamp(),
     };
-    if (approve) {
-      updates.status = 'APPROVED';
+    if (nextStatus === 'APPROVED') {
       updates.approvedBy = toDocId(user.id, uid);
+    } else if (nextStatus === 'PENDING_MANAGER_SIGNATURE') {
+      updates.stage1ApprovedBy = toDocId(user.id, uid);
+      updates.stage1ApprovedByName = actorName;
+      updates.stage1ApprovedAt = nowIso;
     }
 
     try {
@@ -3390,13 +3993,25 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `purchase_orders/${poDocId}`);
     }
-    await addAuditLog(uid, user.id, user.fullName, approve ? 'REVIEW_AND_APPROVE_PO' : 'EDIT_PO', 'PurchaseOrder', id, {
-      poNumber: po.poNumber,
-      totalAmount,
-      status: nextStatus,
-    });
+    await addAuditLog(
+      uid,
+      user.id,
+      user.fullName,
+      nextStatus === 'PENDING_MANAGER_SIGNATURE'
+        ? 'STAGE1_APPROVE_PO'
+        : nextStatus === 'APPROVED'
+          ? 'REVIEW_AND_APPROVE_PO'
+          : 'EDIT_PO',
+      'PurchaseOrder',
+      id,
+      {
+        poNumber: po.poNumber,
+        totalAmount,
+        status: nextStatus,
+      },
+    );
     invalidateWorkspaceCache();
-    return { ok: true, id, poNumber: po.poNumber, status: nextStatus, totalAmount } as T;
+    return { ok: true, id, poNumber: po.poNumber, status: nextStatus, requiresSignature, totalAmount } as T;
   }
 
   if (pathname.startsWith('/procurement/purchase-orders/') && pathname.endsWith('/approve') && method === 'POST') {
@@ -3405,21 +4020,83 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     const poDocId = toDocId(id, uid);
     const po = snap.purchaseOrders.find((p) => p.id === poDocId);
     if (!po) throw new Error('Purchase order not found');
-    if (po.status !== 'PENDING_APPROVAL') {
-      throw new Error('Only pending purchase orders can be approved');
-    }
-    try {
-      await updateDoc(doc(db, 'purchase_orders', poDocId), {
-        status: 'APPROVED',
-        approvedBy: toDocId(user.id, uid),
-        updatedAt: serverTimestamp(),
+
+    const approvalThreshold = getApprovalThreshold();
+    const totalAmount = round2(Number(po.totalAmount || 0));
+    const actorName = String(user.fullName || user.email || 'Manager').trim().slice(0, 150);
+    const nowIso = new Date().toISOString();
+
+    if (po.status === 'DRAFT' || po.status === 'PENDING_APPROVAL') {
+      if (totalAmount > approvalThreshold) {
+        try {
+          await updateDoc(doc(db, 'purchase_orders', poDocId), {
+            status: 'PENDING_MANAGER_SIGNATURE',
+            stage1ApprovedBy: toDocId(user.id, uid),
+            stage1ApprovedByName: actorName,
+            stage1ApprovedAt: nowIso,
+            updatedAt: serverTimestamp(),
+          });
+        } catch (err) {
+          handleFirestoreError(err, OperationType.UPDATE, `purchase_orders/${poDocId}`);
+        }
+        await addAuditLog(uid, user.id, user.fullName, 'STAGE1_APPROVE_PO', 'PurchaseOrder', id, {
+          poNumber: po.poNumber,
+          totalAmount,
+          approvalThreshold,
+        });
+        invalidateWorkspaceCache();
+        return { ok: true, status: 'PENDING_MANAGER_SIGNATURE', requiresSignature: true } as T;
+      }
+
+      try {
+        await updateDoc(doc(db, 'purchase_orders', poDocId), {
+          status: 'APPROVED',
+          approvedBy: toDocId(user.id, uid),
+          updatedAt: serverTimestamp(),
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `purchase_orders/${poDocId}`);
+      }
+      await addAuditLog(uid, user.id, user.fullName, 'APPROVE_PO', 'PurchaseOrder', id, {
+        poNumber: po.poNumber,
+        totalAmount,
       });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `purchase_orders/${poDocId}`);
+      invalidateWorkspaceCache();
+      return { ok: true, status: 'APPROVED', requiresSignature: false } as T;
     }
-    await addAuditLog(uid, user.id, user.fullName, 'APPROVE_PO', 'PurchaseOrder', id, { poNumber: po.poNumber });
-    invalidateWorkspaceCache();
-    return { ok: true } as T;
+
+    if (po.status === 'PENDING_MANAGER_SIGNATURE') {
+      const signatureData = String(body?.signatureData || '').trim();
+      const signerName = String(body?.signerName || actorName).trim().slice(0, 150);
+      if (!signatureData.startsWith('data:image/') || signatureData.length < 30 || signatureData.length > 200000) {
+        throw new Error('A valid drawn manager digital signature is required for this purchase order');
+      }
+      if (!signerName) {
+        throw new Error('Manager signer name is required');
+      }
+      try {
+        await updateDoc(doc(db, 'purchase_orders', poDocId), {
+          status: 'APPROVED',
+          approvedBy: toDocId(user.id, uid),
+          managerSignatureData: signatureData,
+          managerSignerName: signerName,
+          signedAt: nowIso,
+          updatedAt: serverTimestamp(),
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `purchase_orders/${poDocId}`);
+      }
+      await addAuditLog(uid, user.id, user.fullName, 'STAGE2_SIGN_APPROVE_PO', 'PurchaseOrder', id, {
+        poNumber: po.poNumber,
+        signerName,
+        totalAmount,
+        signedAt: nowIso,
+      });
+      invalidateWorkspaceCache();
+      return { ok: true, status: 'APPROVED', signedAt: nowIso } as T;
+    }
+
+    throw new Error('Only draft, pending approval, or signature-pending purchase orders can be approved');
   }
 
   if (pathname.startsWith('/procurement/purchase-orders/') && pathname.endsWith('/cancel') && method === 'POST') {
@@ -3428,8 +4105,8 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     const poDocId = toDocId(id, uid);
     const po = snap.purchaseOrders.find((p) => p.id === poDocId);
     if (!po) throw new Error('Purchase order not found');
-    if (po.status !== 'PENDING_APPROVAL' && po.status !== 'APPROVED') {
-      throw new Error('Only pending or unreceived approved purchase orders can be cancelled');
+    if (po.status !== 'DRAFT' && po.status !== 'PENDING_APPROVAL' && po.status !== 'PENDING_MANAGER_SIGNATURE' && po.status !== 'APPROVED') {
+      throw new Error('Only draft, pending, signature-pending, or unreceived approved purchase orders can be cancelled');
     }
     const hasReceived = (po.items || []).some((pi: any) => Number(pi.receivedQty || 0) > 0);
     if (hasReceived) {
@@ -3608,13 +4285,26 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
       },
     ];
 
+    const nextInvStatus = newPaid >= Number(inv.totalAmount) ? 'PAID' : 'PARTIAL';
     const batch = writeBatch(db);
     batch.update(doc(db, 'supplier_invoices', invDocId), {
       paidAmount: newPaid,
-      status: newPaid >= Number(inv.totalAmount) ? 'PAID' : 'PARTIAL',
+      status: nextInvStatus,
       payments: nextPayments,
       updatedAt: serverTimestamp(),
     });
+
+    if (nextInvStatus === 'PAID' && inv.purchaseOrderId) {
+      const linkedPo = snap.purchaseOrders.find((p) => p.id === inv.purchaseOrderId);
+      const poInvoices = snap.supplierInvoices.filter((x) => x.purchaseOrderId === inv.purchaseOrderId);
+      const allPoInvoicesPaid = poInvoices.every((x) => (x.id === invDocId ? true : x.status === 'PAID'));
+      if (linkedPo && linkedPo.status === 'RECEIVED' && allPoInvoicesPaid) {
+        batch.update(doc(db, 'purchase_orders', linkedPo.id), {
+          status: 'PAID',
+          updatedAt: serverTimestamp(),
+        });
+      }
+    }
 
     const jeId = toDocId(crypto.randomUUID(), uid);
     batch.set(doc(db, 'journal_entries', jeId), {
@@ -4184,6 +4874,7 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
           address: l.address || '',
           is_active: l.isActive ? 1 : 0,
           kds_enabled: isLocationKdsEnabled(l) ? 1 : 0,
+          daily_sales_target: Number(l.dailySalesTarget ?? (l.type === 'FOOD_TRUCK' ? (l.code === 'TRK-02' ? 12000 : 15000) : 5000)),
           truck_id: trk ? toLogicalId(trk.id, uid) : null,
           plate_number: trk?.plateNumber || '',
           make_model: trk?.makeModel || '',
@@ -4334,7 +5025,7 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
       })();
     if (!existingLoc) throw new Error('Location not found');
 
-    const { name, code, type, address, plateNumber, makeModel, currentSite, odometerKm, status, kdsEnabled } = body || {};
+    const { name, code, type, address, plateNumber, makeModel, currentSite, odometerKm, status, kdsEnabled, dailySalesTarget } = body || {};
     const cleanName = String(name ?? existingLoc.name).trim().slice(0, 140);
     const cleanCode = String(code ?? existingLoc.code).trim().slice(0, 40);
     const nextType = type === 'COMMISSARY' || type === 'FOOD_TRUCK' ? type : existingLoc.type;
@@ -4345,6 +5036,10 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         : existingLoc.kdsEnabled !== undefined
           ? Boolean(existingLoc.kdsEnabled)
           : nextType === 'FOOD_TRUCK';
+    const nextDailyTarget =
+      dailySalesTarget !== undefined
+        ? Math.max(0, Number(dailySalesTarget) || 0)
+        : Number(existingLoc.dailySalesTarget ?? (nextType === 'FOOD_TRUCK' ? 15000 : 5000));
 
     if (!cleanName) throw new Error('Truck / Location name is required');
     if (!cleanCode) throw new Error('Location code is required');
@@ -4364,6 +5059,7 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
       address: cleanAddress || null,
       isActive: existingLoc.isActive !== false,
       kdsEnabled: nextKdsEnabled,
+      dailySalesTarget: nextDailyTarget,
     });
 
     const existingTruck = snap.foodTrucks.find((t) => t.locationId === existingLoc.id);
@@ -4449,6 +5145,38 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     });
     invalidateWorkspaceCache();
     return { ok: true, id: toLogicalId(existingLoc.id, uid), kds_enabled: nextKdsEnabled ? 1 : 0 } as T;
+  }
+
+  if (pathname.startsWith('/fleet/locations/') && pathname.endsWith('/target') && method === 'PATCH') {
+    assertPerm(user, PERMISSIONS.FLEET_MANAGE);
+    const rawId = pathname.split('/')[3];
+    const maybeDocId = toDocId(rawId, uid);
+    const existingLoc =
+      snap.locations.find((l) => l.id === maybeDocId) ||
+      (() => {
+        const trk = snap.foodTrucks.find((t) => t.id === maybeDocId);
+        return trk ? snap.locations.find((l) => l.id === trk.locationId) : undefined;
+      })();
+    if (!existingLoc) throw new Error('Location not found');
+
+    const rawTarget = Number(body?.dailySalesTarget);
+    if (!Number.isFinite(rawTarget) || rawTarget < 0) {
+      throw new Error('Daily sales target must be a valid non-negative amount');
+    }
+    const nextTarget = round2(rawTarget);
+    try {
+      await updateDoc(doc(db, 'locations', existingLoc.id), {
+        dailySalesTarget: nextTarget,
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `locations/${existingLoc.id}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_LOCATION_SALES_TARGET', 'Location', toLogicalId(existingLoc.id, uid), {
+      name: existingLoc.name,
+      dailySalesTarget: nextTarget,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true, id: toLogicalId(existingLoc.id, uid), daily_sales_target: nextTarget } as T;
   }
 
   if (pathname.startsWith('/fleet/locations/') && method === 'DELETE') {
@@ -4609,7 +5337,7 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     return { ok: true } as T;
   }
 
-  // 9. HR & PAYROLL
+  // 9. HR, ATTENDANCE KIOSK & PAYROLL
   if (pathname === '/hr' && method === 'GET') {
     assertPerm(user, PERMISSIONS.HR_MANAGE);
     const locMap = new Map(snap.locations.map((l) => [l.id, l]));
@@ -4628,25 +5356,36 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         pay_type: e.payType,
         base_rate: e.baseRate,
         avatar_url: e.avatarUrl || null,
+        face_descriptor_json: e.faceDescriptorJson || null,
+        face_enrolled_at: e.faceEnrolledAt || null,
+        attendance_pin: e.attendancePin || null,
         is_active: e.isActive ? 1 : 0,
       }));
 
     const attendance = [...snap.attendanceLogs]
       .sort((a, b) => String(b.clockIn).localeCompare(String(a.clockIn)))
-      .slice(0, 40)
+      .slice(0, 60)
       .map((a) => {
         const emp = empMap.get(a.employeeId);
+        const resolvedLocId = a.locationId || emp?.locationId || null;
         return {
           id: toLogicalId(a.id, uid),
           employee_id: toLogicalId(a.employeeId, uid),
           clock_in: a.clockIn,
           clock_out: a.clockOut,
-          overtime_hours: a.overtimeHours,
+          worked_hours: Number(a.workedHours || 0),
+          overtime_hours: Number(a.overtimeHours || 0),
           status: a.status,
+          verification_method: a.verificationMethod || 'MANUAL',
+          match_confidence: a.matchConfidence ?? null,
+          clock_in_photo: a.clockInPhoto || null,
+          clock_out_photo: a.clockOutPhoto || null,
+          notes: a.notes || null,
           full_name: emp?.fullName || '',
           employee_code: emp?.employeeCode || '',
-          location_id: emp?.locationId ? toLogicalId(emp.locationId, uid) : null,
-          location_name: emp?.locationId ? locMap.get(emp.locationId)?.name || '' : '',
+          employee_avatar_url: emp?.avatarUrl || null,
+          location_id: resolvedLocId ? toLogicalId(resolvedLocId, uid) : null,
+          location_name: resolvedLocId ? locMap.get(resolvedLocId)?.name || 'Commissary HQ' : 'Commissary HQ',
         };
       });
 
@@ -4676,49 +5415,6 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     return { employees, attendance, payrollRules: snap.meta?.payrollRule || null, payrollRuns } as T;
   }
 
-  if (pathname === '/hr/attendance/clock' && method === 'POST') {
-    assertPerm(user, PERMISSIONS.HR_MANAGE);
-    const { employeeId, action, overtimeHours } = body || {};
-    const empDocId = toDocId(employeeId, uid);
-    if (action === 'CLOCK_IN') {
-      const id = toDocId(crypto.randomUUID(), uid);
-      try {
-        await setDoc(doc(db, 'attendance_logs', id), {
-          id,
-          ownerUid: uid,
-          employeeId: empDocId,
-          clockIn: new Date().toISOString(),
-          clockOut: null,
-          overtimeHours: 0,
-          status: 'PRESENT',
-          notes: null,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      } catch (err) {
-        handleFirestoreError(err, OperationType.CREATE, `attendance_logs/${id}`);
-      }
-      invalidateWorkspaceCache();
-      return { id: toLogicalId(id, uid) } as T;
-    }
-
-    const openLog = [...snap.attendanceLogs]
-      .filter((a) => a.employeeId === empDocId && !a.clockOut)
-      .sort((a, b) => String(b.clockIn).localeCompare(String(a.clockIn)))[0];
-    if (!openLog) throw new Error('No active clock-in found for employee');
-    try {
-      await updateDoc(doc(db, 'attendance_logs', openLog.id), {
-        clockOut: new Date().toISOString(),
-        overtimeHours: Number(overtimeHours || 0),
-        updatedAt: serverTimestamp(),
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `attendance_logs/${openLog.id}`);
-    }
-    invalidateWorkspaceCache();
-    return { ok: true } as T;
-  }
-
   if (pathname === '/hr/payroll-rules' && method === 'PUT') {
     assertPerm(user, PERMISSIONS.PAYROLL_RUN);
     const nextRule = { ...(snap.meta?.payrollRule || {}), config: body.config };
@@ -4737,7 +5433,7 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
 
   if (pathname === '/hr/payroll/run' && method === 'POST') {
     assertPerm(user, PERMISSIONS.PAYROLL_RUN);
-    const { periodStart, periodEnd, daysPerEmployee } = body || {};
+    const { periodStart, periodEnd, daysPerEmployee, useAttendanceDays } = body || {};
     const cfg = snap.meta?.payrollRule?.config || {};
     const activeEmployees = snap.employees.filter((e) => e.isActive);
     const runId = toDocId(crypto.randomUUID(), uid);
@@ -4747,11 +5443,15 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     const items: any[] = [];
 
     for (const emp of activeEmployees) {
-      const days = Number(daysPerEmployee ?? 13);
-      const otHours = snap.attendanceLogs
-        .filter((a) => a.employeeId === emp.id)
-        .reduce((s, a) => s + Number(a.overtimeHours || 0), 0);
-      const dailyRate = emp.payType === 'MONTHLY' ? Number(emp.baseRate) / 26 : Number(emp.baseRate);
+      const periodLogs = snap.attendanceLogs.filter((a) => {
+        if (a.employeeId !== emp.id) return false;
+        const d = String(a.clockIn || '').slice(0, 10);
+        return (!periodStart || d >= periodStart) && (!periodEnd || d <= periodEnd);
+      });
+      const uniqueDays = new Set(periodLogs.map((a) => String(a.clockIn || '').slice(0, 10))).size;
+      const days = useAttendanceDays ? uniqueDays : Number(daysPerEmployee ?? 13);
+      const otHours = periodLogs.reduce((s, a) => s + Number(a.overtimeHours || 0), 0);
+      const dailyRate = emp.payType === 'HOURLY' ? Number(emp.baseRate) * 8 : emp.payType === 'MONTHLY' ? Number(emp.baseRate) / 26 : Number(emp.baseRate);
       const hourlyRate = dailyRate / 8;
       const otPay = round2(otHours * hourlyRate * (cfg.overtimeMultiplier || 1.25));
       const gross = round2(days * dailyRate + otPay);
@@ -5146,19 +5846,26 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     const locMap = new Map(snap.locations.map((l) => [l.id, l]));
     const users = [...snap.erpUsers]
       .sort((a, b) => Number(b.isActive) - Number(a.isActive) || String(a.fullName).localeCompare(String(b.fullName)))
-      .map((u) => ({
-        id: toLogicalId(u.id, uid),
-        email: u.email,
-        full_name: u.fullName,
-        role_id: u.roleId,
-        assigned_location_id: u.assignedLocationId ? toLogicalId(u.assignedLocationId, uid) : null,
-        avatar_url: u.avatarUrl || null,
-        is_active: u.isActive ? 1 : 0,
-        created_at: tsToIso(u.createdAt),
-        role_code: u.roleCode,
-        role_name: u.roleName,
-        location_name: u.assignedLocationId ? locMap.get(u.assignedLocationId)?.name || null : null,
-      }));
+      .map((u) => {
+        const lockRemaining = getLockRemainingMs(u);
+        return {
+          id: toLogicalId(u.id, uid),
+          email: u.email,
+          full_name: u.fullName,
+          role_id: u.roleId,
+          assigned_location_id: u.assignedLocationId ? toLogicalId(u.assignedLocationId, uid) : null,
+          avatar_url: u.avatarUrl || null,
+          has_pin: Boolean(u.shiftPinHash),
+          failed_login_attempts: Number(u.failedLoginAttempts || 0),
+          is_locked: lockRemaining > 0,
+          locked_until: lockRemaining > 0 ? u.lockedUntil : null,
+          is_active: u.isActive ? 1 : 0,
+          created_at: tsToIso(u.createdAt),
+          role_code: u.roleCode,
+          role_name: u.roleName,
+          location_name: u.assignedLocationId ? locMap.get(u.assignedLocationId)?.name || null : null,
+        };
+      });
 
     const employees = [...snap.employees]
       .sort((a, b) => Number(b.isActive) - Number(a.isActive) || String(a.employeeCode).localeCompare(String(b.employeeCode)))
@@ -5187,7 +5894,7 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
 
   if (pathname === '/settings/users' && method === 'POST') {
     assertOwnerOrSuperAdmin(user);
-    const { email, password, fullName, roleId, assignedLocationId, avatarUrl, isActive } = body || {};
+    const { email, password, shiftPin, fullName, roleId, assignedLocationId, avatarUrl, isActive } = body || {};
     const cleanEmail = String(email || '').trim().toLowerCase();
     const cleanName = String(fullName || '').trim();
     if (!cleanEmail) throw new Error('Email is required');
@@ -5203,6 +5910,8 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     const logicalId = crypto.randomUUID();
     const docId = toDocId(logicalId, uid);
     const pwdHash = await hashPassword(String(password));
+    const cleanPin = String(shiftPin || '').trim();
+    const pinHash = cleanPin ? await hashShiftPin(docId, cleanPin) : null;
 
     try {
       await setDoc(doc(db, 'erp_users', docId), {
@@ -5216,6 +5925,9 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         assignedLocationId: assignedLocationId ? toDocId(String(assignedLocationId), uid) : null,
         avatarUrl: avatarUrl || null,
         passwordHash: pwdHash,
+        shiftPinHash: pinHash,
+        failedLoginAttempts: 0,
+        lockedUntil: null,
         isActive: isActive !== false,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
@@ -5223,7 +5935,12 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, `erp_users/${docId}`);
     }
-    await addAuditLog(uid, user.id, user.fullName, 'CREATE_USER', 'User', logicalId, { email: cleanEmail, fullName: cleanName, roleCode: roleRow.code });
+    await addAuditLog(uid, user.id, user.fullName, 'CREATE_USER', 'User', logicalId, {
+      email: cleanEmail,
+      fullName: cleanName,
+      roleCode: roleRow.code,
+      hasPin: Boolean(pinHash),
+    });
     invalidateWorkspaceCache();
     return { id: logicalId } as T;
   }
@@ -5235,7 +5952,7 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     const existing = snap.erpUsers.find((u) => u.id === docId);
     if (!existing) throw new Error('User not found');
 
-    const { email, password, fullName, roleId, assignedLocationId, avatarUrl, isActive } = body || {};
+    const { email, password, shiftPin, clearPin, unlockAccount, fullName, roleId, assignedLocationId, avatarUrl, isActive } = body || {};
     const cleanEmail = String(email ?? existing.email).trim().toLowerCase();
     const cleanName = String(fullName ?? existing.fullName).trim();
     const nextRoleId = roleId || existing.roleId;
@@ -5274,12 +5991,28 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
       updatePayload.passwordHash = await hashPassword(String(password));
     }
 
+    if (clearPin) {
+      updatePayload.shiftPinHash = null;
+    } else if (shiftPin && String(shiftPin).trim().length > 0) {
+      updatePayload.shiftPinHash = await hashShiftPin(docId, String(shiftPin).trim());
+    }
+
+    if (unlockAccount) {
+      updatePayload.failedLoginAttempts = 0;
+      updatePayload.lockedUntil = null;
+    }
+
     try {
       await updateDoc(doc(db, 'erp_users', docId), updatePayload);
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `erp_users/${docId}`);
     }
-    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_USER', 'User', targetId, { email: cleanEmail, fullName: cleanName, roleCode: nextRole.code, isActive: nextActive });
+    await addAuditLog(uid, user.id, user.fullName, unlockAccount ? 'UNLOCK_USER' : 'UPDATE_USER', 'User', targetId, {
+      email: cleanEmail,
+      fullName: cleanName,
+      roleCode: nextRole.code,
+      isActive: nextActive,
+    });
     invalidateWorkspaceCache();
     return { ok: true } as T;
   }
@@ -5288,7 +6021,20 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     if (pathname.startsWith('/settings')) assertOwnerOrSuperAdmin(user);
     else assertPerm(user, PERMISSIONS.HR_MANAGE);
 
-    const { employeeCode, fullName, department, position, locationId, payType, baseRate, avatarUrl, isActive } = body || {};
+    const {
+      employeeCode,
+      fullName,
+      department,
+      position,
+      locationId,
+      payType,
+      baseRate,
+      avatarUrl,
+      faceDescriptorJson,
+      faceEnrolledAt,
+      attendancePin,
+      isActive,
+    } = body || {};
     const cleanName = String(fullName || '').trim();
     if (!cleanName) throw new Error('Employee full name is required');
     const code = String(employeeCode || `EMP-${Date.now().toString().slice(-3)}`).trim();
@@ -5310,6 +6056,9 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         payType: payType || 'DAILY',
         baseRate: Number(baseRate || 650),
         avatarUrl: avatarUrl || null,
+        faceDescriptorJson: faceDescriptorJson ? String(faceDescriptorJson).slice(0, 4096) : null,
+        faceEnrolledAt: faceEnrolledAt || (faceDescriptorJson ? new Date().toISOString() : null),
+        attendancePin: attendancePin ? String(attendancePin).trim().slice(0, 12) : null,
         isActive: isActive !== false,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
@@ -5330,7 +6079,20 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     const existing = snap.employees.find((e) => e.id === docId);
     if (!existing) throw new Error('Employee not found');
 
-    const { employeeCode, fullName, department, position, locationId, payType, baseRate, avatarUrl, isActive } = body || {};
+    const {
+      employeeCode,
+      fullName,
+      department,
+      position,
+      locationId,
+      payType,
+      baseRate,
+      avatarUrl,
+      faceDescriptorJson,
+      faceEnrolledAt,
+      attendancePin,
+      isActive,
+    } = body || {};
     const cleanName = String(fullName ?? existing.fullName).trim();
     const cleanCode = String(employeeCode ?? existing.employeeCode).trim();
     if (!cleanName) throw new Error('Employee full name is required');
@@ -5340,6 +6102,26 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     }
 
     const nextAvatar = avatarUrl !== undefined ? (avatarUrl ? String(avatarUrl) : null) : existing.avatarUrl ?? null;
+    const nextDescriptor =
+      faceDescriptorJson !== undefined
+        ? faceDescriptorJson
+          ? String(faceDescriptorJson).slice(0, 4096)
+          : null
+        : existing.faceDescriptorJson ?? null;
+    const nextEnrolledAt =
+      faceEnrolledAt !== undefined
+        ? faceEnrolledAt || null
+        : faceDescriptorJson !== undefined
+          ? faceDescriptorJson
+            ? new Date().toISOString()
+            : null
+          : existing.faceEnrolledAt ?? null;
+    const nextPin =
+      attendancePin !== undefined
+        ? attendancePin
+          ? String(attendancePin).trim().slice(0, 12)
+          : null
+        : existing.attendancePin ?? null;
     const nextActive = isActive === undefined ? Boolean(existing.isActive) : Boolean(isActive);
 
     try {
@@ -5352,6 +6134,9 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         payType: payType || existing.payType,
         baseRate: Number(baseRate ?? existing.baseRate),
         avatarUrl: nextAvatar,
+        faceDescriptorJson: nextDescriptor,
+        faceEnrolledAt: nextEnrolledAt,
+        attendancePin: nextPin,
         isActive: nextActive,
         updatedAt: serverTimestamp(),
       });

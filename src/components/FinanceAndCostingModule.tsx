@@ -7,6 +7,8 @@ interface Props {
   mode: 'finance' | 'costing';
   locations: LocationRow[];
   activeLocationId?: string;
+  quickAction?: { action: string; nonce: number } | null;
+  onQuickActionHandled?: () => void;
 }
 
 const getTodayLocalDate = () => {
@@ -14,7 +16,7 @@ const getTodayLocalDate = () => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 };
 
-export function FinanceAndCostingModule({ mode, locations, activeLocationId = 'ALL' }: Props) {
+export function FinanceAndCostingModule({ mode, locations, activeLocationId = 'ALL', quickAction, onQuickActionHandled }: Props) {
   const [finTab, setFinTab] = useState<'expenses' | 'closing' | 'ledger' | 'statements' | 'tax'>('expenses');
   const [finData, setFinData] = useState<any>(null);
   const [costData, setCostData] = useState<any>(null);
@@ -64,6 +66,18 @@ export function FinanceAndCostingModule({ mode, locations, activeLocationId = 'A
     if (mode === 'finance') loadFinance();
     else loadCosting();
   }, [mode, activeLocationId]);
+
+  useEffect(() => {
+    if (mode !== 'finance' || !quickAction) return;
+    if (quickAction.action === 'new-expense') {
+      setFinTab('expenses');
+      setShowExpModal(true);
+      onQuickActionHandled?.();
+    } else if (quickAction.action === 'daily-closing') {
+      setFinTab('closing');
+      onQuickActionHandled?.();
+    }
+  }, [mode, quickAction]);
 
   useEffect(() => {
     if (activeLocationId && activeLocationId !== 'ALL') {

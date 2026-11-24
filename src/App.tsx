@@ -17,12 +17,19 @@ import {
   Menu,
   X,
   Settings,
+  ScanFace,
+  Lock,
 } from 'lucide-react';
 import { onAuthStateChanged, signOut, User } from 'firebase/auth';
 import { MotionConfig } from 'motion/react';
 import { auth } from './lib/firebase.ts';
 import { apiFetch } from './lib/api.ts';
-import { resetFirebaseSyncCache, setActiveErpUserId, syncFirebaseUserAndSeed } from './lib/firestoreErp.ts';
+import {
+  resetFirebaseSyncCache,
+  setActiveErpUserId,
+  setSignedOutSession,
+  syncFirebaseUserAndSeed,
+} from './lib/firestoreErp.ts';
 import { AuthUser, LocationRow, PERMISSIONS } from './types/erp.ts';
 import { LoginView } from './components/LoginView.tsx';
 import { DashboardModule } from './components/DashboardModule.tsx';
@@ -33,6 +40,10 @@ import { ProcurementModule } from './components/ProcurementModule.tsx';
 import { FinanceAndCostingModule } from './components/FinanceAndCostingModule.tsx';
 import { OperationsHrCrmModule } from './components/OperationsHrCrmModule.tsx';
 import { AvatarBadge, SettingsUserControlModule } from './components/SettingsUserControlModule.tsx';
+import { FaceAttendanceKioskModal } from './components/FaceAttendanceKioskModal.tsx';
+import { SessionLockModal } from './components/SessionLockModal.tsx';
+
+const IDLE_LOCK_STORAGE_KEY = 'maximus_bbq_idle_lock_mins';
 
 interface ErrorBoundaryState {
   error: Error | null;
@@ -121,6 +132,42 @@ function AppShell() {
   const [notifications, setNotifications] = useState<any[]>([]);
   const [showNotifs, setShowNotifs] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [showGlobalKiosk, setShowGlobalKiosk] = useState(false);
+  const [kioskData, setKioskData] = useState<{ employees: any[]; attendance: any[] } | null>(null);
+  const [pendingQuickAction, setPendingQuickAction] = useState<{ tab: string; action: string; nonce: number } | null>(null);
+  const [isLocked, setIsLocked] = useState(false);
+  const [idleTimeoutMins, setIdleTimeoutMins] = useState<number>(() => {
+    try {
+      const saved = Number(localStorage.getItem(IDLE_LOCK_STORAGE_KEY));
+      if ([0, 5, 15, 30].includes(saved)) return saved;
+    } catch {
+      // ignore storage failure
+    }
+    return 15;
+  });
+
+  const handleQuickAction = (tab: string, action?: string) => {
+    setActiveTab(tab);
+    if (action) {
+      setPendingQuickAction({ tab, action, nonce: Date.now() });
+    } else {
+      setPendingQuickAction(null);
+    }
+  };
+
+  const loadAttendanceKiosk = async () => {
+    try {
+      const res = await apiFetch<{ employees: any[]; attendance: any[] }>('/attendance/kiosk');
+      setKioskData(res);
+    } catch {
+      // Handled gracefully if session expires
+    }
+  };
+
+  const openAttendanceKiosk = () => {
+    setShowGlobalKiosk(true);
+    void loadAttendanceKiosk();
+  };
 
   const loadNotifications = async (locId = activeLocationId) => {
     try {
@@ -135,12 +182,14 @@ function AppShell() {
   const loadWorkspaceContext = async (locId = activeLocationId) => {
     try {
       const qs = locId && locId !== 'ALL' ? `?locationId=${encodeURIComponent(locId)}` : '';
-      const [locs, notifs] = await Promise.all([
+      const [locs, notifs, kiosk] = await Promise.all([
         apiFetch<LocationRow[]>('/locations'),
         apiFetch<any[]>(`/notifications${qs}`),
+        apiFetch<{ employees: any[]; attendance: any[] }>('/attendance/kiosk').catch(() => null),
       ]);
       setLocations(locs);
       setNotifications(notifs);
+      if (kiosk) setKioskData(kiosk);
     } catch {
       // Handled gracefully if session expires or lacks permissions
     }
@@ -152,6 +201,7 @@ function AppShell() {
       setBootError('');
       if (!fbUser) {
         setUser(null);
+        setIsLocked(false);
         resetFirebaseSyncCache();
         setBooting(false);
         return;
@@ -161,23 +211,56 @@ function AppShell() {
         await syncFirebaseUserAndSeed(fbUser);
         const erpUser = await apiFetch<AuthUser>('/auth/me');
         setUser(erpUser);
+        setIsLocked(false);
         await loadWorkspaceContext();
       } catch (err: any) {
-        let msg = err?.message || 'Failed to load cloud workspace';
-        try {
-          const parsed = JSON.parse(msg);
-          if (parsed?.error) msg = `${parsed.error} (${parsed.operationType || 'read'} on ${parsed.path || 'workspace'})`;
-        } catch {
-          // plain error message
+        if (err?.message === 'SIGNED_OUT') {
+          setUser(null);
+          setIsLocked(false);
+        } else {
+          let msg = err?.message || 'Failed to load cloud workspace';
+          try {
+            const parsed = JSON.parse(msg);
+            if (parsed?.error) msg = `${parsed.error} (${parsed.operationType || 'read'} on ${parsed.path || 'workspace'})`;
+          } catch {
+            // plain error message
+          }
+          setBootError(msg);
+          setUser(null);
         }
-        setBootError(msg);
-        setUser(null);
       } finally {
         setBooting(false);
       }
     });
     return () => unsub();
   }, []);
+
+  useEffect(() => {
+    if (!user || isLocked || idleTimeoutMins <= 0) return;
+    let timerId: number | undefined;
+    const resetTimer = () => {
+      if (timerId !== undefined) window.clearTimeout(timerId);
+      timerId = window.setTimeout(() => {
+        setIsLocked(true);
+      }, idleTimeoutMins * 60 * 1000);
+    };
+    const events: Array<keyof WindowEventMap> = ['mousemove', 'mousedown', 'keydown', 'touchstart', 'scroll'];
+    events.forEach((evt) => window.addEventListener(evt, resetTimer, { passive: true }));
+    resetTimer();
+    return () => {
+      if (timerId !== undefined) window.clearTimeout(timerId);
+      events.forEach((evt) => window.removeEventListener(evt, resetTimer));
+    };
+  }, [user, isLocked, idleTimeoutMins]);
+
+  const handleIdleTimeoutChange = (mins: number) => {
+    setIdleTimeoutMins(mins);
+    try {
+      localStorage.setItem(IDLE_LOCK_STORAGE_KEY, String(mins));
+    } catch {
+      // ignore storage failure
+    }
+  };
 
   useEffect(() => {
     if (user) {
@@ -207,6 +290,7 @@ function AppShell() {
 
   const handleAuthenticated = async (u: AuthUser) => {
     setBootError('');
+    setIsLocked(false);
     const isOwnerOrSuper = u.roleCode === 'SUPER_ADMIN' || u.roleCode === 'BUSINESS_OWNER';
     const allowed = NAV_ITEMS.filter((n) => {
       if (n.ownerOrSuperAdminOnly) return isOwnerOrSuper;
@@ -228,7 +312,9 @@ function AppShell() {
 
   const handleLogout = async () => {
     await apiFetch('/auth/logout', { method: 'POST' }).catch(() => {});
+    setSignedOutSession(true);
     setActiveErpUserId(null);
+    setIsLocked(false);
     setUser(null);
     setActiveTab('dashboard');
   };
@@ -329,19 +415,50 @@ function AppShell() {
           </nav>
 
           <div className="p-4 border-t border-slate-200 space-y-2.5">
-            <div className="flex items-center gap-2.5 text-xs">
+            <button
+              type="button"
+              onClick={openAttendanceKiosk}
+              className="w-full inline-flex items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-800 transition-colors"
+            >
+              <ScanFace className="w-3.5 h-3.5" /> Attendance Kiosk
+            </button>
+            <div className="flex items-center gap-2.5 text-xs pt-0.5">
               <AvatarBadge name={user.fullName} src={user.avatarUrl} size="sm" />
               <div className="min-w-0">
                 <p className="font-semibold text-slate-900 truncate">{user.fullName}</p>
                 <p className="text-slate-500 truncate">{user.roleName}</p>
               </div>
             </div>
-            <button
-              onClick={handleLogout}
-              className="w-full inline-flex items-center justify-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50"
-            >
-              <LogOut className="w-3.5 h-3.5" /> Switch Role / Sign Out
-            </button>
+            <div className="flex items-center justify-between gap-2 text-[11px] text-slate-500">
+              <span>Auto-Lock</span>
+              <select
+                aria-label="Idle Auto-Lock Timeout"
+                value={idleTimeoutMins}
+                onChange={(e) => handleIdleTimeoutChange(Number(e.target.value))}
+                className="rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[11px] font-medium text-slate-700"
+              >
+                <option value={5}>5m idle</option>
+                <option value={15}>15m idle</option>
+                <option value={30}>30m idle</option>
+                <option value={0}>Off</option>
+              </select>
+            </div>
+            <div className="grid grid-cols-2 gap-1.5">
+              <button
+                type="button"
+                onClick={() => setIsLocked(true)}
+                className="inline-flex items-center justify-center gap-1 rounded-lg border border-slate-200 px-2.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+              >
+                <Lock className="w-3.5 h-3.5" /> Lock
+              </button>
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="inline-flex items-center justify-center gap-1 rounded-lg border border-slate-200 px-2.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+              >
+                <LogOut className="w-3.5 h-3.5" /> Sign Out
+              </button>
+            </div>
           </div>
         </aside>
 
@@ -383,10 +500,36 @@ function AppShell() {
                   );
                 })}
               </nav>
-              <div className="p-3 border-t">
-                <button onClick={handleLogout} className="w-full py-2 rounded-lg border text-xs font-medium">
-                  Sign Out
+              <div className="p-3 border-t space-y-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMobileMenuOpen(false);
+                    openAttendanceKiosk();
+                  }}
+                  className="w-full inline-flex items-center justify-center gap-1.5 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold"
+                >
+                  <ScanFace className="w-3.5 h-3.5" /> Attendance Kiosk
                 </button>
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMobileMenuOpen(false);
+                      setIsLocked(true);
+                    }}
+                    className="inline-flex items-center justify-center gap-1 py-2 rounded-lg border text-xs font-medium text-slate-700"
+                  >
+                    <Lock className="w-3.5 h-3.5" /> Lock
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleLogout}
+                    className="inline-flex items-center justify-center gap-1 py-2 rounded-lg border text-xs font-medium text-slate-700"
+                  >
+                    <LogOut className="w-3.5 h-3.5" /> Sign Out
+                  </button>
+                </div>
               </div>
             </div>
             <div className="flex-1 bg-black/40" onClick={() => setMobileMenuOpen(false)} />
@@ -430,6 +573,17 @@ function AppShell() {
                   <p className="text-[11px] text-slate-500 truncate max-w-[120px] sm:max-w-[180px]">{user.roleName}</p>
                 </div>
               </div>
+
+              <button
+                type="button"
+                onClick={() => setIsLocked(true)}
+                title="Lock Terminal"
+                aria-label="Lock Terminal"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap shrink-0"
+              >
+                <Lock className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Lock</span>
+              </button>
 
               <div className="relative">
                 <button
@@ -495,10 +649,15 @@ function AppShell() {
           <main className="flex-1 p-4 lg:p-8 max-w-[1440px] w-full mx-auto">
             {currentTab === 'dashboard' && (
               <DashboardModule
+                user={user}
                 locations={locations}
                 activeLocationId={activeLocationId}
                 onLocationChange={setActiveLocationId}
+                onLocationsChanged={loadWorkspaceContext}
                 onNavigate={setActiveTab}
+                onQuickAction={handleQuickAction}
+                kioskData={kioskData}
+                onOpenAttendanceKiosk={openAttendanceKiosk}
               />
             )}
             {currentTab === 'pos' && (
@@ -527,13 +686,27 @@ function AppShell() {
                 locations={locations}
                 activeLocationId={activeLocationId}
                 onLocationChange={setActiveLocationId}
+                quickAction={pendingQuickAction?.tab === 'inventory' ? pendingQuickAction : null}
+                onQuickActionHandled={() => setPendingQuickAction(null)}
               />
             )}
             {currentTab === 'procurement' && (
-              <ProcurementModule user={user} locations={locations} activeLocationId={activeLocationId} />
+              <ProcurementModule
+                user={user}
+                locations={locations}
+                activeLocationId={activeLocationId}
+                quickAction={pendingQuickAction?.tab === 'procurement' ? pendingQuickAction : null}
+                onQuickActionHandled={() => setPendingQuickAction(null)}
+              />
             )}
             {currentTab === 'finance' && (
-              <FinanceAndCostingModule mode="finance" locations={locations} activeLocationId={activeLocationId} />
+              <FinanceAndCostingModule
+                mode="finance"
+                locations={locations}
+                activeLocationId={activeLocationId}
+                quickAction={pendingQuickAction?.tab === 'finance' ? pendingQuickAction : null}
+                onQuickActionHandled={() => setPendingQuickAction(null)}
+              />
             )}
             {currentTab === 'costing' && (
               <FinanceAndCostingModule mode="costing" locations={locations} activeLocationId={activeLocationId} />
@@ -547,7 +720,13 @@ function AppShell() {
               />
             )}
             {currentTab === 'hr' && (
-              <OperationsHrCrmModule mode="hr" locations={locations} activeLocationId={activeLocationId} />
+              <OperationsHrCrmModule
+                mode="hr"
+                locations={locations}
+                activeLocationId={activeLocationId}
+                quickAction={pendingQuickAction?.tab === 'hr' ? pendingQuickAction : null}
+                onQuickActionHandled={() => setPendingQuickAction(null)}
+              />
             )}
             {currentTab === 'crm' && (
               <OperationsHrCrmModule mode="crm" locations={locations} activeLocationId={activeLocationId} />
@@ -565,6 +744,34 @@ function AppShell() {
             )}
           </main>
         </div>
+
+        <FaceAttendanceKioskModal
+          isOpen={showGlobalKiosk}
+          onClose={() => setShowGlobalKiosk(false)}
+          employees={kioskData?.employees || []}
+          attendance={kioskData?.attendance || []}
+          locations={locations}
+          defaultLocationId={activeLocationId}
+          canManageEmployees={
+            user.roleCode === 'SUPER_ADMIN' ||
+            user.roleCode === 'BUSINESS_OWNER' ||
+            user.permissions.includes(PERMISSIONS.HR_MANAGE)
+          }
+          onPunchSuccess={loadAttendanceKiosk}
+          onAutoEnrollSuccess={loadAttendanceKiosk}
+        />
+
+        {isLocked && (
+          <SessionLockModal
+            user={user}
+            firebaseEmail={firebaseUser.email}
+            onUnlocked={(updatedUser) => {
+              setUser(updatedUser);
+              setIsLocked(false);
+            }}
+            onSwitchOperator={handleLogout}
+          />
+        )}
       </div>
     </MotionConfig>
   );

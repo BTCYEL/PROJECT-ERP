@@ -7,9 +7,11 @@ interface Props {
   locations: LocationRow[];
   activeLocationId: string;
   onLocationChange?: (locationId: string) => void;
+  quickAction?: { action: string; nonce: number } | null;
+  onQuickActionHandled?: () => void;
 }
 
-export function InventoryModule({ locations, activeLocationId, onLocationChange }: Props) {
+export function InventoryModule({ locations, activeLocationId, onLocationChange, quickAction, onQuickActionHandled }: Props) {
   const [locFilter, setLocFilter] = useState(activeLocationId === 'ALL' ? '' : activeLocationId);
   const [subTab, setSubTab] = useState<'stock' | 'batches' | 'movements'>('stock');
   const [data, setData] = useState<any>({ items: [], batches: [], movements: [], uoms: [] });
@@ -61,6 +63,15 @@ export function InventoryModule({ locations, activeLocationId, onLocationChange 
   useEffect(() => {
     load();
   }, [locFilter]);
+
+  useEffect(() => {
+    if (!quickAction) return;
+    if (quickAction.action === 'count' || quickAction.action === 'transfer' || quickAction.action === 'waste') {
+      setSubTab('stock');
+      setModal(quickAction.action);
+      onQuickActionHandled?.();
+    }
+  }, [quickAction]);
 
   const submitTransfer = async (e: React.FormEvent) => {
     e.preventDefault();

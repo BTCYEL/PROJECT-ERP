@@ -625,7 +625,7 @@ export function getDashboardSummary(params: { from?: string; to?: string; locati
     .get(...locArgs) as any;
 
   const pendingPOs = (
-    db.prepare("SELECT COUNT(*) AS cnt FROM purchase_orders WHERE status IN ('PENDING_APPROVAL', 'APPROVED', 'PARTIAL')").get() as any
+    db.prepare("SELECT COUNT(*) AS cnt FROM purchase_orders WHERE status IN ('PENDING_APPROVAL', 'PENDING_MANAGER_SIGNATURE', 'APPROVED', 'PARTIAL')").get() as any
   ).cnt;
 
   const totalSales = round2(salesAgg.total_sales);

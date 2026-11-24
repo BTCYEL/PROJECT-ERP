@@ -62,6 +62,7 @@ export function initSchema() {
       address TEXT,
       is_active INTEGER NOT NULL DEFAULT 1,
       kds_enabled INTEGER NOT NULL DEFAULT 1,
+      daily_sales_target REAL NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -73,6 +74,9 @@ export function initSchema() {
       role_id TEXT NOT NULL REFERENCES roles(id),
       assigned_location_id TEXT REFERENCES locations(id),
       avatar_url TEXT,
+      shift_pin_hash TEXT,
+      failed_login_attempts INTEGER NOT NULL DEFAULT 0,
+      locked_until TEXT,
       is_active INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -290,7 +294,11 @@ export function initSchema() {
       address TEXT,
       tin TEXT,
       payment_terms INTEGER NOT NULL DEFAULT 0,
-      is_active INTEGER NOT NULL DEFAULT 1
+      is_active INTEGER NOT NULL DEFAULT 1,
+      updated_by TEXT,
+      updated_by_name TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
     CREATE TABLE IF NOT EXISTS supplier_items (
@@ -581,14 +589,41 @@ export function initSchema() {
     }
   };
   ensureColumn('users', 'avatar_url', 'TEXT');
+  ensureColumn('users', 'shift_pin_hash', 'TEXT');
+  ensureColumn('users', 'failed_login_attempts', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('users', 'locked_until', 'TEXT');
   ensureColumn('employees', 'avatar_url', 'TEXT');
   ensureColumn('products', 'expiry_date', 'TEXT');
   ensureColumn('locations', 'kds_enabled', 'INTEGER NOT NULL DEFAULT 1');
+  ensureColumn('locations', 'daily_sales_target', 'REAL NOT NULL DEFAULT 0');
+  ensureColumn('suppliers', 'updated_by', 'TEXT');
+  ensureColumn('suppliers', 'updated_by_name', 'TEXT');
+  ensureColumn('suppliers', 'created_at', 'TEXT');
+  ensureColumn('suppliers', 'updated_at', 'TEXT');
+  ensureColumn('purchase_orders', 'stage1_approved_by', 'TEXT');
+  ensureColumn('purchase_orders', 'stage1_approved_by_name', 'TEXT');
+  ensureColumn('purchase_orders', 'stage1_approved_at', 'TEXT');
+  ensureColumn('purchase_orders', 'manager_signature_data', 'TEXT');
+  ensureColumn('purchase_orders', 'manager_signer_name', 'TEXT');
+  ensureColumn('purchase_orders', 'signed_at', 'TEXT');
+  ensureColumn('employees', 'face_descriptor_json', 'TEXT');
+  ensureColumn('employees', 'face_enrolled_at', 'TEXT');
+  ensureColumn('employees', 'attendance_pin', 'TEXT');
+  ensureColumn('attendance_logs', 'location_id', 'TEXT');
+  ensureColumn('attendance_logs', 'verification_method', "TEXT DEFAULT 'MANUAL'");
+  ensureColumn('attendance_logs', 'match_confidence', 'REAL');
+  ensureColumn('attendance_logs', 'clock_in_photo', 'TEXT');
+  ensureColumn('attendance_logs', 'clock_out_photo', 'TEXT');
+  ensureColumn('attendance_logs', 'worked_hours', 'REAL DEFAULT 0');
 
   db.exec(`
     UPDATE users SET email = REPLACE(email, '@kalyefleet.ph', '@maximusbbq.ph') WHERE email LIKE '%@kalyefleet.ph';
     UPDATE app_settings SET value = 'Maximus Barbecue ERP' WHERE key = 'business_name' AND value = 'KalyeFleet Street Kitchen';
     INSERT OR IGNORE INTO role_permissions (role_id, permission_id) VALUES ('role_finance_manager', 'perm_hr_manage');
+    INSERT OR IGNORE INTO app_settings (key, value) VALUES ('po_approval_threshold', '10000');
+    UPDATE locations SET daily_sales_target = 15000 WHERE id = 'loc_truck_1' AND daily_sales_target = 0;
+    UPDATE locations SET daily_sales_target = 12000 WHERE id = 'loc_truck_2' AND daily_sales_target = 0;
+    UPDATE locations SET daily_sales_target = 5000 WHERE id = 'loc_commissary' AND daily_sales_target = 0;
   `);
 
   const hasSuperRole = db.prepare("SELECT id FROM roles WHERE id = 'role_super_admin'").get();
@@ -691,10 +726,10 @@ export function seedDatabase() {
     });
 
     // 3. Locations & Trucks
-    const insLoc = db.prepare('INSERT INTO locations (id, code, name, type, address, kds_enabled) VALUES (?, ?, ?, ?, ?, ?)');
-    insLoc.run('loc_commissary', 'COM-01', 'Central Commissary Kitchen', 'COMMISSARY', 'Pasig Food Hub, Metro Manila', 0);
-    insLoc.run('loc_truck_1', 'TRK-01', 'Truck 01 — BGC High Street', 'FOOD_TRUCK', '7th Ave & Bonifacio High St, Taguig', 1);
-    insLoc.run('loc_truck_2', 'TRK-02', 'Truck 02 — Ayala Triangle', 'FOOD_TRUCK', 'Makati Ave Night Market, Makati', 1);
+    const insLoc = db.prepare('INSERT INTO locations (id, code, name, type, address, kds_enabled, daily_sales_target) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    insLoc.run('loc_commissary', 'COM-01', 'Central Commissary Kitchen', 'COMMISSARY', 'Pasig Food Hub, Metro Manila', 0, 5000);
+    insLoc.run('loc_truck_1', 'TRK-01', 'Truck 01 — BGC High Street', 'FOOD_TRUCK', '7th Ave & Bonifacio High St, Taguig', 1, 15000);
+    insLoc.run('loc_truck_2', 'TRK-02', 'Truck 02 — Ayala Triangle', 'FOOD_TRUCK', 'Makati Ave Night Market, Makati', 1, 12000);
 
     const insTruck = db.prepare('INSERT INTO food_trucks (id, location_id, plate_number, make_model, status, current_site, odometer_km) VALUES (?, ?, ?, ?, ?, ?, ?)');
     insTruck.run('trk_1', 'loc_truck_1', 'NAA-4821', 'Isuzu NLR Custom Kitchen Van', 'ACTIVE', 'BGC High Street South', 42850);
@@ -984,6 +1019,7 @@ export function seedDatabase() {
     // App settings
     db.prepare('INSERT INTO app_settings (key, value) VALUES (?, ?)').run('currency', 'PHP');
     db.prepare('INSERT INTO app_settings (key, value) VALUES (?, ?)').run('business_name', 'Maximus Barbecue ERP');
+    db.prepare('INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)').run('po_approval_threshold', '10000');
   });
 
   tx();
