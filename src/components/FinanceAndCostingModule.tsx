@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Plus, Lock, AlertTriangle } from 'lucide-react';
+import { Plus, Lock, AlertTriangle, Pencil, Trash2, Tag, BookOpen, X, Check, Settings2, PlusCircle, RotateCcw } from 'lucide-react';
 import { apiFetch, formatNum, formatPHP } from '../lib/api.ts';
 import { LocationRow } from '../types/erp.ts';
 
@@ -20,16 +20,40 @@ export function FinanceAndCostingModule({ mode, locations, activeLocationId = 'A
   const [finTab, setFinTab] = useState<'expenses' | 'closing' | 'ledger' | 'statements' | 'tax'>('expenses');
   const [finData, setFinData] = useState<any>(null);
   const [costData, setCostData] = useState<any>(null);
+
+  // Expense modal & state
   const [showExpModal, setShowExpModal] = useState(false);
+  const [editingExpenseId, setEditingExpenseId] = useState<string | null>(null);
+  const [deletingExpense, setDeletingExpense] = useState<any | null>(null);
+  const [isSubmittingExp, setIsSubmittingExp] = useState(false);
+  const [isDeletingExp, setIsDeletingExp] = useState(false);
+
   const [expForm, setExpForm] = useState({
     locationId: 'loc_truck_1',
     accountId: 'acc_6100',
-    category: 'LPG',
+    category: 'FUEL',
     expenseDate: getTodayLocalDate(),
     amount: '',
     description: '',
     paidFromPettyCash: false,
   });
+
+  // Expense Categories management state
+  const [showCategoryModal, setShowCategoryModal] = useState(false);
+  const [editingCatId, setEditingCatId] = useState<string | null>(null);
+  const [catForm, setCatForm] = useState({ code: '', name: '', description: '', sortOrder: '1', isActive: true });
+  const [catErr, setCatErr] = useState('');
+  const [catMsg, setCatMsg] = useState('');
+  const [isSubmittingCat, setIsSubmittingCat] = useState(false);
+
+  // GL Accounts management state
+  const [showAccountModal, setShowAccountModal] = useState(false);
+  const [editingAccId, setEditingAccId] = useState<string | null>(null);
+  const [accForm, setAccForm] = useState({ code: '', name: '', type: 'EXPENSE' });
+  const [accErr, setAccErr] = useState('');
+  const [accMsg, setAccMsg] = useState('');
+  const [isSubmittingAcc, setIsSubmittingAcc] = useState(false);
+
   const [closingForm, setClosingForm] = useState({
     locationId: 'loc_truck_1',
     businessDate: new Date().toISOString().slice(0, 10),
@@ -71,7 +95,7 @@ export function FinanceAndCostingModule({ mode, locations, activeLocationId = 'A
     if (mode !== 'finance' || !quickAction) return;
     if (quickAction.action === 'new-expense') {
       setFinTab('expenses');
-      setShowExpModal(true);
+      handleOpenAddExpense();
       onQuickActionHandled?.();
     } else if (quickAction.action === 'daily-closing') {
       setFinTab('closing');
@@ -90,21 +114,228 @@ export function FinanceAndCostingModule({ mode, locations, activeLocationId = 'A
     }
   }, [activeLocationId, locations]);
 
+  const handleOpenAddExpense = () => {
+    setErr('');
+    setEditingExpenseId(null);
+    const defaultCat = finData?.expenseCategories?.[0]?.code || 'FUEL';
+    const defaultAcc = finData?.accounts?.find((a: any) => a.type === 'EXPENSE')?.id || 'acc_6100';
+    setExpForm({
+      locationId: activeLocationId !== 'ALL' && locations.some((l) => l.id === activeLocationId)
+        ? activeLocationId
+        : locations[0]?.id || 'loc_truck_1',
+      accountId: defaultAcc,
+      category: defaultCat,
+      expenseDate: getTodayLocalDate(),
+      amount: '',
+      description: '',
+      paidFromPettyCash: false,
+    });
+    setShowExpModal(true);
+  };
+
+  const handleStartEditExpense = (ex: any) => {
+    setErr('');
+    setEditingExpenseId(ex.id);
+    setExpForm({
+      locationId: ex.location_id || locations[0]?.id || 'loc_truck_1',
+      accountId: ex.account_id || finData?.accounts?.find((a: any) => a.type === 'EXPENSE')?.id || 'acc_6100',
+      category: ex.category || finData?.expenseCategories?.[0]?.code || 'FUEL',
+      expenseDate: String(ex.expense_date || '').slice(0, 10) || getTodayLocalDate(),
+      amount: String(ex.amount ?? ''),
+      description: ex.description || '',
+      paidFromPettyCash: Boolean(ex.paid_from_petty_cash),
+    });
+    setShowExpModal(true);
+  };
+
   const submitExpense = async (e: React.FormEvent) => {
     e.preventDefault();
     setErr('');
+    setIsSubmittingExp(true);
     try {
       const datePart = expForm.expenseDate || getTodayLocalDate();
-      await apiFetch('/finance/expenses', {
-        method: 'POST',
-        body: JSON.stringify({ ...expForm, expenseDate: `${datePart}T12:00:00.000Z` }),
-      });
+      const payload = { ...expForm, expenseDate: `${datePart}T12:00:00.000Z` };
+
+      if (editingExpenseId) {
+        await apiFetch(`/finance/expenses/${editingExpenseId}`, {
+          method: 'PUT',
+          body: JSON.stringify(payload),
+        });
+        setMsg('Operating expense updated successfully and linked journal entry reconciled.');
+      } else {
+        await apiFetch('/finance/expenses', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+        setMsg('Operating expense recorded and balanced Journal Entry posted.');
+      }
+
       setShowExpModal(false);
+      setEditingExpenseId(null);
       setExpForm({ ...expForm, expenseDate: getTodayLocalDate(), amount: '', description: '' });
-      setMsg('Expense recorded and balanced Journal Entry posted.');
       await loadFinance();
     } catch (e: any) {
-      setErr(e.message);
+      setErr(e.message || 'Error saving operating expense');
+    } finally {
+      setIsSubmittingExp(false);
+    }
+  };
+
+  const handleDeleteExpense = async () => {
+    if (!deletingExpense) return;
+    setErr('');
+    setIsDeletingExp(true);
+    try {
+      await apiFetch(`/finance/expenses/${deletingExpense.id}`, {
+        method: 'DELETE',
+      });
+      setMsg(`Operating expense (${formatPHP(deletingExpense.amount)}) deleted and petty cash float/GL journal adjusted.`);
+      setDeletingExpense(null);
+      await loadFinance();
+    } catch (e: any) {
+      setErr(e.message || 'Error deleting operating expense');
+    } finally {
+      setIsDeletingExp(false);
+    }
+  };
+
+  // --- Category Management Handlers ---
+  const handleOpenCategoryManager = () => {
+    setCatErr('');
+    setCatMsg('');
+    setEditingCatId(null);
+    const nextSort = (finData?.expenseCategories?.length || 0) + 1;
+    setCatForm({ code: '', name: '', description: '', sortOrder: String(nextSort), isActive: true });
+    setShowCategoryModal(true);
+  };
+
+  const handleStartEditCategory = (cat: any) => {
+    setCatErr('');
+    setCatMsg('');
+    setEditingCatId(cat.id);
+    setCatForm({
+      code: cat.code,
+      name: cat.name,
+      description: cat.description || '',
+      sortOrder: String(cat.sort_order ?? 0),
+      isActive: Boolean(cat.is_active),
+    });
+  };
+
+  const handleCancelEditCategory = () => {
+    setEditingCatId(null);
+    const nextSort = (finData?.expenseCategories?.length || 0) + 1;
+    setCatForm({ code: '', name: '', description: '', sortOrder: String(nextSort), isActive: true });
+  };
+
+  const handleSubmitCategory = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setCatErr('');
+    setCatMsg('');
+    setIsSubmittingCat(true);
+    try {
+      if (editingCatId) {
+        await apiFetch(`/finance/expense-categories/${editingCatId}`, {
+          method: 'PUT',
+          body: JSON.stringify(catForm),
+        });
+        setCatMsg(`Expense category "${catForm.name}" updated successfully.`);
+      } else {
+        await apiFetch('/finance/expense-categories', {
+          method: 'POST',
+          body: JSON.stringify(catForm),
+        });
+        setCatMsg(`Expense category "${catForm.name}" created successfully.`);
+      }
+      handleCancelEditCategory();
+      await loadFinance();
+    } catch (e: any) {
+      setCatErr(e.message || 'Error saving category');
+    } finally {
+      setIsSubmittingCat(false);
+    }
+  };
+
+  const handleDeleteCategory = async (cat: any) => {
+    if (!confirm(`Delete expense category "${cat.name}"?`)) return;
+    setCatErr('');
+    setCatMsg('');
+    try {
+      await apiFetch(`/finance/expense-categories/${cat.id}`, {
+        method: 'DELETE',
+      });
+      setCatMsg(`Expense category "${cat.name}" deleted.`);
+      await loadFinance();
+    } catch (e: any) {
+      setCatErr(e.message || 'Unable to delete category');
+    }
+  };
+
+  // --- GL Account Management Handlers ---
+  const handleOpenAccountManager = () => {
+    setAccErr('');
+    setAccMsg('');
+    setEditingAccId(null);
+    setAccForm({ code: '', name: '', type: 'EXPENSE' });
+    setShowAccountModal(true);
+  };
+
+  const handleStartEditAccount = (acc: any) => {
+    setAccErr('');
+    setAccMsg('');
+    setEditingAccId(acc.id);
+    setAccForm({
+      code: acc.code,
+      name: acc.name,
+      type: 'EXPENSE',
+    });
+  };
+
+  const handleCancelEditAccount = () => {
+    setEditingAccId(null);
+    setAccForm({ code: '', name: '', type: 'EXPENSE' });
+  };
+
+  const handleSubmitAccount = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAccErr('');
+    setAccMsg('');
+    setIsSubmittingAcc(true);
+    try {
+      if (editingAccId) {
+        await apiFetch(`/finance/accounts/${editingAccId}`, {
+          method: 'PUT',
+          body: JSON.stringify(accForm),
+        });
+        setAccMsg(`GL Expense Account ${accForm.code} updated successfully.`);
+      } else {
+        await apiFetch('/finance/accounts', {
+          method: 'POST',
+          body: JSON.stringify({ ...accForm, type: 'EXPENSE' }),
+        });
+        setAccMsg(`GL Expense Account ${accForm.code} created successfully.`);
+      }
+      handleCancelEditAccount();
+      await loadFinance();
+    } catch (e: any) {
+      setAccErr(e.message || 'Error saving GL account');
+    } finally {
+      setIsSubmittingAcc(false);
+    }
+  };
+
+  const handleDeleteAccount = async (acc: any) => {
+    if (!confirm(`Delete GL Account "${acc.code} ${acc.name}"?`)) return;
+    setAccErr('');
+    setAccMsg('');
+    try {
+      await apiFetch(`/finance/accounts/${acc.id}`, {
+        method: 'DELETE',
+      });
+      setAccMsg(`GL Account ${acc.code} deleted.`);
+      await loadFinance();
+    } catch (e: any) {
+      setAccErr(e.message || 'Unable to delete account');
     }
   };
 
@@ -243,7 +474,7 @@ export function FinanceAndCostingModule({ mode, locations, activeLocationId = 'A
   if (err && !finData) return <div className="p-4 rounded-lg border border-red-200 bg-red-50 text-xs text-red-700 font-medium">{err}</div>;
   if (!finData) return <div className="h-64 rounded-xl border bg-white animate-pulse" />;
 
-  const { expenses, closings, journals, accounts, pettyCash, statements } = finData;
+  const { expenses, closings, journals, accounts, pettyCash, statements, expenseCategories = [] } = finData;
 
   return (
     <div className="space-y-6">
@@ -252,29 +483,37 @@ export function FinanceAndCostingModule({ mode, locations, activeLocationId = 'A
           <h1 className="font-display text-2xl font-semibold text-slate-900">Finance, Accounting &amp; Daily Closing</h1>
           <p className="text-sm text-slate-500">Expenses, petty cash, Workflow C cash reconciliation, double-entry ledger, and configurable PH tax</p>
         </div>
-        <button
-          onClick={() => {
-            setErr('');
-            setExpForm((f) => ({
-              ...f,
-              locationId:
-                activeLocationId !== 'ALL' && locations.some((l) => l.id === activeLocationId)
-                  ? activeLocationId
-                  : locations.some((l) => l.id === f.locationId)
-                    ? f.locationId
-                    : locations[0]?.id || f.locationId,
-              expenseDate: f.expenseDate || getTodayLocalDate(),
-            }));
-            setShowExpModal(true);
-          }}
-          className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 whitespace-nowrap shrink-0"
-        >
-          <Plus className="w-4 h-4" /> Record Expense
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={handleOpenCategoryManager}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 whitespace-nowrap shrink-0 transition-colors"
+            title="Manage Expense Categories"
+          >
+            <Tag className="w-3.5 h-3.5 text-slate-500" /> Expense Categories
+          </button>
+          <button
+            type="button"
+            onClick={handleOpenAccountManager}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 whitespace-nowrap shrink-0"
+            title="Manage GL Expense Accounts"
+          >
+            <BookOpen className="w-3.5 h-3.5 text-slate-500" /> GL Accounts
+          </button>
+          <button
+            type="button"
+            onClick={handleOpenAddExpense}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 whitespace-nowrap shrink-0 transition-colors"
+          >
+            <Plus className="w-4 h-4" /> Record Operating Expense
+          </button>
+        </div>
       </div>
 
       {msg && <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 font-medium">{msg}</div>}
-      {err && !showExpModal && <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{err}</div>}
+      {err && !showExpModal && !showCategoryModal && !showAccountModal && (
+        <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{err}</div>
+      )}
 
       <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-lg border border-slate-200 w-fit">
         {([
@@ -307,13 +546,28 @@ export function FinanceAndCostingModule({ mode, locations, activeLocationId = 'A
                 </div>
                 <div className="text-right">
                   <p className="font-mono tabular-nums text-lg font-bold text-slate-900">{formatPHP(pc.current_balance)}</p>
-                  <p className="text-[11px] text-slate-500">Float: {formatPHP(pc.float_amount)}</p>
+                  <p className="text-[11px] text-slate-500 font-mono tabular-nums">Float: {formatPHP(pc.float_amount)}</p>
                 </div>
               </div>
             ))}
           </div>
 
           <div className="rounded-xl border border-slate-200 bg-white overflow-x-auto">
+            <div className="p-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="font-display text-sm font-semibold text-slate-900">Operating Expenses Register</h3>
+                <p className="text-xs text-slate-500">Add, edit, or delete operating costs and petty cash disbursements</p>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleOpenAddExpense}
+                  className="inline-flex items-center gap-1 text-xs font-semibold text-slate-800 hover:text-slate-950 px-2.5 py-1.5 rounded-md border border-slate-200 hover:bg-slate-50"
+                >
+                  <Plus className="w-3.5 h-3.5" /> Add Expense
+                </button>
+              </div>
+            </div>
             <table className="w-full text-left text-xs">
               <thead className="border-b border-slate-200 bg-slate-50 text-slate-500">
                 <tr>
@@ -323,23 +577,53 @@ export function FinanceAndCostingModule({ mode, locations, activeLocationId = 'A
                   <th className="p-3 font-medium">GL Account</th>
                   <th className="p-3 font-medium">Description</th>
                   <th className="p-3 font-medium text-right">Amount</th>
+                  <th className="p-3 font-medium text-right w-20">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {expenses.length === 0 ? (
                   <tr>
-                    <td colSpan={6} className="p-6 text-center text-slate-400">
+                    <td colSpan={7} className="p-6 text-center text-slate-400">
                       No operating expenses found for the selected truck / location.
                     </td>
                   </tr>
                 ) : expenses.map((ex: any) => (
-                  <tr key={ex.id}>
-                    <td className="p-3 font-mono text-slate-500">{String(ex.expense_date).slice(0, 10)}</td>
-                    <td className="p-3">{ex.location_name}</td>
-                    <td className="p-3 font-semibold">{ex.category}</td>
-                    <td className="p-3 text-slate-600">{ex.account_name}</td>
-                    <td className="p-3 text-slate-700">{ex.description}</td>
+                  <tr key={ex.id} className="hover:bg-slate-50/70 transition-colors">
+                    <td className="p-3 font-mono text-slate-500 whitespace-nowrap">{String(ex.expense_date).slice(0, 10)}</td>
+                    <td className="p-3 font-medium text-slate-800">{ex.location_name}</td>
+                    <td className="p-3">
+                      <div className="inline-flex items-center gap-1.5">
+                        <span className="font-semibold text-slate-800">{ex.category}</span>
+                        {ex.paid_from_petty_cash ? (
+                          <span className="text-[10px] font-medium text-amber-800 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
+                            Petty Cash
+                          </span>
+                        ) : null}
+                      </div>
+                    </td>
+                    <td className="p-3 text-slate-600 font-mono text-[11px]">{ex.account_name || ex.account_id}</td>
+                    <td className="p-3 text-slate-700 max-w-xs truncate">{ex.description}</td>
                     <td className="p-3 text-right font-mono tabular-nums font-semibold text-slate-900">{formatPHP(ex.amount)}</td>
+                    <td className="p-3 text-right">
+                      <div className="inline-flex items-center justify-end gap-1">
+                        <button
+                          type="button"
+                          onClick={() => handleStartEditExpense(ex)}
+                          title="Edit Operating Expense"
+                          className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md transition-colors"
+                        >
+                          <Pencil className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setDeletingExpense(ex)}
+                          title="Delete Operating Expense"
+                          className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -552,40 +836,94 @@ export function FinanceAndCostingModule({ mode, locations, activeLocationId = 'A
         </div>
       )}
 
+      {/* Record or Edit Operating Expense Modal */}
       {showExpModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <form onSubmit={submitExpense} className="w-full max-w-md rounded-xl bg-white p-5 space-y-3 border border-slate-200">
-            <h3 className="font-display text-base font-semibold text-slate-900">Record Operating Expense</h3>
+          <form onSubmit={submitExpense} className="w-full max-w-md rounded-xl bg-white p-5 space-y-3.5 border border-slate-200 shadow-xl">
+            <div className="flex items-center justify-between pb-1 border-b border-slate-100">
+              <h3 className="font-display text-base font-semibold text-slate-900">
+                {editingExpenseId ? 'Edit Operating Expense' : 'Record Operating Expense'}
+              </h3>
+              <button
+                type="button"
+                onClick={() => { setErr(''); setShowExpModal(false); setEditingExpenseId(null); }}
+                className="p-1 rounded text-slate-400 hover:text-slate-600 hover:bg-slate-100"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
             {err && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{err}</div>}
+
             <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">Branch / Location</label>
-              <select value={expForm.locationId} onChange={(e) => setExpForm({ ...expForm, locationId: e.target.value })} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs">
-                {locations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
+              <label className="block text-xs font-medium text-slate-600 mb-1">Branch / Location *</label>
+              <select
+                value={expForm.locationId}
+                onChange={(e) => setExpForm({ ...expForm, locationId: e.target.value })}
+                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs bg-white"
+              >
+                {locations.map((l) => (
+                  <option key={l.id} value={l.id}>{l.name} ({l.type})</option>
+                ))}
               </select>
             </div>
+
             <div className="grid grid-cols-2 gap-2.5">
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Expense Category</label>
-                <select value={expForm.category} onChange={(e) => setExpForm({ ...expForm, category: e.target.value })} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs">
-                  <option value="FUEL">Fuel</option>
-                  <option value="LPG">LPG</option>
-                  <option value="ELECTRICITY">Electricity / Water</option>
-                  <option value="PACKAGING">Packaging</option>
-                  <option value="MAINTENANCE">Vehicle Repairs</option>
-                  <option value="PERMITS">Permits &amp; Licenses</option>
-                  <option value="RENT_PARKING">Rent &amp; Parking</option>
-                  <option value="MARKETING">Marketing</option>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-medium text-slate-600">Expense Category *</label>
+                  <button
+                    type="button"
+                    onClick={() => { setShowCategoryModal(true); }}
+                    className="text-[11px] text-slate-500 hover:text-slate-900 font-medium underline"
+                  >
+                    Manage
+                  </button>
+                </div>
+                <select
+                  value={expForm.category}
+                  onChange={(e) => setExpForm({ ...expForm, category: e.target.value })}
+                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs bg-white font-medium"
+                >
+                  {(expenseCategories && expenseCategories.length > 0 ? expenseCategories : [
+                    { code: 'FUEL', name: 'Fuel' },
+                    { code: 'LPG', name: 'LPG' },
+                    { code: 'ELECTRICITY', name: 'Electricity' },
+                    { code: 'PACKAGING', name: 'Packaging' },
+                    { code: 'MAINTENANCE', name: 'Maintenance' },
+                    { code: 'PERMITS', name: 'Permits' },
+                    { code: 'RENT_PARKING', name: 'Rent & Parking' },
+                    { code: 'MARKETING', name: 'Marketing' },
+                    { code: 'MISC', name: 'Miscellaneous' },
+                  ]).filter((c: any) => c.is_active !== 0).map((c: any) => (
+                    <option key={c.id || c.code} value={c.code}>{c.name}</option>
+                  ))}
                 </select>
               </div>
+
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">GL Expense Account</label>
-                <select value={expForm.accountId} onChange={(e) => setExpForm({ ...expForm, accountId: e.target.value })} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs">
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-medium text-slate-600">GL Account *</label>
+                  <button
+                    type="button"
+                    onClick={() => { setShowAccountModal(true); }}
+                    className="text-[11px] text-slate-500 hover:text-slate-900 font-medium underline"
+                  >
+                    Manage
+                  </button>
+                </div>
+                <select
+                  value={expForm.accountId}
+                  onChange={(e) => setExpForm({ ...expForm, accountId: e.target.value })}
+                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs bg-white font-mono"
+                >
                   {accounts.filter((a: any) => a.type === 'EXPENSE').map((a: any) => (
-                    <option key={a.id} value={a.id}>{a.code} {a.name}</option>
+                    <option key={a.id} value={a.id}>{a.code} · {a.name}</option>
                   ))}
                 </select>
               </div>
             </div>
+
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
               <div>
                 <label className="block text-xs font-medium text-slate-600 mb-1">Expense Date *</label>
@@ -594,7 +932,7 @@ export function FinanceAndCostingModule({ mode, locations, activeLocationId = 'A
                   required
                   value={expForm.expenseDate}
                   onChange={(e) => setExpForm({ ...expForm, expenseDate: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono bg-white"
                 />
               </div>
               <div>
@@ -604,26 +942,407 @@ export function FinanceAndCostingModule({ mode, locations, activeLocationId = 'A
                   step="0.01"
                   min="0.01"
                   required
-                  placeholder="e.g. 1850"
+                  placeholder="e.g. 1850.00"
                   value={expForm.amount}
                   onChange={(e) => setExpForm({ ...expForm, amount: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono bg-white"
                 />
               </div>
             </div>
+
             <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">Description *</label>
-              <input type="text" required placeholder="e.g. 2x Solane LPG" value={expForm.description} onChange={(e) => setExpForm({ ...expForm, description: e.target.value })} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs" />
+              <label className="block text-xs font-medium text-slate-600 mb-1">Description / Memo *</label>
+              <input
+                type="text"
+                required
+                placeholder="e.g. 2x 11kg Solane LPG Tank refill for evening shift"
+                value={expForm.description}
+                onChange={(e) => setExpForm({ ...expForm, description: e.target.value })}
+                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs bg-white"
+              />
             </div>
-            <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
-              <input type="checkbox" checked={expForm.paidFromPettyCash} onChange={(e) => setExpForm({ ...expForm, paidFromPettyCash: e.target.checked })} />
-              Deduct from Truck Petty Cash Float
+
+            <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer pt-1">
+              <input
+                type="checkbox"
+                checked={expForm.paidFromPettyCash}
+                onChange={(e) => setExpForm({ ...expForm, paidFromPettyCash: e.target.checked })}
+                className="rounded border-slate-300 text-slate-900 focus:ring-slate-900"
+              />
+              <span>Deduct from Truck Petty Cash Float (reduces on-hand drawer cash)</span>
             </label>
-            <div className="flex justify-end gap-2 pt-2">
-              <button type="button" onClick={() => { setErr(''); setShowExpModal(false); }} className="px-4 py-2 rounded-lg border text-xs">Cancel</button>
-              <button type="submit" className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold">Post Expense &amp; GL</button>
+
+            <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => { setErr(''); setShowExpModal(false); setEditingExpenseId(null); }}
+                className="px-4 py-2 rounded-lg border border-slate-200 text-xs text-slate-700 hover:bg-slate-50 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={isSubmittingExp}
+                className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-60 transition-colors"
+              >
+                {isSubmittingExp ? 'Saving...' : editingExpenseId ? 'Update Operating Expense' : 'Post Expense & GL'}
+              </button>
             </div>
           </form>
+        </div>
+      )}
+
+      {/* Delete Operating Expense Confirmation Modal */}
+      {deletingExpense && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-sm rounded-xl bg-white p-5 space-y-3.5 border border-slate-200 shadow-xl">
+            <div className="flex items-center gap-2 text-red-600">
+              <AlertTriangle className="w-5 h-5" />
+              <h3 className="font-display text-base font-semibold text-slate-900">Delete Operating Expense</h3>
+            </div>
+            <p className="text-xs text-slate-600">
+              Are you sure you want to delete this expense of{' '}
+              <strong className="text-slate-900 font-mono">{formatPHP(deletingExpense.amount)}</strong> recorded for{' '}
+              <span className="font-medium">{deletingExpense.location_name}</span> ({deletingExpense.category})?
+            </p>
+            {deletingExpense.paid_from_petty_cash ? (
+              <p className="text-xs text-amber-800 bg-amber-50 p-2.5 rounded-lg border border-amber-200">
+                This expense was paid from petty cash. Deleting it will restore{' '}
+                <strong className="font-mono">{formatPHP(deletingExpense.amount)}</strong> back to the truck's petty cash float and remove the linked journal entry.
+              </p>
+            ) : (
+              <p className="text-xs text-slate-500 bg-slate-50 p-2.5 rounded-lg border border-slate-200">
+                The linked general ledger journal entry will also be deleted to maintain double-entry balancing.
+              </p>
+            )}
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setDeletingExpense(null)}
+                className="px-4 py-2 rounded-lg border border-slate-200 text-xs text-slate-700 hover:bg-slate-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingExp}
+                onClick={handleDeleteExpense}
+                className="px-4 py-2 rounded-lg bg-red-600 text-white text-xs font-semibold hover:bg-red-700 disabled:opacity-60"
+              >
+                {isDeletingExp ? 'Deleting...' : 'Confirm Delete'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Manage Expense Categories Modal */}
+      {showCategoryModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-2xl rounded-xl bg-white p-5 space-y-4 border border-slate-200 shadow-2xl max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between pb-2 border-b border-slate-200">
+              <div>
+                <h3 className="font-display text-base font-semibold text-slate-900 flex items-center gap-2">
+                  <Tag className="w-4 h-4 text-slate-700" /> Manage Expense Categories
+                </h3>
+                <p className="text-xs text-slate-500">Configure operating expense groupings used across food trucks</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowCategoryModal(false)}
+                className="p-1 rounded text-slate-400 hover:text-slate-600 hover:bg-slate-100"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {catErr && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{catErr}</div>}
+            {catMsg && <div className="p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 font-medium">{catMsg}</div>}
+
+            {/* Category Form */}
+            <form onSubmit={handleSubmitCategory} className="p-3.5 rounded-lg border border-slate-200 bg-slate-50 space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-slate-800">
+                  {editingCatId ? 'Edit Category' : 'Add New Category'}
+                </span>
+                {editingCatId && (
+                  <button
+                    type="button"
+                    onClick={handleCancelEditCategory}
+                    className="text-xs text-slate-500 hover:text-slate-800 flex items-center gap-1"
+                  >
+                    <RotateCcw className="w-3 h-3" /> Cancel Edit
+                  </button>
+                )}
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-600 mb-1">Code (Unique) *</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="e.g. ICE_SUPPLY"
+                    value={catForm.code}
+                    onChange={(e) => setCatForm({ ...catForm, code: e.target.value.toUpperCase().replace(/\s+/g, '_') })}
+                    className="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-mono"
+                  />
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="block text-[11px] font-medium text-slate-600 mb-1">Category Name *</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="e.g. Ice & Cooling Consumables"
+                    value={catForm.name}
+                    onChange={(e) => setCatForm({ ...catForm, name: e.target.value })}
+                    className="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs"
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-4 gap-2.5">
+                <div className="sm:col-span-3">
+                  <label className="block text-[11px] font-medium text-slate-600 mb-1">Description</label>
+                  <input
+                    type="text"
+                    placeholder="Short description or usage guidance"
+                    value={catForm.description}
+                    onChange={(e) => setCatForm({ ...catForm, description: e.target.value })}
+                    className="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-600 mb-1">Sort Order</label>
+                  <input
+                    type="number"
+                    value={catForm.sortOrder}
+                    onChange={(e) => setCatForm({ ...catForm, sortOrder: e.target.value })}
+                    className="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-mono"
+                  />
+                </div>
+              </div>
+              <div className="flex items-center justify-between pt-1">
+                <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={catForm.isActive}
+                    onChange={(e) => setCatForm({ ...catForm, isActive: e.target.checked })}
+                    className="rounded border-slate-300 text-slate-900"
+                  />
+                  <span>Active in Expense Dropdown</span>
+                </label>
+                <button
+                  type="submit"
+                  disabled={isSubmittingCat}
+                  className="px-3.5 py-1.5 rounded-md bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-60 transition-colors"
+                >
+                  {isSubmittingCat ? 'Saving...' : editingCatId ? 'Save Category' : '+ Add Category'}
+                </button>
+              </div>
+            </form>
+
+            {/* Categories Table */}
+            <div className="rounded-lg border border-slate-200 overflow-hidden">
+              <table className="w-full text-left text-xs">
+                <thead className="border-b border-slate-200 bg-slate-50 text-slate-500">
+                  <tr>
+                    <th className="p-2.5 font-medium">Code</th>
+                    <th className="p-2.5 font-medium">Name</th>
+                    <th className="p-2.5 font-medium">Description</th>
+                    <th className="p-2.5 font-medium text-center">Status</th>
+                    <th className="p-2.5 font-medium text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {(expenseCategories || []).map((cat: any) => (
+                    <tr key={cat.id || cat.code} className="hover:bg-slate-50">
+                      <td className="p-2.5 font-mono font-semibold text-slate-800">{cat.code}</td>
+                      <td className="p-2.5 font-medium text-slate-900">{cat.name}</td>
+                      <td className="p-2.5 text-slate-500 truncate max-w-[200px]">{cat.description || '—'}</td>
+                      <td className="p-2.5 text-center">
+                        <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-semibold ${
+                          cat.is_active !== 0 ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-slate-100 text-slate-500'
+                        }`}>
+                          {cat.is_active !== 0 ? 'Active' : 'Inactive'}
+                        </span>
+                      </td>
+                      <td className="p-2.5 text-right">
+                        <div className="inline-flex items-center justify-end gap-1">
+                          <button
+                            type="button"
+                            onClick={() => handleStartEditCategory(cat)}
+                            title="Edit Category"
+                            className="p-1 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded"
+                          >
+                            <Pencil className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteCategory(cat)}
+                            title="Delete Category"
+                            className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="flex justify-end pt-2">
+              <button
+                type="button"
+                onClick={() => setShowCategoryModal(false)}
+                className="px-4 py-2 rounded-lg bg-slate-100 text-slate-700 text-xs font-semibold hover:bg-slate-200"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Manage GL Accounts Modal */}
+      {showAccountModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-2xl rounded-xl bg-white p-5 space-y-4 border border-slate-200 shadow-2xl max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between pb-2 border-b border-slate-200">
+              <div>
+                <h3 className="font-display text-base font-semibold text-slate-900 flex items-center gap-2">
+                  <BookOpen className="w-4 h-4 text-slate-700" /> Manage GL Expense Accounts
+                </h3>
+                <p className="text-xs text-slate-500">Configure General Ledger expense accounts for chart-of-accounts compliance</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowAccountModal(false)}
+                className="p-1 rounded text-slate-400 hover:text-slate-600 hover:bg-slate-100"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {accErr && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{accErr}</div>}
+            {accMsg && <div className="p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 font-medium">{accMsg}</div>}
+
+            {/* Account Form */}
+            <form onSubmit={handleSubmitAccount} className="p-3.5 rounded-lg border border-slate-200 bg-slate-50 space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-slate-800">
+                  {editingAccId ? 'Edit GL Account' : 'Add Custom GL Expense Account'}
+                </span>
+                {editingAccId && (
+                  <button
+                    type="button"
+                    onClick={handleCancelEditAccount}
+                    className="text-xs text-slate-500 hover:text-slate-800 flex items-center gap-1"
+                  >
+                    <RotateCcw className="w-3 h-3" /> Cancel Edit
+                  </button>
+                )}
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-600 mb-1">Account Code *</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="e.g. 6500"
+                    value={accForm.code}
+                    onChange={(e) => setAccForm({ ...accForm, code: e.target.value })}
+                    className="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-mono"
+                  />
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="block text-[11px] font-medium text-slate-600 mb-1">Account Name *</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="e.g. Staff Meals &amp; Refreshments"
+                    value={accForm.name}
+                    onChange={(e) => setAccForm({ ...accForm, name: e.target.value })}
+                    className="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs"
+                  />
+                </div>
+              </div>
+              <div className="flex justify-end pt-1">
+                <button
+                  type="submit"
+                  disabled={isSubmittingAcc}
+                  className="px-3.5 py-1.5 rounded-md bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-60 transition-colors"
+                >
+                  {isSubmittingAcc ? 'Saving...' : editingAccId ? 'Save Account' : '+ Add Expense Account'}
+                </button>
+              </div>
+            </form>
+
+            {/* Accounts Table */}
+            <div className="rounded-lg border border-slate-200 overflow-hidden">
+              <table className="w-full text-left text-xs">
+                <thead className="border-b border-slate-200 bg-slate-50 text-slate-500">
+                  <tr>
+                    <th className="p-2.5 font-medium">Code</th>
+                    <th className="p-2.5 font-medium">Account Name</th>
+                    <th className="p-2.5 font-medium">Classification</th>
+                    <th className="p-2.5 font-medium">Type</th>
+                    <th className="p-2.5 font-medium text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {accounts.filter((a: any) => a.type === 'EXPENSE').map((acc: any) => (
+                    <tr key={acc.id} className="hover:bg-slate-50">
+                      <td className="p-2.5 font-mono font-semibold text-slate-800">{acc.code}</td>
+                      <td className="p-2.5 font-medium text-slate-900">{acc.name}</td>
+                      <td className="p-2.5 text-slate-500">
+                        {acc.is_system ? (
+                          <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded font-mono">System</span>
+                        ) : (
+                          <span className="text-[10px] bg-blue-50 text-blue-700 border border-blue-200 px-2 py-0.5 rounded font-medium">Custom</span>
+                        )}
+                      </td>
+                      <td className="p-2.5 text-slate-500 font-mono text-[11px]">{acc.type}</td>
+                      <td className="p-2.5 text-right">
+                        {acc.is_system ? (
+                          <span className="text-[11px] text-slate-400 italic">Protected</span>
+                        ) : (
+                          <div className="inline-flex items-center justify-end gap-1">
+                            <button
+                              type="button"
+                              onClick={() => handleStartEditAccount(acc)}
+                              title="Edit Account"
+                              className="p-1 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded"
+                            >
+                              <Pencil className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteAccount(acc)}
+                              title="Delete Account"
+                              className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="flex justify-end pt-2">
+              <button
+                type="button"
+                onClick={() => setShowAccountModal(false)}
+                className="px-4 py-2 rounded-lg bg-slate-100 text-slate-700 text-xs font-semibold hover:bg-slate-200"
+              >
+                Close
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

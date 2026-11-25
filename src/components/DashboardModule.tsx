@@ -38,6 +38,7 @@ import {
 } from 'recharts';
 import { apiFetch, downloadCsv, formatNum, formatPHP } from '../lib/api.ts';
 import { AuthUser, LocationRow, PERMISSIONS } from '../types/erp.ts';
+import { AiInventoryForecastWidget } from './AiInventoryForecastWidget.tsx';
 
 interface Props {
   user?: AuthUser;
@@ -1057,6 +1058,14 @@ export function DashboardModule({
           </div>
         )}
       </section>
+
+      {/* AI-Based Inventory Forecasting Widget */}
+      <AiInventoryForecastWidget
+        selectedLocationId={locationFilter}
+        locations={locations}
+        onNavigate={onNavigate}
+        onQuickAction={onQuickAction}
+      />
 
       {/* Bottom Operational Grids: Truck Performance, Top Products & Alerts */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">

@@ -476,6 +476,16 @@ export function initSchema() {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS expense_categories (
+      id TEXT PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      description TEXT,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS petty_cash_funds (
       id TEXT PRIMARY KEY,
       location_id TEXT UNIQUE NOT NULL REFERENCES locations(id),
@@ -997,6 +1007,18 @@ export function seedDatabase() {
       insJL.run(`jl_${i}_4`, jeId, 'acc_5000', cogs, 0, 'Cost of Goods Sold');
       insJL.run(`jl_${i}_5`, jeId, 'acc_1200', 0, cogs, 'Inventory Asset Reduction');
     });
+
+    // Seed default expense categories
+    const insExpCat = db.prepare('INSERT OR IGNORE INTO expense_categories (id, code, name, description, sort_order, is_active) VALUES (?, ?, ?, ?, ?, ?)');
+    insExpCat.run('cat_fuel', 'FUEL', 'Fuel (Diesel / Gasoline)', 'Food truck and generator fuel', 1, 1);
+    insExpCat.run('cat_lpg', 'LPG', 'LPG Tank Refills', 'Cooking and grill gas', 2, 1);
+    insExpCat.run('cat_electricity', 'ELECTRICITY', 'Electricity & Water', 'Site plug-in and utilities', 3, 1);
+    insExpCat.run('cat_packaging', 'PACKAGING', 'Packaging & Disposables', 'Boxes, cups, napkins, paper wraps', 4, 1);
+    insExpCat.run('cat_maintenance', 'MAINTENANCE', 'Vehicle & Equipment Repairs', 'Preventive truck and generator repairs', 5, 1);
+    insExpCat.run('cat_permits', 'PERMITS', 'Permits & City Licenses', 'Barangay, mayor, sanitary permits', 6, 1);
+    insExpCat.run('cat_rent', 'RENT_PARKING', 'Truck Slot Rent & Parking', 'Night market and site fees', 7, 1);
+    insExpCat.run('cat_marketing', 'MARKETING', 'Marketing & Local Ads', 'Promotions and social campaigns', 8, 1);
+    insExpCat.run('cat_misc', 'MISC', 'Miscellaneous Operating', 'Ice, small tools, and cleaning consumables', 9, 1);
 
     // Historical Expenses
     const insExp = db.prepare('INSERT INTO expenses (id, location_id, account_id, category, amount, description, expense_date) VALUES (?, ?, ?, ?, ?, ?, ?)');

@@ -336,14 +336,15 @@ service cloud.firestore {
 
     function isValidAccount(data) {
       return data.keys().hasAll(['id', 'ownerUid', 'code', 'name', 'type', 'isSystem', 'createdAt'])
-        && data.keys().hasOnly(['id', 'ownerUid', 'code', 'name', 'type', 'isSystem', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'code', 'name', 'type', 'isSystem', 'createdAt', 'updatedAt'])
         && isValidId(data.id)
         && isValidId(data.ownerUid)
         && isValidString(data.code, 1, 20)
         && isValidString(data.name, 1, 150)
         && data.type in ['ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'EXPENSE']
         && data.isSystem is bool
-        && data.createdAt is timestamp;
+        && data.createdAt is timestamp
+        && (!('updatedAt' in data) || data.updatedAt is timestamp);
     }
 
     function isValidJournalEntry(data) {
@@ -363,7 +364,7 @@ service cloud.firestore {
 
     function isValidExpense(data) {
       return data.keys().hasAll(['id', 'ownerUid', 'locationId', 'accountId', 'category', 'amount', 'description', 'isRecurring', 'paidFromPettyCash', 'expenseDate', 'createdAt'])
-        && data.keys().hasOnly(['id', 'ownerUid', 'locationId', 'accountId', 'category', 'amount', 'description', 'isRecurring', 'paidFromPettyCash', 'expenseDate', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'locationId', 'accountId', 'category', 'amount', 'description', 'isRecurring', 'paidFromPettyCash', 'expenseDate', 'createdAt', 'updatedAt'])
         && isValidId(data.id)
         && isValidId(data.ownerUid)
         && isValidId(data.locationId)
@@ -374,7 +375,22 @@ service cloud.firestore {
         && data.isRecurring is bool
         && data.paidFromPettyCash is bool
         && isValidString(data.expenseDate, 1, 40)
-        && data.createdAt is timestamp;
+        && data.createdAt is timestamp
+        && (!('updatedAt' in data) || data.updatedAt is timestamp);
+    }
+
+    function isValidExpenseCategory(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'code', 'name', 'isActive', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'code', 'name', 'description', 'sortOrder', 'isActive', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.code, 1, 64)
+        && isValidString(data.name, 1, 120)
+        && isNullableString(data.description, 250)
+        && (!('sortOrder' in data) || data.sortOrder is int)
+        && data.isActive is bool
+        && data.createdAt is timestamp
+        && (!('updatedAt' in data) || data.updatedAt is timestamp);
     }
 
     function isValidDailyClosing(data) {
@@ -804,8 +820,13 @@ service cloud.firestore {
       allow create: if isEmailVerified() && isValidId(accountId) && isValidAccount(incoming())
         && incoming().ownerUid == request.auth.uid
         && incoming().createdAt == request.time;
-      allow update: if false;
-      allow delete: if isValidId(accountId) && isDocOwner();
+      allow update: if isValidId(accountId) && isDocOwner() && isValidAccount(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['code', 'name', 'updatedAt'])
+        );
+      allow delete: if isValidId(accountId) && isDocOwner() && (isBootstrapAdmin() || resource.data.isSystem == false);
     }
 
     match /journal_entries/{jeId} {
@@ -814,7 +835,9 @@ service cloud.firestore {
       allow create: if isEmailVerified() && isValidId(jeId) && isValidJournalEntry(incoming())
         && incoming().ownerUid == request.auth.uid
         && incoming().createdAt == request.time;
-      allow update, delete: if false;
+      allow update: if isValidId(jeId) && isDocOwner() && isValidJournalEntry(incoming())
+        && preservesImmutableOwnerAndCreated();
+      allow delete: if isValidId(jeId) && isDocOwner();
     }
 
     match /expenses/{expenseId} {
@@ -823,7 +846,20 @@ service cloud.firestore {
       allow create: if isEmailVerified() && isValidId(expenseId) && isValidExpense(incoming())
         && incoming().ownerUid == request.auth.uid
         && incoming().createdAt == request.time;
-      allow update, delete: if false;
+      allow update: if isValidId(expenseId) && isDocOwner() && isValidExpense(incoming())
+        && preservesImmutableOwnerAndCreated();
+      allow delete: if isValidId(expenseId) && isDocOwner();
+    }
+
+    match /expense_categories/{categoryId} {
+      allow get: if isValidId(categoryId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(categoryId) && isValidExpenseCategory(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update: if isValidId(categoryId) && isDocOwner() && isValidExpenseCategory(incoming())
+        && preservesImmutableOwnerAndCreated();
+      allow delete: if isValidId(categoryId) && isDocOwner();
     }
 
     match /daily_closings/{closingId} {

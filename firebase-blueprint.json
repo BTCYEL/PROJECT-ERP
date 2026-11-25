@@ -320,7 +320,8 @@
         "name": { "type": "string", "minLength": 1, "maxLength": 150 },
         "type": { "type": "string", "enum": ["ASSET", "LIABILITY", "EQUITY", "REVENUE", "EXPENSE"] },
         "isSystem": { "type": "boolean" },
-        "createdAt": { "type": "string", "format": "date-time" }
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "ownerUid", "code", "name", "type", "isSystem", "createdAt"]
     },
@@ -357,9 +358,27 @@
         "isRecurring": { "type": "boolean" },
         "paidFromPettyCash": { "type": "boolean" },
         "expenseDate": { "type": "string", "maxLength": 40 },
-        "createdAt": { "type": "string", "format": "date-time" }
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "ownerUid", "locationId", "accountId", "category", "amount", "description", "isRecurring", "paidFromPettyCash", "expenseDate", "createdAt"]
+    },
+    "ExpenseCategory": {
+      "title": "ExpenseCategory",
+      "description": "Operating expense category definition",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "description": { "type": "string", "maxLength": 250 },
+        "sortOrder": { "type": "integer" },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "code", "name", "isActive", "createdAt"]
     },
     "DailyClosing": {
       "title": "DailyClosing",
@@ -599,6 +618,7 @@
     "/accounts/{accountId}": { "schema": { "$ref": "#/entities/Account" }, "description": "Chart of accounts" },
     "/journal_entries/{jeId}": { "schema": { "$ref": "#/entities/JournalEntry" }, "description": "Double-entry journal entries" },
     "/expenses/{expenseId}": { "schema": { "$ref": "#/entities/Expense" }, "description": "Operating expenses" },
+    "/expense_categories/{categoryId}": { "schema": { "$ref": "#/entities/ExpenseCategory" }, "description": "Operating expense categories" },
     "/daily_closings/{closingId}": { "schema": { "$ref": "#/entities/DailyClosing" }, "description": "Daily Z-readings" },
     "/tax_configs/{taxId}": { "schema": { "$ref": "#/entities/TaxConfig" }, "description": "Tax rate configs" },
     "/locations/{locationId}": { "schema": { "$ref": "#/entities/Location" }, "description": "Commissary and truck locations" },

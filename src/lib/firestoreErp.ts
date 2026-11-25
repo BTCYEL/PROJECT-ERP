@@ -111,6 +111,18 @@ function formatDetailsText(details?: Record<string, unknown> | string | null): s
 // =====================================================
 // SNAPSHOT LOADER (WORKSPACE SCOPED BY ownerUid)
 // =====================================================
+export const DEFAULT_EXPENSE_CATEGORIES = [
+  { id: 'cat_fuel', code: 'FUEL', name: 'Fuel (Diesel / Gasoline)', description: 'Food truck and generator fuel', sortOrder: 1, isActive: true },
+  { id: 'cat_lpg', code: 'LPG', name: 'LPG Tank Refills', description: 'Cooking and grill gas', sortOrder: 2, isActive: true },
+  { id: 'cat_electricity', code: 'ELECTRICITY', name: 'Electricity & Water', description: 'Site plug-in and utilities', sortOrder: 3, isActive: true },
+  { id: 'cat_packaging', code: 'PACKAGING', name: 'Packaging & Disposables', description: 'Boxes, cups, napkins, paper wraps', sortOrder: 4, isActive: true },
+  { id: 'cat_maintenance', code: 'MAINTENANCE', name: 'Vehicle & Equipment Repairs', description: 'Preventive truck and generator repairs', sortOrder: 5, isActive: true },
+  { id: 'cat_permits', code: 'PERMITS', name: 'Permits & City Licenses', description: 'Barangay, mayor, sanitary permits', sortOrder: 6, isActive: true },
+  { id: 'cat_rent', code: 'RENT_PARKING', name: 'Truck Slot Rent & Parking', description: 'Night market and site fees', sortOrder: 7, isActive: true },
+  { id: 'cat_marketing', code: 'MARKETING', name: 'Marketing & Local Ads', description: 'Promotions and social campaigns', sortOrder: 8, isActive: true },
+  { id: 'cat_misc', code: 'MISC', name: 'Miscellaneous Operating', description: 'Ice, small tools, and cleaning consumables', sortOrder: 9, isActive: true },
+];
+
 interface WorkspaceSnapshot {
   uid: string;
   meta: any;
@@ -130,6 +142,7 @@ interface WorkspaceSnapshot {
   accounts: any[];
   journalEntries: any[];
   expenses: any[];
+  expenseCategories: any[];
   dailyClosings: any[];
   taxConfigs: any[];
   locations: any[];
@@ -1077,6 +1090,21 @@ async function seedWorkspaceFirestore(firebaseUser: User): Promise<void> {
     });
   }
 
+  // 13b. Expense Categories
+  for (const c of DEFAULT_EXPENSE_CATEGORIES) {
+    const docId = toDocId(c.id, uid);
+    batch.set(doc(db, 'expense_categories', docId), {
+      id: docId,
+      ownerUid: uid,
+      code: c.code,
+      name: c.name,
+      description: c.description,
+      sortOrder: c.sortOrder,
+      isActive: c.isActive,
+      createdAt: serverTimestamp(),
+    });
+  }
+
   // 14. Notifications
   const notifSeeds = [
     { id: 'ntf_1', type: 'LOW_STOCK', severity: 'WARNING', title: 'Low Stock: Toasted Brioche Buns', message: 'Truck 01 has 95 pcs remaining (below reorder point of 120 pcs).', locationId: toDocId('loc_truck_1', uid) },
@@ -1140,10 +1168,11 @@ async function loadSnapshot(force = false): Promise<WorkspaceSnapshot> {
       queryCollection('supplier_invoices', uid),
     ]);
 
-    const [accounts, journalEntries, expenses, dailyClosings, taxConfigs, locations, foodTrucks] = await Promise.all([
+    const [accounts, journalEntries, expenses, expenseCategories, dailyClosings, taxConfigs, locations, foodTrucks] = await Promise.all([
       queryCollection('accounts', uid),
       queryCollection('journal_entries', uid),
       queryCollection('expenses', uid),
+      queryCollection('expense_categories', uid),
       queryCollection('daily_closings', uid),
       queryCollection('tax_configs', uid),
       queryCollection('locations', uid),
@@ -1158,6 +1187,15 @@ async function loadSnapshot(force = false): Promise<WorkspaceSnapshot> {
       queryCollection('notifications', uid),
       queryCollection('audit_logs', uid),
     ]);
+
+    const activeExpCats = expenseCategories.length > 0
+      ? expenseCategories
+      : DEFAULT_EXPENSE_CATEGORIES.map((c) => ({
+          ...c,
+          id: toDocId(c.id, uid),
+          ownerUid: uid,
+          createdAt: new Date().toISOString(),
+        }));
 
     const snapshot: WorkspaceSnapshot = {
       uid,
@@ -1178,6 +1216,7 @@ async function loadSnapshot(force = false): Promise<WorkspaceSnapshot> {
       accounts,
       journalEntries,
       expenses,
+      expenseCategories: activeExpCats,
       dailyClosings,
       taxConfigs,
       locations,
@@ -4512,6 +4551,17 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     const vatableSales = round2(salesInRange.reduce((s, r) => s + Number(r.subtotal || 0), 0));
     const outputTax = round2(salesInRange.reduce((s, r) => s + Number(r.taxAmount || 0), 0));
 
+    const expenseCategories = [...(snap.expenseCategories && snap.expenseCategories.length > 0 ? snap.expenseCategories : DEFAULT_EXPENSE_CATEGORIES)]
+      .sort((a, b) => Number(a.sortOrder || 0) - Number(b.sortOrder || 0) || String(a.name).localeCompare(String(b.name)))
+      .map((c) => ({
+        id: toLogicalId(c.id, uid),
+        code: c.code,
+        name: c.name,
+        description: c.description || '',
+        sort_order: c.sortOrder ?? 0,
+        is_active: c.isActive !== false ? 1 : 0,
+      }));
+
     return {
       expenses,
       closings,
@@ -4519,6 +4569,7 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
       accounts,
       pettyCash,
       periods,
+      expenseCategories,
       statements: {
         trialBalance: accBalances,
         profitAndLoss: { revenues, expenses: expSt, totalRevenue, totalExpenses: totalExp, netIncome },
@@ -4601,6 +4652,496 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     await addAuditLog(uid, user.id, user.fullName, 'RECORD_EXPENSE', 'Expense', toLogicalId(expId, uid), { category, amt });
     invalidateWorkspaceCache();
     return { id: toLogicalId(expId, uid) } as T;
+  }
+
+  if (pathname.startsWith('/finance/expenses/') && method === 'PUT') {
+    assertPerm(user, PERMISSIONS.FINANCE_VIEW);
+    const rawId = pathname.split('/')[3];
+    const expId = toDocId(rawId, uid);
+    const existing = snap.expenses.find((e) => e.id === expId || toLogicalId(e.id, uid) === rawId);
+    if (!existing) throw new Error('Expense not found');
+
+    const { locationId, accountId, category, amount, description, expenseDate, paidFromPettyCash, isRecurring } = body || {};
+    const amt = round2(Number(amount));
+    if (!Number.isFinite(amt) || amt <= 0) throw new Error('Amount must be positive');
+    const cleanDesc = String(description || '').trim();
+    if (!cleanDesc) throw new Error('Description is required');
+
+    const locDocId = toDocId(locationId || existing.locationId, uid);
+    const accDocId = toDocId(accountId || existing.accountId, uid);
+    const rawExpDate = String(expenseDate || existing.expenseDate || '').trim();
+    const expDate = /^\d{4}-\d{2}-\d{2}$/.test(rawExpDate)
+      ? `${rawExpDate}T12:00:00.000Z`
+      : rawExpDate || new Date().toISOString();
+
+    const batch = writeBatch(db);
+    const funds = [...(snap.meta?.pettyCashFunds || [])];
+    let fundsChanged = false;
+
+    // Refund old petty cash if it was paid from petty cash
+    if (existing.paidFromPettyCash) {
+      const oldIdx = funds.findIndex((f: any) => f.location_id === existing.locationId || toDocId(f.location_id, uid) === existing.locationId);
+      if (oldIdx >= 0) {
+        funds[oldIdx] = { ...funds[oldIdx], current_balance: round2(Number(funds[oldIdx].current_balance) + Number(existing.amount || 0)) };
+        fundsChanged = true;
+      }
+    }
+
+    // Deduct new petty cash if paidFromPettyCash is true
+    if (paidFromPettyCash) {
+      const newIdx = funds.findIndex((f: any) => f.location_id === locationId || toDocId(f.location_id, uid) === locDocId);
+      if (newIdx < 0 || Number(funds[newIdx].current_balance) < amt) {
+        throw new Error('Insufficient petty cash balance for updated expense');
+      }
+      funds[newIdx] = { ...funds[newIdx], current_balance: round2(Number(funds[newIdx].current_balance) - amt) };
+      fundsChanged = true;
+    }
+
+    if (fundsChanged) {
+      batch.update(doc(db, 'workspace_meta', `ws_${uid}`), { pettyCashFunds: funds, updatedAt: serverTimestamp() });
+    }
+
+    batch.update(doc(db, 'expenses', existing.id), {
+      locationId: locDocId,
+      accountId: accDocId,
+      category: String(category || existing.category || 'GENERAL'),
+      amount: amt,
+      description: cleanDesc,
+      isRecurring: Boolean(isRecurring),
+      paidFromPettyCash: Boolean(paidFromPettyCash),
+      expenseDate: expDate,
+      updatedAt: serverTimestamp(),
+    });
+
+    const je = snap.journalEntries.find((j) => j.referenceType === 'EXPENSE' && (j.referenceId === existing.id || j.referenceId === toLogicalId(existing.id, uid)));
+    if (je) {
+      batch.update(doc(db, 'journal_entries', je.id), {
+        entryDate: expDate,
+        description: `${category || existing.category}: ${cleanDesc}`,
+        lines: [
+          { id: crypto.randomUUID(), accountId: accDocId, debit: amt, credit: 0, memo: cleanDesc },
+          { id: crypto.randomUUID(), accountId: toDocId('acc_1000', uid), debit: 0, credit: amt, memo: paidFromPettyCash ? 'Petty Cash Disbursement' : 'Cash Disbursement' },
+        ],
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    try {
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `expenses/${existing.id}`);
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_EXPENSE', 'Expense', toLogicalId(existing.id, uid), { category, amt, cleanDesc });
+    invalidateWorkspaceCache();
+    return { ok: true, id: toLogicalId(existing.id, uid) } as T;
+  }
+
+  if (pathname.startsWith('/finance/expenses/') && method === 'DELETE') {
+    assertPerm(user, PERMISSIONS.FINANCE_VIEW);
+    const rawId = pathname.split('/')[3];
+    const expId = toDocId(rawId, uid);
+    const existing = snap.expenses.find((e) => e.id === expId || toLogicalId(e.id, uid) === rawId);
+    if (!existing) throw new Error('Expense not found');
+
+    const batch = writeBatch(db);
+
+    if (existing.paidFromPettyCash) {
+      const funds = [...(snap.meta?.pettyCashFunds || [])];
+      const fIdx = funds.findIndex((f: any) => f.location_id === existing.locationId || toDocId(f.location_id, uid) === existing.locationId);
+      if (fIdx >= 0) {
+        funds[fIdx] = { ...funds[fIdx], current_balance: round2(Number(funds[fIdx].current_balance) + Number(existing.amount || 0)) };
+        batch.update(doc(db, 'workspace_meta', `ws_${uid}`), { pettyCashFunds: funds, updatedAt: serverTimestamp() });
+      }
+    }
+
+    const je = snap.journalEntries.find((j) => j.referenceType === 'EXPENSE' && (j.referenceId === existing.id || j.referenceId === toLogicalId(existing.id, uid)));
+    if (je) {
+      batch.delete(doc(db, 'journal_entries', je.id));
+    }
+
+    batch.delete(doc(db, 'expenses', existing.id));
+
+    try {
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `expenses/${existing.id}`);
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'DELETE_EXPENSE', 'Expense', toLogicalId(existing.id, uid), { category: existing.category, amount: existing.amount });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if (pathname === '/finance/expense-categories' && method === 'GET') {
+    assertPerm(user, PERMISSIONS.FINANCE_VIEW);
+    const cats = [...(snap.expenseCategories?.length ? snap.expenseCategories : DEFAULT_EXPENSE_CATEGORIES)]
+      .sort((a, b) => Number(a.sortOrder || 0) - Number(b.sortOrder || 0) || String(a.name).localeCompare(String(b.name)))
+      .map((c) => ({
+        id: toLogicalId(c.id, uid),
+        code: c.code,
+        name: c.name,
+        description: c.description || '',
+        sort_order: c.sortOrder ?? 0,
+        is_active: c.isActive !== false ? 1 : 0,
+      }));
+    return cats as T;
+  }
+
+  if (pathname === '/finance/expense-categories' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.FINANCE_VIEW);
+    const { code, name, description, sortOrder, isActive } = body || {};
+    const cleanCode = String(code || '').trim().toUpperCase().replace(/\s+/g, '_');
+    const cleanName = String(name || '').trim();
+    if (!cleanCode || !cleanName) throw new Error('Category code and name are required');
+
+    const catDocId = toDocId(`cat_${cleanCode.toLowerCase()}`, uid);
+    try {
+      await setDoc(doc(db, 'expense_categories', catDocId), {
+        id: catDocId,
+        ownerUid: uid,
+        code: cleanCode,
+        name: cleanName,
+        description: description ? String(description).trim() : '',
+        sortOrder: Number(sortOrder) || 0,
+        isActive: isActive !== false,
+        createdAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `expense_categories/${catDocId}`);
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'CREATE_EXPENSE_CATEGORY', 'ExpenseCategory', toLogicalId(catDocId, uid), { code: cleanCode, name: cleanName });
+    invalidateWorkspaceCache();
+    return { id: toLogicalId(catDocId, uid), code: cleanCode, name: cleanName } as T;
+  }
+
+  if (pathname.startsWith('/finance/expense-categories/') && method === 'PUT') {
+    assertPerm(user, PERMISSIONS.FINANCE_VIEW);
+    const rawId = pathname.split('/')[3];
+    const catDocId = toDocId(rawId, uid);
+    const existing = (snap.expenseCategories || []).find((c) => c.id === catDocId || toLogicalId(c.id, uid) === rawId);
+    if (!existing) throw new Error('Expense category not found');
+
+    const { code, name, description, sortOrder, isActive } = body || {};
+    const cleanName = String(name || '').trim();
+    if (!cleanName) throw new Error('Name is required');
+
+    const nextCode = code ? String(code).trim().toUpperCase().replace(/\s+/g, '_') : existing.code;
+    try {
+      await updateDoc(doc(db, 'expense_categories', existing.id), {
+        code: nextCode,
+        name: cleanName,
+        description: description !== undefined ? String(description).trim() : existing.description || '',
+        sortOrder: sortOrder !== undefined ? Number(sortOrder) : existing.sortOrder || 0,
+        isActive: isActive === undefined ? existing.isActive !== false : Boolean(isActive),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `expense_categories/${existing.id}`);
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_EXPENSE_CATEGORY', 'ExpenseCategory', toLogicalId(existing.id, uid), { code: nextCode, name: cleanName });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if (pathname.startsWith('/finance/expense-categories/') && method === 'DELETE') {
+    assertPerm(user, PERMISSIONS.FINANCE_VIEW);
+    const rawId = pathname.split('/')[3];
+    const catDocId = toDocId(rawId, uid);
+    const existing = (snap.expenseCategories || []).find((c) => c.id === catDocId || toLogicalId(c.id, uid) === rawId);
+    if (!existing) throw new Error('Expense category not found');
+
+    const inUse = snap.expenses.filter((e) => e.category === existing.code || e.category === existing.name).length;
+    if (inUse > 0) {
+      throw new Error(`Cannot delete category "${existing.name}" because it is currently linked to ${inUse} operating expense record(s).`);
+    }
+
+    try {
+      await deleteDoc(doc(db, 'expense_categories', existing.id));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `expense_categories/${existing.id}`);
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'DELETE_EXPENSE_CATEGORY', 'ExpenseCategory', toLogicalId(existing.id, uid), { code: existing.code });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if (pathname === '/finance/accounts' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.FINANCE_VIEW);
+    const { code, name, type } = body || {};
+    const cleanCode = String(code || '').trim();
+    const cleanName = String(name || '').trim();
+    const accType = type || 'EXPENSE';
+    if (!cleanCode || !cleanName) throw new Error('Account code and name are required');
+
+    const existingCode = snap.accounts.find((a) => a.code === cleanCode);
+    if (existingCode) throw new Error(`GL Account code ${cleanCode} already exists`);
+
+    const accDocId = toDocId(`acc_${cleanCode}`, uid);
+    try {
+      await setDoc(doc(db, 'accounts', accDocId), {
+        id: accDocId,
+        ownerUid: uid,
+        code: cleanCode,
+        name: cleanName,
+        type: accType,
+        isSystem: false,
+        createdAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `accounts/${accDocId}`);
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'CREATE_ACCOUNT', 'Account', toLogicalId(accDocId, uid), { code: cleanCode, name: cleanName, type: accType });
+    invalidateWorkspaceCache();
+    return { id: toLogicalId(accDocId, uid), code: cleanCode, name: cleanName, type: accType, is_system: 0 } as T;
+  }
+
+  if (pathname.startsWith('/finance/accounts/') && method === 'PUT') {
+    assertPerm(user, PERMISSIONS.FINANCE_VIEW);
+    const rawId = pathname.split('/')[3];
+    const accDocId = toDocId(rawId, uid);
+    const existing = snap.accounts.find((a) => a.id === accDocId || toLogicalId(a.id, uid) === rawId);
+    if (!existing) throw new Error('Account not found');
+
+    const { code, name } = body || {};
+    const cleanName = String(name || '').trim();
+    if (!cleanName) throw new Error('Account name is required');
+
+    const nextCode = code ? String(code).trim() : existing.code;
+    if (nextCode !== existing.code) {
+      if (existing.isSystem) throw new Error('System account codes cannot be modified');
+      const conflict = snap.accounts.find((a) => a.code === nextCode && a.id !== existing.id);
+      if (conflict) throw new Error(`GL Account code ${nextCode} already exists`);
+    }
+
+    try {
+      await updateDoc(doc(db, 'accounts', existing.id), {
+        code: nextCode,
+        name: cleanName,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `accounts/${existing.id}`);
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_ACCOUNT', 'Account', toLogicalId(existing.id, uid), { code: nextCode, name: cleanName });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if (pathname.startsWith('/finance/accounts/') && method === 'DELETE') {
+    assertPerm(user, PERMISSIONS.FINANCE_VIEW);
+    const rawId = pathname.split('/')[3];
+    const accDocId = toDocId(rawId, uid);
+    const existing = snap.accounts.find((a) => a.id === accDocId || toLogicalId(a.id, uid) === rawId);
+    if (!existing) throw new Error('Account not found');
+
+    if (existing.isSystem) {
+      throw new Error(`Cannot delete system account "${existing.name}" (${existing.code})`);
+    }
+
+    const jeUsage = snap.journalEntries.filter((j) => (j.lines || []).some((l: any) => l.accountId === existing.id || toDocId(l.accountId, uid) === existing.id)).length;
+    if (jeUsage > 0) {
+      throw new Error(`Cannot delete account "${existing.name}" because it has ${jeUsage} posted journal transaction(s).`);
+    }
+
+    const expUsage = snap.expenses.filter((e) => e.accountId === existing.id || toDocId(e.accountId, uid) === existing.id).length;
+    if (expUsage > 0) {
+      throw new Error(`Cannot delete account "${existing.name}" because it is linked to ${expUsage} operating expense record(s).`);
+    }
+
+    try {
+      await deleteDoc(doc(db, 'accounts', existing.id));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `accounts/${existing.id}`);
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'DELETE_ACCOUNT', 'Account', toLogicalId(existing.id, uid), { code: existing.code });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  // AI-Powered Inventory Forecasting Endpoint
+  if (pathname === '/ai/inventory-forecast' && method === 'POST') {
+    const { locationId, horizonDays = 5 } = body || {};
+    const days = Math.max(1, Math.min(14, Number(horizonDays) || 5));
+    const locDocId = locationId && locationId !== 'ALL' ? toDocId(locationId, uid) : '';
+    const loc = snap.locations.find((l) => l.id === locDocId);
+
+    // Prepare location inventory summary
+    const batches = snap.stockBatches.filter((b) => !locDocId || b.locationId === locDocId);
+    const onHandMap = new Map<string, number>();
+    for (const b of batches) {
+      const cur = onHandMap.get(b.inventoryItemId) || 0;
+      onHandMap.set(b.inventoryItemId, cur + Number(b.remainingQty || 0));
+    }
+
+    const inventorySummary = snap.inventoryItems.map((item) => ({
+      id: toLogicalId(item.id, uid),
+      sku: item.sku,
+      name: item.name,
+      category: item.category,
+      unit_of_measure: item.unitOfMeasure,
+      cost_per_unit: item.costPerUnit,
+      reorder_point: item.reorderPoint,
+      on_hand: round2(onHandMap.get(item.id) || 0),
+    }));
+
+    // 7-day sales breakdown
+    const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+    const recentCompletedSales = snap.sales.filter(
+      (s) => s.status === 'COMPLETED' && s.soldAt >= sevenDaysAgo && (!locDocId || s.locationId === locDocId),
+    );
+
+    const salesItemMap = new Map<string, { qty: number; revenue: number }>();
+    for (const sale of recentCompletedSales) {
+      for (const it of sale.items || []) {
+        const cur = salesItemMap.get(it.productName) || { qty: 0, revenue: 0 };
+        cur.qty += Number(it.quantity || 0);
+        cur.revenue += Number(it.lineTotal || 0);
+        salesItemMap.set(it.productName, cur);
+      }
+    }
+
+    const recentSalesSummary = Array.from(salesItemMap.entries()).map(([product_name, stats]) => ({
+      product_name,
+      total_qty: stats.qty,
+      total_revenue: round2(stats.revenue),
+    }));
+
+    // First attempt to call the server-side proxy which holds GEMINI_API_KEY
+    try {
+      const token = user.id?.startsWith('usr_') ? user.id : 'firebase-session';
+      const resp = await fetch('/api/v1/ai/inventory-forecast', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          locationId: locationId || 'ALL',
+          horizonDays: days,
+          truckName: loc?.name || 'All Food Trucks',
+          inventorySummary,
+          recentSalesSummary,
+        }),
+      });
+      if (resp.ok) {
+        const jsonResult = await resp.json();
+        if (jsonResult && Array.isArray(jsonResult.items)) {
+          return jsonResult as T;
+        }
+      }
+    } catch (_) {
+      // Backend unavailable or fetch failed; proceed to local deterministic prediction
+    }
+
+    // Direct fallback calculation using BOM matrix
+    const recipeMap: Record<string, Array<{ ingredientSku: string; qty: number }>> = {
+      'Double Wagyu Smash Burger': [
+        { ingredientSku: 'ING-BEEF-01', qty: 2 },
+        { ingredientSku: 'ING-BUN-01', qty: 1 },
+        { ingredientSku: 'ING-CHEESE-01', qty: 2 },
+      ],
+      'Crispy Pork Sisig Tacos (3 pcs)': [
+        { ingredientSku: 'ING-PORK-01', qty: 0.15 },
+        { ingredientSku: 'ING-TORT-01', qty: 3 },
+      ],
+      'Truffle Parmesan Fries': [
+        { ingredientSku: 'ING-FRIES-01', qty: 0.25 },
+        { ingredientSku: 'ING-TRUFFLE-01', qty: 0.045 },
+      ],
+      'Guimaras Mango Graham Shake': [
+        { ingredientSku: 'ING-MANGO-01', qty: 0.22 },
+      ],
+    };
+
+    const calculatedItems = inventorySummary.map((item) => {
+      const onHand = Number(item.on_hand || 0);
+      const reorderPt = Number(item.reorder_point || 10);
+      const unitCost = Number(item.cost_per_unit || 50);
+      const uom = item.unit_of_measure || 'units';
+
+      let estimatedDailyBurn = 0;
+      for (const sale of recentSalesSummary) {
+        const recipes = recipeMap[sale.product_name];
+        if (recipes) {
+          for (const ing of recipes) {
+            if (ing.ingredientSku === item.sku || item.name.toLowerCase().includes(ing.ingredientSku.toLowerCase())) {
+              estimatedDailyBurn += (ing.qty * sale.total_qty) / 7;
+            }
+          }
+        }
+      }
+
+      if (estimatedDailyBurn <= 0) {
+        estimatedDailyBurn = Math.max(0.6, round2(reorderPt * 0.16));
+      } else {
+        estimatedDailyBurn = round2(estimatedDailyBurn);
+      }
+
+      const projectedDemand = round2(estimatedDailyBurn * days);
+      const daysOfSupply = estimatedDailyBurn > 0 ? round2(onHand / estimatedDailyBurn) : 99;
+      const projectedStockAfterHorizon = round2(onHand - projectedDemand);
+
+      let riskLevel: 'CRITICAL' | 'HIGH' | 'OPTIMAL' = 'OPTIMAL';
+      let suggestedRestock = 0;
+
+      if (projectedStockAfterHorizon <= 0) {
+        riskLevel = 'CRITICAL';
+        suggestedRestock = Math.ceil(Math.abs(projectedStockAfterHorizon) + reorderPt * 1.5);
+      } else if (projectedStockAfterHorizon < reorderPt) {
+        riskLevel = 'HIGH';
+        suggestedRestock = Math.ceil((reorderPt * 1.4) - projectedStockAfterHorizon);
+      }
+
+      return {
+        id: item.id,
+        sku: item.sku,
+        name: item.name,
+        category: item.category || 'General',
+        uom,
+        unitCost,
+        onHand,
+        reorderPt,
+        estimatedDailyBurn,
+        daysOfSupply,
+        projectedDemand,
+        projectedStockAfterHorizon: Math.max(0, projectedStockAfterHorizon),
+        riskLevel,
+        suggestedRestock,
+        estimatedCost: round2(suggestedRestock * unitCost),
+        reason: riskLevel === 'CRITICAL'
+          ? `Stock depletion expected in ${daysOfSupply} days at current sales velocity (${estimatedDailyBurn} ${uom}/day). Restock urgently.`
+          : riskLevel === 'HIGH'
+          ? `Stock projected to breach reorder point (${reorderPt} ${uom}) within ${days} days.`
+          : `Healthy stock buffer. Safe for ${daysOfSupply} days of continuous operation.`,
+      };
+    });
+
+    const totalCost = round2(calculatedItems.reduce((s, i) => s + i.estimatedCost, 0));
+    const criticalCount = calculatedItems.filter((i) => i.riskLevel === 'CRITICAL').length;
+    const highCount = calculatedItems.filter((i) => i.riskLevel === 'HIGH').length;
+
+    return {
+      source: 'algorithmic',
+      horizonDays: days,
+      summary: {
+        totalItemsAnalyzed: calculatedItems.length,
+        criticalCount,
+        highRiskCount: highCount,
+        totalRecommendedRestockUnits: calculatedItems.reduce((s, i) => s + i.suggestedRestock, 0),
+        totalEstimatedReplenishmentCostPhp: totalCost,
+        strategicAdvice: criticalCount > 0
+          ? `Demand projection identified ${criticalCount} ingredient(s) at severe stockout risk within ${days} days based on 7-day sales velocity. Request Commissary Transfer immediately.`
+          : `All inventory levels currently maintain adequate safety buffers for the upcoming ${days}-day service cycle.`,
+      },
+      items: calculatedItems,
+    } as T;
   }
 
   if (pathname === '/finance/daily-closing' && method === 'POST') {
