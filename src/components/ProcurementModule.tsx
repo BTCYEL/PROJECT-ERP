@@ -688,66 +688,66 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
       case 'DRAFT':
         return {
           label: 'Draft',
-          badgeClass: 'bg-slate-100 text-slate-700 border-slate-200',
+          badgeClass: 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-800',
           dotClass: 'bg-slate-400',
-          textClass: 'text-slate-700',
+          textClass: 'text-slate-700 dark:text-slate-200',
         };
       case 'PENDING_APPROVAL':
         return {
           label: 'Pending',
-          badgeClass: 'bg-amber-50 text-amber-800 border-amber-200',
+          badgeClass: 'bg-amber-50 dark:bg-amber-950/45 text-amber-800 dark:text-amber-300 border-amber-200 dark:border-amber-700/80',
           dotClass: 'bg-amber-500',
-          textClass: 'text-amber-700',
+          textClass: 'text-amber-700 dark:text-amber-300',
         };
       case 'PENDING_MANAGER_SIGNATURE':
         return {
           label: 'Pending Signature',
-          badgeClass: 'bg-violet-50 text-violet-800 border-violet-200',
+          badgeClass: 'bg-violet-50 dark:bg-violet-950/50 text-violet-800 dark:text-violet-300 border-violet-200 dark:border-violet-700/80',
           dotClass: 'bg-violet-600',
-          textClass: 'text-violet-700',
+          textClass: 'text-violet-700 dark:text-violet-300',
         };
       case 'APPROVED':
         return {
           label: 'Approved',
-          badgeClass: 'bg-sky-50 text-sky-800 border-sky-200',
+          badgeClass: 'bg-sky-50 dark:bg-sky-950/50 text-sky-800 dark:text-sky-300 border-sky-200 dark:border-sky-700/80',
           dotClass: 'bg-sky-500',
-          textClass: 'text-sky-700',
+          textClass: 'text-sky-700 dark:text-sky-300',
         };
       case 'PARTIAL':
       case 'PARTIALLY_RECEIVED':
         return {
           label: 'Partial',
-          badgeClass: 'bg-indigo-50 text-indigo-800 border-indigo-200',
+          badgeClass: 'bg-indigo-50 dark:bg-indigo-950/50 text-indigo-800 dark:text-indigo-300 border-indigo-200 dark:border-indigo-700/80',
           dotClass: 'bg-indigo-500',
-          textClass: 'text-indigo-700',
+          textClass: 'text-indigo-700 dark:text-indigo-300',
         };
       case 'RECEIVED':
         return {
           label: 'Received',
-          badgeClass: 'bg-emerald-50 text-emerald-800 border-emerald-200',
+          badgeClass: 'bg-emerald-50 dark:bg-emerald-950/45 text-emerald-800 dark:text-emerald-300 border-emerald-200 dark:border-emerald-700/80',
           dotClass: 'bg-emerald-500',
-          textClass: 'text-emerald-700',
+          textClass: 'text-emerald-700 dark:text-emerald-300',
         };
       case 'PAID':
         return {
           label: 'Paid',
-          badgeClass: 'bg-teal-50 text-teal-800 border-teal-200',
+          badgeClass: 'bg-teal-50 dark:bg-teal-950/50 text-teal-800 dark:text-teal-300 border-teal-200 dark:border-teal-700/80',
           dotClass: 'bg-teal-600',
-          textClass: 'text-teal-700',
+          textClass: 'text-teal-700 dark:text-teal-300',
         };
       case 'CANCELLED':
         return {
           label: 'Cancelled',
-          badgeClass: 'bg-red-50 text-red-700 border-red-200',
+          badgeClass: 'bg-red-50 dark:bg-red-950/50 text-red-700 dark:text-red-300 border-red-200 dark:border-red-800/80',
           dotClass: 'bg-red-500',
-          textClass: 'text-red-600',
+          textClass: 'text-red-600 dark:text-red-300',
         };
       default:
         return {
           label: status || 'Unknown',
-          badgeClass: 'bg-slate-100 text-slate-700 border-slate-200',
+          badgeClass: 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-800',
           dotClass: 'bg-slate-400',
-          textClass: 'text-slate-700',
+          textClass: 'text-slate-700 dark:text-slate-200',
         };
     }
   };
@@ -766,10 +766,10 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
     const normalized = String(status || '').toUpperCase();
     const cls =
       normalized === 'PAID'
-        ? 'bg-teal-50 text-teal-800 border-teal-200'
+        ? 'bg-teal-50 dark:bg-teal-950/50 text-teal-800 dark:text-teal-300 border-teal-200 dark:border-teal-700/80'
         : normalized === 'PARTIAL'
-          ? 'bg-indigo-50 text-indigo-800 border-indigo-200'
-          : 'bg-amber-50 text-amber-800 border-amber-200';
+          ? 'bg-indigo-50 dark:bg-indigo-950/50 text-indigo-800 dark:text-indigo-300 border-indigo-200 dark:border-indigo-700/80'
+          : 'bg-amber-50 dark:bg-amber-950/45 text-amber-800 dark:text-amber-300 border-amber-200 dark:border-amber-700/80';
     const dot =
       normalized === 'PAID' ? 'bg-teal-600' : normalized === 'PARTIAL' ? 'bg-indigo-500' : 'bg-amber-500';
     return (
@@ -797,10 +797,10 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
     const act = String(action || '').toUpperCase();
     const meta =
       act === 'CREATE_SUPPLIER'
-        ? { label: 'Created', cls: 'bg-emerald-50 text-emerald-800 border-emerald-200', dot: 'bg-emerald-500' }
+        ? { label: 'Created', cls: 'bg-emerald-50 dark:bg-emerald-950/45 text-emerald-800 dark:text-emerald-300 border-emerald-200 dark:border-emerald-700/80', dot: 'bg-emerald-500' }
         : act === 'DELETE_SUPPLIER'
-          ? { label: 'Removed / Archived', cls: 'bg-red-50 text-red-700 border-red-200', dot: 'bg-red-500' }
-          : { label: 'Updated', cls: 'bg-sky-50 text-sky-800 border-sky-200', dot: 'bg-sky-500' };
+          ? { label: 'Removed / Archived', cls: 'bg-red-50 dark:bg-red-950/50 text-red-700 dark:text-red-300 border-red-200 dark:border-red-800/80', dot: 'bg-red-500' }
+          : { label: 'Updated', cls: 'bg-sky-50 dark:bg-sky-950/50 text-sky-800 dark:text-sky-300 border-sky-200 dark:border-sky-700/80', dot: 'bg-sky-500' };
     return (
       <span className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap ${meta.cls}`}>
         <span className={`w-1.5 h-1.5 rounded-xs ${meta.dot}`} />
@@ -871,21 +871,21 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
       <div className={viewInvoice ? 'no-print space-y-6' : 'space-y-6'}>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="font-display text-2xl font-semibold text-slate-900">Procurement &amp; Suppliers</h1>
-          <p className="text-sm text-slate-500">Purchase orders, manager approvals, partial GRN batch receiving, and supplier payables</p>
+          <h1 className="font-display text-2xl font-semibold text-slate-900 dark:text-slate-50">Procurement &amp; Suppliers</h1>
+          <p className="text-sm text-slate-500 dark:text-slate-400">Purchase orders, manager approvals, partial GRN batch receiving, and supplier payables</p>
         </div>
         <button
           onClick={openNewPoModal}
-          className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 whitespace-nowrap shrink-0"
+          className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 dark:bg-slate-100 px-4 py-2 text-xs font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white whitespace-nowrap shrink-0"
         >
           <Plus className="w-4 h-4" /> Create Purchase Order
         </button>
       </div>
 
-      {msg && <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 font-medium">{msg}</div>}
-      {err && <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{err}</div>}
+      {msg && <div className="p-3 rounded-lg bg-emerald-50 dark:bg-emerald-950/45 border border-emerald-200 dark:border-emerald-700/80 text-xs text-emerald-800 dark:text-emerald-300 font-medium">{msg}</div>}
+      {err && <div className="p-3 rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800/80 text-xs text-red-700 dark:text-red-300 font-medium">{err}</div>}
 
-      <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg border border-slate-200 w-fit">
+      <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-800 w-fit">
         {([
           { id: 'pos', label: `Purchase Orders (${visiblePurchaseOrders.length})` },
           { id: 'suppliers', label: 'Suppliers & Price Comparison' },
@@ -895,7 +895,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
             key={t.id}
             onClick={() => setSubTab(t.id)}
             className={`px-3 py-1.5 rounded-md text-xs font-medium whitespace-nowrap shrink-0 ${
-              subTab === t.id ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
+              subTab === t.id ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-50 shadow-sm' : 'text-slate-600 dark:text-slate-300'
             }`}
           >
             {t.label}
@@ -905,16 +905,16 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
 
       {subTab === 'pos' && (
         <div className="space-y-3">
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-4 py-2.5">
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-4 py-2.5">
             <div className="flex items-center gap-2.5 text-xs">
-              <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-violet-50 text-violet-700 border border-violet-200 shrink-0">
+              <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-violet-50 dark:bg-violet-950/50 text-violet-700 dark:text-violet-300 border border-violet-200 dark:border-violet-700/80 shrink-0">
                 <ShieldCheck className="w-4 h-4" />
               </div>
               <div>
-                <span className="font-semibold text-slate-900">
-                  Multi-Stage Signature Threshold: <span className="font-mono text-violet-800">{formatPHP(approvalThreshold)}</span>
+                <span className="font-semibold text-slate-900 dark:text-slate-50">
+                  Multi-Stage Signature Threshold: <span className="font-mono text-violet-800 dark:text-violet-300">{formatPHP(approvalThreshold)}</span>
                 </span>
-                <p className="text-[11px] text-slate-500">
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
                   Orders exceeding {formatPHP(approvalThreshold)} require Stage 1 verification and a Stage 2 Manager Digital Signature before goods receiving.
                 </p>
               </div>
@@ -923,7 +923,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
               <button
                 type="button"
                 onClick={openThresholdModal}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 whitespace-nowrap shrink-0"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
               >
                 <SlidersHorizontal className="w-3.5 h-3.5" /> Configure Threshold
               </button>
@@ -950,13 +950,13 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                   onClick={() => setPoStatusFilter(st.id)}
                   className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap ${
                     active
-                      ? 'border-slate-900 bg-slate-900 text-white'
-                      : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                      ? 'border-slate-900 dark:border-slate-100 bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950'
+                      : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
                   }`}
                 >
-                  {st.id !== 'ALL' && <span className={`w-1.5 h-1.5 rounded-xs ${active ? 'bg-white' : st.dot}`} />}
+                  {st.id !== 'ALL' && <span className={`w-1.5 h-1.5 rounded-xs ${active ? 'bg-white dark:bg-slate-900' : st.dot}`} />}
                   <span>{st.label}</span>
-                  <span className={`font-mono text-[11px] ${active ? 'text-slate-300' : 'text-slate-400'}`}>
+                  <span className={`font-mono text-[11px] ${active ? 'text-slate-500 dark:text-slate-500' : 'text-slate-500 dark:text-slate-400'}`}>
                     {st.count}
                   </span>
                 </button>
@@ -964,9 +964,9 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
             })}
           </div>
 
-          <div className="rounded-xl border border-slate-200 bg-white overflow-x-auto">
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-x-auto">
             <table className="w-full text-left text-xs">
-              <thead className="border-b border-slate-200 bg-slate-50 text-slate-500">
+              <thead className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 text-slate-500 dark:text-slate-400">
                 <tr>
                   <th className="p-3 font-medium">PO Number</th>
                   <th className="p-3 font-medium">Supplier</th>
@@ -977,10 +977,10 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                   <th className="p-3 font-medium text-right">Actions</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-100">
+              <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                 {filteredPurchaseOrders.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="p-6 text-center text-xs text-slate-400">
+                    <td colSpan={7} className="p-6 text-center text-xs text-slate-500 dark:text-slate-400">
                       No purchase orders match the selected location or status filter.
                     </td>
                   </tr>
@@ -992,19 +992,19 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                   const canCancel = (isDraftOrPending || isAwaitingSignature || po.status === 'APPROVED') && !hasReceived;
 
                   return (
-                    <tr key={po.id} className="hover:bg-slate-50">
-                      <td className="p-3 font-mono font-semibold text-slate-900 whitespace-nowrap">{po.po_number}</td>
+                    <tr key={po.id} className="hover:bg-slate-50 dark:hover:bg-slate-800">
+                      <td className="p-3 font-mono font-semibold text-slate-900 dark:text-slate-50 whitespace-nowrap">{po.po_number}</td>
                       <td className="p-3">{po.supplier_name}</td>
-                      <td className="p-3 text-slate-600">{po.location_name}</td>
-                      <td className="p-3 text-slate-600">
+                      <td className="p-3 text-slate-600 dark:text-slate-300">{po.location_name}</td>
+                      <td className="p-3 text-slate-600 dark:text-slate-300">
                         {po.items.map((i: any) => `${i.item_name} (${i.received_qty}/${i.ordered_qty} ${i.uom_code})`).join(', ')}
                       </td>
                       <td className="p-3 text-right whitespace-nowrap">
-                        <div className="font-mono tabular-nums font-semibold text-slate-900">{formatPHP(po.total_amount)}</div>
+                        <div className="font-mono tabular-nums font-semibold text-slate-900 dark:text-slate-50">{formatPHP(po.total_amount)}</div>
                         {po.manager_signature_data ? (
-                          <div className="text-[10px] font-medium text-violet-700">Digitally Signed</div>
+                          <div className="text-[10px] font-medium text-violet-700 dark:text-violet-300">Digitally Signed</div>
                         ) : exceedsThreshold ? (
-                          <div className="text-[10px] font-medium text-amber-700">&gt; Threshold · 2-Stage</div>
+                          <div className="text-[10px] font-medium text-amber-700 dark:text-amber-300">&gt; Threshold · 2-Stage</div>
                         ) : null}
                       </td>
                       <td className="p-3 whitespace-nowrap">{renderPoStatusBadge(po.status)}</td>
@@ -1014,7 +1014,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                             <button
                               type="button"
                               onClick={() => openReviewModal(po)}
-                              className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
+                              className="inline-flex items-center gap-1 rounded-md border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
                             >
                               <Pencil className="w-3.5 h-3.5" /> Edit / Review
                             </button>
@@ -1022,7 +1022,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                             <button
                               type="button"
                               onClick={() => openReviewModal(po)}
-                              className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
+                              className="inline-flex items-center gap-1 rounded-md border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
                             >
                               <Eye className="w-3.5 h-3.5" /> Review
                             </button>
@@ -1032,7 +1032,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                             <button
                               type="button"
                               onClick={() => approvePO(po)}
-                              className="inline-flex items-center gap-1 rounded-md bg-slate-900 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-slate-800"
+                              className="inline-flex items-center gap-1 rounded-md bg-slate-900 dark:bg-slate-100 px-2.5 py-1.5 text-xs font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white"
                             >
                               <CheckCircle2 className="w-3.5 h-3.5" /> {exceedsThreshold ? 'Verify (Stage 1)' : 'Approve'}
                             </button>
@@ -1062,7 +1062,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                             <button
                               type="button"
                               onClick={() => markPoPaid(po)}
-                              className="inline-flex items-center gap-1 rounded-md border border-teal-200 bg-teal-50 px-2.5 py-1.5 text-xs font-semibold text-teal-800 hover:bg-teal-100"
+                              className="inline-flex items-center gap-1 rounded-md border border-teal-200 dark:border-teal-700/80 bg-teal-50 dark:bg-teal-950/50 px-2.5 py-1.5 text-xs font-semibold text-teal-800 dark:text-teal-300 hover:bg-teal-100 dark:hover:bg-teal-900/60"
                             >
                               <CheckCircle2 className="w-3.5 h-3.5" /> Mark Paid
                             </button>
@@ -1076,7 +1076,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                                 setCancelReason('');
                                 setCancelPoTarget(po);
                               }}
-                              className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50"
+                              className="inline-flex items-center gap-1 rounded-md border border-red-200 dark:border-red-800/80 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/70"
                             >
                               <XCircle className="w-3.5 h-3.5" /> Cancel
                             </button>
@@ -1095,19 +1095,19 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
       {subTab === 'suppliers' && (
         <div className="space-y-6">
           <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
-            <div className="xl:col-span-7 rounded-xl border border-slate-200 bg-white overflow-x-auto">
-              <div className="p-4 border-b border-slate-200 flex items-center justify-between gap-2">
-                <span className="text-xs font-semibold text-slate-700">Active Suppliers ({data.suppliers.length})</span>
+            <div className="xl:col-span-7 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-x-auto">
+              <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">Active Suppliers ({data.suppliers.length})</span>
                 <button
                   type="button"
                   onClick={() => openAddSupplierModal('tab')}
-                  className="inline-flex items-center gap-1 rounded-md bg-slate-900 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-slate-800 whitespace-nowrap"
+                  className="inline-flex items-center gap-1 rounded-md bg-slate-900 dark:bg-slate-100 px-2.5 py-1.5 text-[11px] font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white whitespace-nowrap"
                 >
                   <Plus className="w-3.5 h-3.5" /> Add Supplier
                 </button>
               </div>
               <table className="w-full text-left text-xs">
-                <thead className="border-b border-slate-100 text-slate-500">
+                <thead className="border-b border-slate-100 dark:border-slate-800/80 text-slate-500 dark:text-slate-400">
                   <tr>
                     <th className="p-3 font-medium">Supplier</th>
                     <th className="p-3 font-medium">Contact</th>
@@ -1116,28 +1116,28 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                     <th className="p-3 font-medium text-right">Actions</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-100">
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                   {data.suppliers.length === 0 ? (
                     <tr>
-                      <td colSpan={5} className="p-6 text-center text-xs text-slate-400">
+                      <td colSpan={5} className="p-6 text-center text-xs text-slate-500 dark:text-slate-400">
                         No active suppliers yet. Click &ldquo;Add Supplier&rdquo; to register one.
                       </td>
                     </tr>
                   ) : (
                     data.suppliers.map((s: any) => (
-                      <tr key={s.id} className="hover:bg-slate-50/70">
-                        <td className="p-3 font-semibold text-slate-900">
+                      <tr key={s.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/70">
+                        <td className="p-3 font-semibold text-slate-900 dark:text-slate-50">
                           {s.name}
-                          <p className="font-normal text-slate-500 font-mono text-[11px]">{[s.code, s.tin].filter(Boolean).join(' · ') || '—'}</p>
+                          <p className="font-normal text-slate-500 dark:text-slate-400 font-mono text-[11px]">{[s.code, s.tin].filter(Boolean).join(' · ') || '—'}</p>
                         </td>
-                        <td className="p-3 text-slate-600">{s.contact_person || '—'}<p className="text-[11px]">{s.phone || ''}</p></td>
+                        <td className="p-3 text-slate-600 dark:text-slate-300">{s.contact_person || '—'}<p className="text-[11px]">{s.phone || ''}</p></td>
                         <td className="p-3 text-right font-mono whitespace-nowrap">{s.payment_terms} days</td>
                         <td className="p-3 whitespace-nowrap">
-                          <div className="text-[11px] font-medium text-slate-800 font-mono">
+                          <div className="text-[11px] font-medium text-slate-800 dark:text-slate-100 font-mono">
                             {formatAuditTimestamp(s.updated_at)}
                           </div>
-                          <div className="inline-flex items-center gap-1 text-[11px] text-slate-500 mt-0.5">
-                            <User className="w-3 h-3 text-slate-400" />
+                          <div className="inline-flex items-center gap-1 text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                            <User className="w-3 h-3 text-slate-500 dark:text-slate-400" />
                             <span>{s.updated_by_name || 'System Seed'}</span>
                           </div>
                         </td>
@@ -1145,25 +1145,25 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                           <button
                             type="button"
                             onClick={() => setAuditSupplierTarget(s)}
-                            className="inline-flex items-center gap-1 rounded border border-slate-200 px-2 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                            className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-800 px-2 py-1 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
                             title="View supplier audit trail"
                           >
                             <History className="w-3 h-3" /> History
                             {Number(s.audit_count || 0) > 0 && (
-                              <span className="font-mono text-[10px] text-slate-500">({s.audit_count})</span>
+                              <span className="font-mono text-[10px] text-slate-500 dark:text-slate-400">({s.audit_count})</span>
                             )}
                           </button>
                           <button
                             type="button"
                             onClick={() => openEditSupplierModal(s, 'tab')}
-                            className="inline-flex items-center gap-1 rounded border border-slate-200 px-2 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                            className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-800 px-2 py-1 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
                           >
                             <Pencil className="w-3 h-3" /> Edit
                           </button>
                           <button
                             type="button"
                             onClick={() => setDeleteSupplierTarget(s)}
-                            className="inline-flex items-center gap-1 rounded border border-red-200 px-2 py-1 text-[11px] font-medium text-red-700 hover:bg-red-50"
+                            className="inline-flex items-center gap-1 rounded border border-red-200 dark:border-red-800/80 px-2 py-1 text-[11px] font-medium text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/70"
                           >
                             <Trash2 className="w-3 h-3" /> Delete
                           </button>
@@ -1175,10 +1175,10 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
               </table>
             </div>
 
-            <div className="xl:col-span-5 rounded-xl border border-slate-200 bg-white overflow-x-auto">
-              <div className="p-4 border-b border-slate-200 text-xs font-semibold text-slate-700">Supplier Price Comparison</div>
+            <div className="xl:col-span-5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-x-auto">
+              <div className="p-4 border-b border-slate-200 dark:border-slate-800 text-xs font-semibold text-slate-700 dark:text-slate-200">Supplier Price Comparison</div>
               <table className="w-full text-left text-xs">
-                <thead className="border-b border-slate-100 text-slate-500">
+                <thead className="border-b border-slate-100 dark:border-slate-800/80 text-slate-500 dark:text-slate-400">
                   <tr>
                     <th className="p-3 font-medium">Ingredient</th>
                     <th className="p-3 font-medium">Supplier</th>
@@ -1186,11 +1186,11 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                     <th className="p-3 font-medium text-right">Lead Time</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-100">
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                   {data.priceComparison.map((pc: any) => (
                     <tr key={pc.id}>
-                      <td className="p-3 font-medium text-slate-900">{pc.item_name}</td>
-                      <td className="p-3 text-slate-600">{pc.supplier_name}</td>
+                      <td className="p-3 font-medium text-slate-900 dark:text-slate-50">{pc.item_name}</td>
+                      <td className="p-3 text-slate-600 dark:text-slate-300">{pc.supplier_name}</td>
                       <td className="p-3 text-right font-mono tabular-nums font-semibold">{formatPHP(pc.unit_price)} / {pc.uom_code}</td>
                       <td className="p-3 text-right font-mono">{pc.lead_time_days}d</td>
                     </tr>
@@ -1200,21 +1200,21 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
             </div>
           </div>
 
-          <div className="rounded-xl border border-slate-200 bg-white overflow-x-auto">
-            <div className="p-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-x-auto">
+            <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3">
               <div>
-                <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-800">
-                  <History className="w-3.5 h-3.5 text-slate-500" />
+                <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-800 dark:text-slate-100">
+                  <History className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400" />
                   <span>Supplier Profile Audit Trail ({visibleSupplierAuditLogs.length})</span>
                 </div>
-                <p className="text-[11px] text-slate-500 mt-0.5">
+                <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
                   Chronological record of supplier profile creations, edits, and removals with responsible user
                 </p>
               </div>
               <select
                 value={auditFilterSupplierId}
                 onChange={(e) => setAuditFilterSupplierId(e.target.value)}
-                className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-700"
+                className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs text-slate-700 dark:text-slate-200"
               >
                 <option value="ALL">All Suppliers</option>
                 {data.suppliers.map((s: any) => (
@@ -1223,7 +1223,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
               </select>
             </div>
             <table className="w-full text-left text-xs">
-              <thead className="border-b border-slate-100 bg-slate-50 text-slate-500">
+              <thead className="border-b border-slate-100 dark:border-slate-800/80 bg-slate-50 dark:bg-slate-800/70 text-slate-500 dark:text-slate-400">
                 <tr>
                   <th className="p-3 font-medium">Modified Date</th>
                   <th className="p-3 font-medium">Supplier</th>
@@ -1232,33 +1232,33 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                   <th className="p-3 font-medium">Change Details</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-100">
+              <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                 {visibleSupplierAuditLogs.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="p-6 text-center text-xs text-slate-400">
+                    <td colSpan={5} className="p-6 text-center text-xs text-slate-500 dark:text-slate-400">
                       No supplier profile changes recorded yet. Creating or editing a supplier will log entries here.
                     </td>
                   </tr>
                 ) : (
                   visibleSupplierAuditLogs.map((log: any) => (
-                    <tr key={log.id} className="hover:bg-slate-50/70">
-                      <td className="p-3 font-mono text-[11px] text-slate-700 whitespace-nowrap">
+                    <tr key={log.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/70">
+                      <td className="p-3 font-mono text-[11px] text-slate-700 dark:text-slate-200 whitespace-nowrap">
                         {formatAuditTimestamp(log.logged_at)}
                       </td>
-                      <td className="p-3 font-medium text-slate-900 whitespace-nowrap">
+                      <td className="p-3 font-medium text-slate-900 dark:text-slate-50 whitespace-nowrap">
                         {log.supplier_name}
                         {log.supplier_code && (
-                          <span className="ml-1.5 font-mono text-[11px] text-slate-400">{log.supplier_code}</span>
+                          <span className="ml-1.5 font-mono text-[11px] text-slate-500 dark:text-slate-400">{log.supplier_code}</span>
                         )}
                       </td>
                       <td className="p-3 whitespace-nowrap">{renderSupplierAuditActionBadge(log.action)}</td>
                       <td className="p-3 whitespace-nowrap">
-                        <span className="inline-flex items-center gap-1.5 font-medium text-slate-800">
-                          <User className="w-3.5 h-3.5 text-slate-400" />
+                        <span className="inline-flex items-center gap-1.5 font-medium text-slate-800 dark:text-slate-100">
+                          <User className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400" />
                           {log.user_name || 'System'}
                         </span>
                       </td>
-                      <td className="p-3 text-slate-600">{log.details || '—'}</td>
+                      <td className="p-3 text-slate-600 dark:text-slate-300">{log.details || '—'}</td>
                     </tr>
                   ))
                 )}
@@ -1269,9 +1269,9 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
       )}
 
       {subTab === 'payables' && (
-        <div className="rounded-xl border border-slate-200 bg-white overflow-x-auto">
+        <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-x-auto">
           <table className="w-full text-left text-xs">
-            <thead className="border-b border-slate-200 bg-slate-50 text-slate-500">
+            <thead className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 text-slate-500 dark:text-slate-400">
               <tr>
                 <th className="p-3 font-medium">Invoice #</th>
                 <th className="p-3 font-medium">Supplier</th>
@@ -1283,10 +1283,10 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                 <th className="p-3 font-medium text-right">Action</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100">
+            <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
               {visibleInvoices.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="p-6 text-center text-xs text-slate-400">
+                  <td colSpan={8} className="p-6 text-center text-xs text-slate-500 dark:text-slate-400">
                     No supplier invoices match the selected truck / location.
                   </td>
                 </tr>
@@ -1296,17 +1296,17 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                   <tr key={inv.id}>
                     <td className="p-3 font-mono font-semibold">{inv.invoice_number}</td>
                     <td className="p-3">{inv.supplier_name}</td>
-                    <td className="p-3 font-mono text-slate-500">{String(inv.due_date).slice(0, 10)}</td>
+                    <td className="p-3 font-mono text-slate-500 dark:text-slate-400">{String(inv.due_date).slice(0, 10)}</td>
                     <td className="p-3 text-right font-mono tabular-nums">{formatPHP(inv.total_amount)}</td>
                     <td className="p-3 text-right font-mono tabular-nums">{formatPHP(inv.paid_amount)}</td>
-                    <td className="p-3 text-right font-mono tabular-nums font-semibold text-red-700">{formatPHP(bal)}</td>
+                    <td className="p-3 text-right font-mono tabular-nums font-semibold text-red-700 dark:text-red-300">{formatPHP(bal)}</td>
                     <td className="p-3 whitespace-nowrap">{renderInvoiceStatusBadge(inv.status)}</td>
                     <td className="p-3 text-right whitespace-nowrap">
                       <div className="inline-flex items-center justify-end gap-1.5">
                         <button
                           type="button"
                           onClick={() => setViewInvoice(inv)}
-                          className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
+                          className="inline-flex items-center gap-1 rounded-md border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
                         >
                           <Eye className="w-3.5 h-3.5" /> View / Print
                         </button>
@@ -1314,7 +1314,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                           <button
                             type="button"
                             onClick={() => payInvoice(inv)}
-                            className="rounded-md bg-slate-900 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-slate-800"
+                            className="rounded-md bg-slate-900 dark:bg-slate-100 px-2.5 py-1.5 text-xs font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white"
                           >
                             Settle Balance
                           </button>
@@ -1332,42 +1332,42 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
       {/* Receive Goods (GRN) Modal */}
       {receivingPo && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-2xl rounded-xl bg-white p-5 space-y-4 border border-slate-200">
+          <div className="w-full max-w-2xl rounded-xl bg-white dark:bg-slate-900 p-5 space-y-4 border border-slate-200 dark:border-slate-800">
             <h3 className="font-display text-base font-semibold">Receive Goods — {receivingPo.po_number}</h3>
             <div className="space-y-3 max-h-80 overflow-y-auto">
               {receivingPo.items.map((it: any) => (
-                <div key={it.id} className="grid grid-cols-1 sm:grid-cols-5 gap-2.5 items-end border border-slate-200 rounded-lg p-3">
+                <div key={it.id} className="grid grid-cols-1 sm:grid-cols-5 gap-2.5 items-end border border-slate-200 dark:border-slate-800 rounded-lg p-3">
                   <div className="sm:col-span-2">
-                    <p className="text-xs font-semibold text-slate-900">{it.item_name}</p>
-                    <p className="text-[11px] text-slate-500">Ordered: {formatNum(it.ordered_qty, 0)} {it.uom_code}</p>
+                    <p className="text-xs font-semibold text-slate-900 dark:text-slate-50">{it.item_name}</p>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">Ordered: {formatNum(it.ordered_qty, 0)} {it.uom_code}</p>
                   </div>
                   <div>
-                    <label className="block text-[11px] font-medium text-slate-600 mb-1">Received Qty</label>
+                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">Received Qty</label>
                     <input
                       type="number"
                       placeholder="Recv Qty"
                       value={recvMap[it.id]?.qty || ''}
                       onChange={(e) => setRecvMap((m) => ({ ...m, [it.id]: { ...m[it.id], qty: e.target.value } }))}
-                      className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-mono"
+                      className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-2.5 py-1.5 text-xs font-mono"
                     />
                   </div>
                   <div>
-                    <label className="block text-[11px] font-medium text-slate-600 mb-1">Batch / Lot #</label>
+                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">Batch / Lot #</label>
                     <input
                       type="text"
                       placeholder="Lot #"
                       value={recvMap[it.id]?.batch || ''}
                       onChange={(e) => setRecvMap((m) => ({ ...m, [it.id]: { ...m[it.id], batch: e.target.value } }))}
-                      className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-mono"
+                      className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-2.5 py-1.5 text-xs font-mono"
                     />
                   </div>
                   <div>
-                    <label className="block text-[11px] font-medium text-slate-600 mb-1">Expiry Date</label>
+                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">Expiry Date</label>
                     <input
                       type="date"
                       value={recvMap[it.id]?.expiry || ''}
                       onChange={(e) => setRecvMap((m) => ({ ...m, [it.id]: { ...m[it.id], expiry: e.target.value } }))}
-                      className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-mono"
+                      className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-2.5 py-1.5 text-xs font-mono"
                     />
                   </div>
                 </div>
@@ -1386,16 +1386,16 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
       {/* New Purchase Order Modal */}
       {showNewPo && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <form onSubmit={createPO} className="w-full max-w-xl max-h-[90vh] overflow-y-auto rounded-xl bg-white p-5 space-y-4 border border-slate-200">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+          <form onSubmit={createPO} className="w-full max-w-xl max-h-[90vh] overflow-y-auto rounded-xl bg-white dark:bg-slate-900 p-5 space-y-4 border border-slate-200 dark:border-slate-800">
+            <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800/80 pb-3">
               <div>
-                <h3 className="font-display text-base font-semibold text-slate-900">New Purchase Order</h3>
-                <p className="text-xs text-slate-500">Create a supplier order for manager review and approval</p>
+                <h3 className="font-display text-base font-semibold text-slate-900 dark:text-slate-50">New Purchase Order</h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400">Create a supplier order for manager review and approval</p>
               </div>
               <button
                 type="button"
                 onClick={() => setShowNewPo(false)}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                className="p-1.5 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -1404,12 +1404,12 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <div className="flex items-center justify-between gap-2 mb-1">
-                  <label className="block text-xs font-medium text-slate-600">Supplier</label>
+                  <label className="block text-xs font-medium text-slate-600 dark:text-slate-300">Supplier</label>
                   <div className="inline-flex items-center gap-1">
                     <button
                       type="button"
                       onClick={() => openAddSupplierModal('newPo')}
-                      className="inline-flex items-center gap-0.5 rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-100"
+                      className="inline-flex items-center gap-0.5 rounded border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 px-1.5 py-0.5 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
                       title="Add new supplier"
                     >
                       <Plus className="w-3 h-3" /> Add
@@ -1421,7 +1421,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                         const sel = data.suppliers.find((s: any) => s.id === poForm.supplierId);
                         if (sel) openEditSupplierModal(sel, 'newPo');
                       }}
-                      className="inline-flex items-center gap-0.5 rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-40"
+                      className="inline-flex items-center gap-0.5 rounded border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 px-1.5 py-0.5 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-40"
                       title="Edit selected supplier"
                     >
                       <Pencil className="w-3 h-3" /> Edit
@@ -1433,7 +1433,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                         const sel = data.suppliers.find((s: any) => s.id === poForm.supplierId);
                         if (sel) setDeleteSupplierTarget(sel);
                       }}
-                      className="inline-flex items-center gap-0.5 rounded border border-red-200 bg-red-50/60 px-1.5 py-0.5 text-[11px] font-medium text-red-700 hover:bg-red-100 disabled:opacity-40"
+                      className="inline-flex items-center gap-0.5 rounded border border-red-200 dark:border-red-800/80 bg-red-50/60 dark:bg-red-950/50 px-1.5 py-0.5 text-[11px] font-medium text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/60 disabled:opacity-40"
                       title="Delete selected supplier"
                     >
                       <Trash2 className="w-3 h-3" /> Delete
@@ -1444,7 +1444,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                   required
                   value={poForm.supplierId}
                   onChange={(e) => setPoForm({ ...poForm, supplierId: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs"
                 >
                   {data.suppliers.length === 0 ? (
                     <option value="">No suppliers available — click Add</option>
@@ -1456,11 +1456,11 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                 </select>
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Delivery Location</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Delivery Location</label>
                 <select
                   value={poForm.locationId}
                   onChange={(e) => setPoForm({ ...poForm, locationId: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs"
                 >
                   {locations.map((l) => (
                     <option key={l.id} value={l.id}>{l.name}</option>
@@ -1468,12 +1468,12 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                 </select>
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Purchase Order Status</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Purchase Order Status</label>
                 <div className="flex items-center gap-2">
                   <select
                     value={poForm.status}
                     onChange={(e) => setPoForm({ ...poForm, status: e.target.value as 'DRAFT' | 'PENDING_APPROVAL' | 'APPROVED' })}
-                    className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                    className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs"
                   >
                     <option value="DRAFT">Draft</option>
                     <option value="PENDING_APPROVAL">Pending Approval</option>
@@ -1483,29 +1483,29 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                 </div>
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Expected Delivery Date (optional)</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Expected Delivery Date (optional)</label>
                 <input
                   type="date"
                   value={poForm.expectedAt}
                   onChange={(e) => setPoForm({ ...poForm, expectedAt: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
               <div className="sm:col-span-2">
-                <label className="block text-xs font-medium text-slate-600 mb-1">Order Notes (optional)</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Order Notes (optional)</label>
                 <input
                   type="text"
                   placeholder="e.g. Morning commissary delivery"
                   value={poForm.notes}
                   onChange={(e) => setPoForm({ ...poForm, notes: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs"
                 />
               </div>
             </div>
 
-            <div className="space-y-2.5 border-t border-slate-100 pt-3">
+            <div className="space-y-2.5 border-t border-slate-100 dark:border-slate-800/80 pt-3">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-slate-700">Order Line Items</span>
+                <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">Order Line Items</span>
                 <button
                   type="button"
                   onClick={() => {
@@ -1522,16 +1522,16 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                       ],
                     }));
                   }}
-                  className="text-xs font-medium text-slate-900 hover:underline"
+                  className="text-xs font-medium text-slate-900 dark:text-slate-50 hover:underline"
                 >
                   + Add Line Item
                 </button>
               </div>
 
               {poForm.items.map((line, idx) => (
-                <div key={idx} className="grid grid-cols-12 gap-2 items-end rounded-lg border border-slate-200 bg-slate-50/60 p-2.5">
+                <div key={idx} className="grid grid-cols-12 gap-2 items-end rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/60 p-2.5">
                   <div className="col-span-12 sm:col-span-5">
-                    <label className="block text-[11px] font-medium text-slate-600 mb-1">Ingredient / Item</label>
+                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">Ingredient / Item</label>
                     <select
                       value={line.inventoryItemId}
                       onChange={(e) => {
@@ -1549,7 +1549,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                           ),
                         }));
                       }}
-                      className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs"
+                      className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs"
                     >
                       {invItems.map((i) => (
                         <option key={i.id} value={i.id}>{i.name} ({i.uom_code})</option>
@@ -1557,7 +1557,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                     </select>
                   </div>
                   <div className="col-span-5 sm:col-span-3">
-                    <label className="block text-[11px] font-medium text-slate-600 mb-1">Order Quantity</label>
+                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">Order Quantity</label>
                     <input
                       type="number"
                       min="0.01"
@@ -1571,11 +1571,11 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                           items: f.items.map((x, i) => (i === idx ? { ...x, orderedQty: e.target.value } : x)),
                         }))
                       }
-                      className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs font-mono"
+                      className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs font-mono"
                     />
                   </div>
                   <div className="col-span-5 sm:col-span-3">
-                    <label className="block text-[11px] font-medium text-slate-600 mb-1">Unit Cost (PHP)</label>
+                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">Unit Cost (PHP)</label>
                     <input
                       type="number"
                       min="0"
@@ -1589,7 +1589,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                           items: f.items.map((x, i) => (i === idx ? { ...x, unitCost: e.target.value } : x)),
                         }))
                       }
-                      className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs font-mono"
+                      className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs font-mono"
                     />
                   </div>
                   <div className="col-span-2 sm:col-span-1 flex justify-end pb-1.5">
@@ -1599,7 +1599,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                         onClick={() =>
                           setPoForm((f) => ({ ...f, items: f.items.filter((_, i) => i !== idx) }))
                         }
-                        className="p-1.5 text-slate-400 hover:text-red-600"
+                        className="p-1.5 text-slate-500 dark:text-slate-400 hover:text-red-600 dark:hover:text-red-300"
                         title="Remove line item"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
@@ -1610,19 +1610,19 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
               ))}
 
               <div className="flex items-center justify-between pt-1 text-xs">
-                <span className="text-slate-500">Estimated Order Total</span>
-                <span className="font-mono tabular-nums text-sm font-bold text-slate-900">{formatPHP(newPoTotal)}</span>
+                <span className="text-slate-500 dark:text-slate-400">Estimated Order Total</span>
+                <span className="font-mono tabular-nums text-sm font-bold text-slate-900 dark:text-slate-50">{formatPHP(newPoTotal)}</span>
               </div>
               {newPoExceedsThreshold && (
-                <div className="rounded-lg border border-violet-200 bg-violet-50 px-3 py-2 text-[11px] text-violet-900">
+                <div className="rounded-lg border border-violet-200 dark:border-violet-700/80 bg-violet-50 dark:bg-violet-950/50 px-3 py-2 text-[11px] text-violet-900 dark:text-violet-300">
                   Exceeds the <span className="font-mono font-semibold">{formatPHP(approvalThreshold)}</span> approval threshold — after submission, this PO requires Stage 1 verification and a Stage 2 Manager Digital Signature.
                 </div>
               )}
             </div>
 
-            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800/80">
               <button type="button" onClick={() => setShowNewPo(false)} className="px-4 py-2 rounded-lg border text-xs">Cancel</button>
-              <button type="submit" className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800">
+              <button type="submit" className="px-4 py-2 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950 text-xs font-semibold hover:bg-slate-800 dark:hover:bg-white">
                 {poForm.status === 'DRAFT'
                   ? 'Save as Draft'
                   : poForm.status === 'APPROVED'
@@ -1642,14 +1642,14 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
               e.preventDefault();
               saveReviewPo(false);
             }}
-            className="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-xl bg-white p-5 space-y-4 border border-slate-200"
+            className="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-xl bg-white dark:bg-slate-900 p-5 space-y-4 border border-slate-200 dark:border-slate-800"
           >
-            <div className="flex items-start justify-between gap-3 border-b border-slate-100 pb-3">
+            <div className="flex items-start justify-between gap-3 border-b border-slate-100 dark:border-slate-800/80 pb-3">
               <div>
-                <h3 className="font-display text-base font-semibold text-slate-900">
+                <h3 className="font-display text-base font-semibold text-slate-900 dark:text-slate-50">
                   {reviewEditable ? `Edit / Review Purchase Order — ${reviewPo.po_number}` : `Review Purchase Order — ${reviewPo.po_number}`}
                 </h3>
-                <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
                   {renderPoStatusBadge(reviewPo.status)}
                   {reviewPo.ordered_at && <span>Ordered {String(reviewPo.ordered_at).slice(0, 10)}</span>}
                 </div>
@@ -1657,24 +1657,24 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
               <button
                 type="button"
                 onClick={() => setReviewPo(null)}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                className="p-1.5 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            {err && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{err}</div>}
+            {err && <div className="p-2.5 rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800/80 text-xs text-red-700 dark:text-red-300 font-medium">{err}</div>}
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <div className="flex items-center justify-between gap-2 mb-1">
-                  <label className="block text-xs font-medium text-slate-600">Supplier</label>
+                  <label className="block text-xs font-medium text-slate-600 dark:text-slate-300">Supplier</label>
                   {reviewEditable && (
                     <div className="inline-flex items-center gap-1">
                       <button
                         type="button"
                         onClick={() => openAddSupplierModal('reviewPo')}
-                        className="inline-flex items-center gap-0.5 rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-100"
+                        className="inline-flex items-center gap-0.5 rounded border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 px-1.5 py-0.5 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
                         title="Add new supplier"
                       >
                         <Plus className="w-3 h-3" /> Add
@@ -1686,7 +1686,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                           const sel = data.suppliers.find((s: any) => s.id === reviewForm.supplierId);
                           if (sel) openEditSupplierModal(sel, 'reviewPo');
                         }}
-                        className="inline-flex items-center gap-0.5 rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-40"
+                        className="inline-flex items-center gap-0.5 rounded border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 px-1.5 py-0.5 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-40"
                         title="Edit selected supplier"
                       >
                         <Pencil className="w-3 h-3" /> Edit
@@ -1698,7 +1698,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                           const sel = data.suppliers.find((s: any) => s.id === reviewForm.supplierId);
                           if (sel) setDeleteSupplierTarget(sel);
                         }}
-                        className="inline-flex items-center gap-0.5 rounded border border-red-200 bg-red-50/60 px-1.5 py-0.5 text-[11px] font-medium text-red-700 hover:bg-red-100 disabled:opacity-40"
+                        className="inline-flex items-center gap-0.5 rounded border border-red-200 dark:border-red-800/80 bg-red-50/60 dark:bg-red-950/50 px-1.5 py-0.5 text-[11px] font-medium text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/60 disabled:opacity-40"
                         title="Delete selected supplier"
                       >
                         <Trash2 className="w-3 h-3" /> Delete
@@ -1710,7 +1710,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                   disabled={!reviewEditable}
                   value={reviewForm.supplierId}
                   onChange={(e) => setReviewForm({ ...reviewForm, supplierId: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs disabled:bg-slate-50 disabled:text-slate-600"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs disabled:bg-slate-50 dark:disabled:bg-slate-900 disabled:text-slate-600 dark:disabled:text-slate-400"
                 >
                   {data.suppliers.map((s: any) => (
                     <option key={s.id} value={s.id}>{s.name}</option>
@@ -1718,12 +1718,12 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                 </select>
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Delivery Location</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Delivery Location</label>
                 <select
                   disabled={!reviewEditable}
                   value={reviewForm.locationId}
                   onChange={(e) => setReviewForm({ ...reviewForm, locationId: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs disabled:bg-slate-50 disabled:text-slate-600"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs disabled:bg-slate-50 dark:disabled:bg-slate-900 disabled:text-slate-600 dark:disabled:text-slate-400"
                 >
                   {locations.map((l) => (
                     <option key={l.id} value={l.id}>{l.name}</option>
@@ -1731,13 +1731,13 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                 </select>
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Purchase Order Status</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Purchase Order Status</label>
                 {reviewEditable ? (
                   <div className="flex items-center gap-2">
                     <select
                       value={reviewForm.status}
                       onChange={(e) => setReviewForm({ ...reviewForm, status: e.target.value as 'DRAFT' | 'PENDING_APPROVAL' | 'APPROVED' })}
-                      className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                      className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs"
                     >
                       <option value="DRAFT">Draft</option>
                       <option value="PENDING_APPROVAL">Pending Approval</option>
@@ -1746,9 +1746,9 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                     {renderPoStatusBadge(reviewForm.status)}
                   </div>
                 ) : (
-                  <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                  <div className="flex items-center justify-between rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 px-3 py-2">
                     {renderPoStatusBadge(reviewPo.status)}
-                    <span className="text-[11px] text-slate-500">
+                    <span className="text-[11px] text-slate-500 dark:text-slate-400">
                       {reviewPo.status === 'PAID'
                         ? 'Settled'
                         : reviewPo.status === 'RECEIVED'
@@ -1763,31 +1763,31 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                 )}
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Expected Delivery Date</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Expected Delivery Date</label>
                 <input
                   type="date"
                   disabled={!reviewEditable}
                   value={reviewForm.expectedAt}
                   onChange={(e) => setReviewForm({ ...reviewForm, expectedAt: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono disabled:bg-slate-50 disabled:text-slate-600"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono disabled:bg-slate-50 dark:disabled:bg-slate-900 disabled:text-slate-600 dark:disabled:text-slate-400"
                 />
               </div>
               <div className="sm:col-span-2">
-                <label className="block text-xs font-medium text-slate-600 mb-1">Order / Review Notes</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Order / Review Notes</label>
                 <input
                   type="text"
                   disabled={!reviewEditable}
                   placeholder={reviewEditable ? 'Review remarks or delivery instructions' : 'No notes recorded'}
                   value={reviewForm.notes}
                   onChange={(e) => setReviewForm({ ...reviewForm, notes: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs disabled:bg-slate-50 disabled:text-slate-600"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs disabled:bg-slate-50 dark:disabled:bg-slate-900 disabled:text-slate-600 dark:disabled:text-slate-400"
                 />
               </div>
             </div>
 
-            <div className="space-y-2.5 border-t border-slate-100 pt-3">
+            <div className="space-y-2.5 border-t border-slate-100 dark:border-slate-800/80 pt-3">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-slate-700">Order Line Items</span>
+                <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">Order Line Items</span>
                 {reviewEditable && (
                   <button
                     type="button"
@@ -1805,7 +1805,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                         ],
                       }));
                     }}
-                    className="text-xs font-medium text-slate-900 hover:underline"
+                    className="text-xs font-medium text-slate-900 dark:text-slate-50 hover:underline"
                   >
                     + Add Line Item
                   </button>
@@ -1816,9 +1816,9 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                 reviewForm.items.map((line, idx) => {
                   const lineTotal = (Number(line.orderedQty) || 0) * (Number(line.unitCost) || 0);
                   return (
-                    <div key={idx} className="grid grid-cols-12 gap-2 items-end rounded-lg border border-slate-200 bg-slate-50/60 p-2.5">
+                    <div key={idx} className="grid grid-cols-12 gap-2 items-end rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/60 p-2.5">
                       <div className="col-span-12 sm:col-span-4">
-                        <label className="block text-[11px] font-medium text-slate-600 mb-1">Ingredient / Item</label>
+                        <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">Ingredient / Item</label>
                         <select
                           value={line.inventoryItemId}
                           onChange={(e) => {
@@ -1836,7 +1836,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                               ),
                             }));
                           }}
-                          className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs"
+                          className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs"
                         >
                           {invItems.map((i) => (
                             <option key={i.id} value={i.id}>{i.name} ({i.uom_code})</option>
@@ -1844,7 +1844,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                         </select>
                       </div>
                       <div className="col-span-4 sm:col-span-3">
-                        <label className="block text-[11px] font-medium text-slate-600 mb-1">Order Qty</label>
+                        <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">Order Qty</label>
                         <input
                           type="number"
                           min="0.01"
@@ -1857,11 +1857,11 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                               items: f.items.map((x, i) => (i === idx ? { ...x, orderedQty: e.target.value } : x)),
                             }))
                           }
-                          className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs font-mono"
+                          className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs font-mono"
                         />
                       </div>
                       <div className="col-span-4 sm:col-span-2">
-                        <label className="block text-[11px] font-medium text-slate-600 mb-1">Unit Cost</label>
+                        <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">Unit Cost</label>
                         <input
                           type="number"
                           min="0"
@@ -1874,12 +1874,12 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                               items: f.items.map((x, i) => (i === idx ? { ...x, unitCost: e.target.value } : x)),
                             }))
                           }
-                          className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs font-mono"
+                          className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs font-mono"
                         />
                       </div>
                       <div className="col-span-3 sm:col-span-2 text-right pb-2">
-                        <span className="block text-[10px] text-slate-400">Subtotal</span>
-                        <span className="font-mono text-xs font-semibold text-slate-900">{formatPHP(lineTotal)}</span>
+                        <span className="block text-[10px] text-slate-500 dark:text-slate-400">Subtotal</span>
+                        <span className="font-mono text-xs font-semibold text-slate-900 dark:text-slate-50">{formatPHP(lineTotal)}</span>
                       </div>
                       <div className="col-span-1 flex justify-end pb-1.5">
                         {reviewForm.items.length > 1 && (
@@ -1888,7 +1888,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                             onClick={() =>
                               setReviewForm((f) => ({ ...f, items: f.items.filter((_, i) => i !== idx) }))
                             }
-                            className="p-1.5 text-slate-400 hover:text-red-600"
+                            className="p-1.5 text-slate-500 dark:text-slate-400 hover:text-red-600 dark:hover:text-red-300"
                             title="Remove line item"
                           >
                             <Trash2 className="w-3.5 h-3.5" />
@@ -1899,9 +1899,9 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                   );
                 })
               ) : (
-                <div className="rounded-lg border border-slate-200 overflow-x-auto">
+                <div className="rounded-lg border border-slate-200 dark:border-slate-800 overflow-x-auto">
                   <table className="w-full text-left text-xs">
-                    <thead className="border-b border-slate-200 bg-slate-50 text-slate-500">
+                    <thead className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 text-slate-500 dark:text-slate-400">
                       <tr>
                         <th className="p-2.5 font-medium">Ingredient / Item</th>
                         <th className="p-2.5 font-medium text-right">Ordered</th>
@@ -1910,10 +1910,10 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                         <th className="p-2.5 font-medium text-right">Subtotal</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-slate-100">
+                    <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                       {(reviewPo.items || []).map((pi: any) => (
                         <tr key={pi.id}>
-                          <td className="p-2.5 font-medium text-slate-900">{pi.item_name}</td>
+                          <td className="p-2.5 font-medium text-slate-900 dark:text-slate-50">{pi.item_name}</td>
                           <td className="p-2.5 text-right font-mono">{formatNum(pi.ordered_qty, 2)} {pi.uom_code}</td>
                           <td className="p-2.5 text-right font-mono">{formatNum(pi.received_qty, 2)} {pi.uom_code}</td>
                           <td className="p-2.5 text-right font-mono">{formatPHP(pi.unit_cost)}</td>
@@ -1926,28 +1926,28 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
               )}
 
               <div className="flex items-center justify-between pt-1 text-xs">
-                <span className="text-slate-500">Total Purchase Order Amount</span>
-                <span className="font-mono tabular-nums text-base font-bold text-slate-900">
+                <span className="text-slate-500 dark:text-slate-400">Total Purchase Order Amount</span>
+                <span className="font-mono tabular-nums text-base font-bold text-slate-900 dark:text-slate-50">
                   {formatPHP(reviewDisplayTotal)}
                 </span>
               </div>
             </div>
 
             {(reviewExceedsThreshold || reviewPo.stage1_approved_at || reviewPo.manager_signature_data || reviewPo.status === 'PENDING_MANAGER_SIGNATURE') && (
-              <div className="rounded-lg border border-violet-200 bg-violet-50/50 p-3 space-y-2.5">
+              <div className="rounded-lg border border-violet-200 dark:border-violet-700/80 bg-violet-50/50 dark:bg-violet-950/50 p-3 space-y-2.5">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex items-center gap-1.5 text-xs font-semibold text-violet-900">
-                    <ShieldCheck className="w-4 h-4 text-violet-700" />
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-violet-900 dark:text-violet-300">
+                    <ShieldCheck className="w-4 h-4 text-violet-700 dark:text-violet-300" />
                     Multi-Stage Approval Workflow
                   </div>
-                  <span className="font-mono text-[11px] text-violet-800">
+                  <span className="font-mono text-[11px] text-violet-800 dark:text-violet-300">
                     Threshold: {formatPHP(approvalThreshold)}
                   </span>
                 </div>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
-                  <div className="rounded-md border border-violet-200/80 bg-white p-2.5">
-                    <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Stage 1 · Initial Verification</div>
-                    <div className="mt-1 font-medium text-slate-900">
+                  <div className="rounded-md border border-violet-200/80 bg-white dark:bg-slate-900 p-2.5">
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Stage 1 · Initial Verification</div>
+                    <div className="mt-1 font-medium text-slate-900 dark:text-slate-50">
                       {reviewPo.stage1_approved_by_name
                         ? `Verified by ${reviewPo.stage1_approved_by_name}`
                         : reviewPo.status === 'APPROVED' || reviewPo.status === 'PARTIAL' || reviewPo.status === 'RECEIVED' || reviewPo.status === 'PAID'
@@ -1955,12 +1955,12 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                           : 'Awaiting Stage 1 Verification'}
                     </div>
                     {reviewPo.stage1_approved_at && (
-                      <div className="text-[11px] text-slate-500 mt-0.5">{formatAuditTimestamp(reviewPo.stage1_approved_at)}</div>
+                      <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">{formatAuditTimestamp(reviewPo.stage1_approved_at)}</div>
                     )}
                   </div>
-                  <div className="rounded-md border border-violet-200/80 bg-white p-2.5">
-                    <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Stage 2 · Manager Digital Signature</div>
-                    <div className="mt-1 font-medium text-slate-900">
+                  <div className="rounded-md border border-violet-200/80 bg-white dark:bg-slate-900 p-2.5">
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Stage 2 · Manager Digital Signature</div>
+                    <div className="mt-1 font-medium text-slate-900 dark:text-slate-50">
                       {reviewPo.manager_signature_data
                         ? `Signed by ${reviewPo.manager_signer_name || 'Authorized Manager'}`
                         : reviewPo.status === 'PENDING_MANAGER_SIGNATURE'
@@ -1970,17 +1970,17 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                             : 'Not required (under threshold)'}
                     </div>
                     {reviewPo.signed_at && (
-                      <div className="text-[11px] text-slate-500 mt-0.5">{formatAuditTimestamp(reviewPo.signed_at)}</div>
+                      <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">{formatAuditTimestamp(reviewPo.signed_at)}</div>
                     )}
                   </div>
                 </div>
                 {reviewPo.manager_signature_data && (
-                  <div className="rounded-md border border-slate-200 bg-white p-2.5">
-                    <div className="flex items-center justify-between text-[11px] text-slate-500 mb-1.5">
+                  <div className="rounded-md border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-2.5">
+                    <div className="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400 mb-1.5">
                       <span>Captured Digital Signature</span>
                       <span className="font-mono">{reviewPo.manager_signer_name}</span>
                     </div>
-                    <div className="flex justify-center rounded border border-dashed border-slate-200 bg-slate-50/70 p-2">
+                    <div className="flex justify-center rounded border border-dashed border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/70 p-2">
                       <img
                         src={reviewPo.manager_signature_data}
                         alt="Manager digital signature"
@@ -1992,7 +1992,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
               </div>
             )}
 
-            <div className="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-slate-100">
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-slate-100 dark:border-slate-800/80">
               <div>
                 {reviewCanCancel && (
                   <button
@@ -2002,7 +2002,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                       setCancelReason('');
                       setCancelPoTarget(reviewPo);
                     }}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-red-200 bg-white px-3 py-2 text-xs font-medium text-red-700 hover:bg-red-50"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-red-200 dark:border-red-800/80 bg-white dark:bg-slate-900 px-3 py-2 text-xs font-medium text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/70"
                   >
                     <XCircle className="w-3.5 h-3.5" /> Cancel PO
                   </button>
@@ -2013,7 +2013,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                 <button
                   type="button"
                   onClick={() => setReviewPo(null)}
-                  className="px-4 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                  className="px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
                 >
                   Close
                 </button>
@@ -2022,7 +2022,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                     <button
                       type="submit"
                       disabled={savingReview}
-                      className="px-4 py-2 rounded-lg border border-slate-300 bg-white text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-50"
+                      className="px-4 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-semibold text-slate-800 dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50"
                     >
                       {savingReview ? 'Saving...' : 'Save Changes'}
                     </button>
@@ -2031,7 +2031,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                         type="button"
                         disabled={savingReview}
                         onClick={() => saveReviewPo(true)}
-                        className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-50"
+                        className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950 text-xs font-semibold hover:bg-slate-800 dark:hover:bg-white disabled:opacity-50"
                       >
                         <CheckCircle2 className="w-3.5 h-3.5" />
                         {savingReview
@@ -2083,37 +2083,37 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
       {/* Cancel Purchase Order Confirmation Modal */}
       {cancelPoTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <form onSubmit={confirmCancelPO} className="w-full max-w-md rounded-xl bg-white p-5 space-y-4 border border-slate-200">
+          <form onSubmit={confirmCancelPO} className="w-full max-w-md rounded-xl bg-white dark:bg-slate-900 p-5 space-y-4 border border-slate-200 dark:border-slate-800">
             <div className="flex items-start justify-between gap-2">
               <div>
-                <h3 className="font-display text-base font-semibold text-slate-900">
+                <h3 className="font-display text-base font-semibold text-slate-900 dark:text-slate-50">
                   Cancel Purchase Order {cancelPoTarget.po_number}?
                 </h3>
-                <p className="text-xs text-slate-500 mt-0.5">
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                   {cancelPoTarget.supplier_name} · {formatPHP(cancelPoTarget.total_amount)}
                 </p>
               </div>
               <button
                 type="button"
                 onClick={() => setCancelPoTarget(null)}
-                className="p-1 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                className="p-1 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            <p className="text-xs text-slate-600">
-              Cancelling this order will mark it as <span className="font-semibold text-red-600">CANCELLED</span> and prevent goods receiving or supplier billing against it.
+            <p className="text-xs text-slate-600 dark:text-slate-300">
+              Cancelling this order will mark it as <span className="font-semibold text-red-600 dark:text-red-300">CANCELLED</span> and prevent goods receiving or supplier billing against it.
             </p>
 
             <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">Cancellation Reason (optional)</label>
+              <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Cancellation Reason (optional)</label>
               <input
                 type="text"
                 placeholder="e.g. Supplier out of stock or revised quantity"
                 value={cancelReason}
                 onChange={(e) => setCancelReason(e.target.value)}
-                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs"
               />
             </div>
 
@@ -2121,7 +2121,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
               <button
                 type="button"
                 onClick={() => setCancelPoTarget(null)}
-                className="px-4 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                className="px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
               >
                 Keep PO
               </button>
@@ -2146,31 +2146,31 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
         const invPayments = Array.isArray(viewInvoice.payments) ? viewInvoice.payments : [];
         const statusColor =
           viewInvoice.status === 'PAID'
-            ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+            ? 'bg-emerald-50 dark:bg-emerald-950/45 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-700/80'
             : viewInvoice.status === 'PARTIAL'
-            ? 'bg-blue-50 text-blue-700 border-blue-200'
-            : 'bg-amber-50 text-amber-700 border-amber-200';
+            ? 'bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-blue-300 border-blue-200 dark:border-blue-700/80'
+            : 'bg-amber-50 dark:bg-amber-950/45 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-700/80';
 
         return (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 overflow-y-auto print:static print:bg-transparent print:p-0 print:block">
-            <div className="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-xl bg-white p-6 space-y-5 border border-slate-200 print:max-h-none print:overflow-visible print:border-0 print:shadow-none print:mx-auto print:max-w-full">
+            <div className="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-xl bg-white dark:bg-slate-900 p-6 space-y-5 border border-slate-200 dark:border-slate-800 print:max-h-none print:overflow-visible print:border-0 print:shadow-none print:mx-auto print:max-w-full">
               {/* Header */}
-              <div className="flex items-start justify-between gap-4 border-b border-slate-200 pb-4">
+              <div className="flex items-start justify-between gap-4 border-b border-slate-200 dark:border-slate-800 pb-4">
                 <div className="flex items-center gap-3">
                   <img
                     src="/assets/aistudio/Logo_836b4628.png"
                     alt="Maximus Barbecue Logo"
                     referrerPolicy="no-referrer"
-                    className="w-11 h-11 rounded-full object-contain border border-slate-100"
+                    className="w-11 h-11 rounded-full object-contain border border-slate-100 dark:border-slate-800/80"
                   />
                   <div>
-                    <h3 className="font-display text-lg font-bold text-slate-900">Maximus Barbecue ERP</h3>
-                    <p className="text-xs text-slate-500">Supplier Invoice &amp; Accounts Payable Voucher</p>
+                    <h3 className="font-display text-lg font-bold text-slate-900 dark:text-slate-50">Maximus Barbecue ERP</h3>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">Supplier Invoice &amp; Accounts Payable Voucher</p>
                   </div>
                 </div>
                 <div className="flex items-start gap-2">
                   <div className="text-right">
-                    <p className="font-mono text-sm font-bold text-slate-900">{viewInvoice.invoice_number}</p>
+                    <p className="font-mono text-sm font-bold text-slate-900 dark:text-slate-50">{viewInvoice.invoice_number}</p>
                     <span className={`inline-block mt-1 px-2 py-0.5 rounded border text-[11px] font-semibold ${statusColor}`}>
                       {viewInvoice.status}
                     </span>
@@ -2178,7 +2178,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                   <button
                     type="button"
                     onClick={() => setViewInvoice(null)}
-                    className="no-print p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                    className="no-print p-1.5 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
                   >
                     <X className="w-4 h-4" />
                   </button>
@@ -2187,52 +2187,52 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
 
               {/* Supplier & Invoice Metadata */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-                <div className="rounded-lg border border-slate-200 bg-slate-50 p-3.5 space-y-1">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Supplier (Bill From)</p>
-                  <p className="text-sm font-semibold text-slate-900">{viewInvoice.supplier_name}</p>
-                  {viewInvoice.supplier_code && <p className="font-mono text-slate-600">Code: {viewInvoice.supplier_code}</p>}
-                  {viewInvoice.supplier_tin && <p className="font-mono text-slate-600">TIN: {viewInvoice.supplier_tin}</p>}
-                  {viewInvoice.supplier_contact && <p className="text-slate-600">Contact: {viewInvoice.supplier_contact}</p>}
+                <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 p-3.5 space-y-1">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Supplier (Bill From)</p>
+                  <p className="text-sm font-semibold text-slate-900 dark:text-slate-50">{viewInvoice.supplier_name}</p>
+                  {viewInvoice.supplier_code && <p className="font-mono text-slate-600 dark:text-slate-300">Code: {viewInvoice.supplier_code}</p>}
+                  {viewInvoice.supplier_tin && <p className="font-mono text-slate-600 dark:text-slate-300">TIN: {viewInvoice.supplier_tin}</p>}
+                  {viewInvoice.supplier_contact && <p className="text-slate-600 dark:text-slate-300">Contact: {viewInvoice.supplier_contact}</p>}
                   {(viewInvoice.supplier_phone || viewInvoice.supplier_email) && (
-                    <p className="text-slate-600">
+                    <p className="text-slate-600 dark:text-slate-300">
                       {[viewInvoice.supplier_phone, viewInvoice.supplier_email].filter(Boolean).join(' · ')}
                     </p>
                   )}
-                  {viewInvoice.supplier_address && <p className="text-slate-500">{viewInvoice.supplier_address}</p>}
+                  {viewInvoice.supplier_address && <p className="text-slate-500 dark:text-slate-400">{viewInvoice.supplier_address}</p>}
                 </div>
 
-                <div className="rounded-lg border border-slate-200 bg-slate-50 p-3.5 space-y-1.5">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Voucher Reference</p>
+                <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 p-3.5 space-y-1.5">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Voucher Reference</p>
                   <div className="flex justify-between">
-                    <span className="text-slate-500">Invoice Date</span>
-                    <span className="font-mono font-medium text-slate-900">
+                    <span className="text-slate-500 dark:text-slate-400">Invoice Date</span>
+                    <span className="font-mono font-medium text-slate-900 dark:text-slate-50">
                       {viewInvoice.created_at ? String(viewInvoice.created_at).slice(0, 10) : '—'}
                     </span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-slate-500">Due Date</span>
-                    <span className="font-mono font-semibold text-slate-900">{String(viewInvoice.due_date || '').slice(0, 10)}</span>
+                    <span className="text-slate-500 dark:text-slate-400">Due Date</span>
+                    <span className="font-mono font-semibold text-slate-900 dark:text-slate-50">{String(viewInvoice.due_date || '').slice(0, 10)}</span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-slate-500">Linked PO #</span>
-                    <span className="font-mono text-slate-900">{viewInvoice.po_number || 'Direct / Opening AP'}</span>
+                    <span className="text-slate-500 dark:text-slate-400">Linked PO #</span>
+                    <span className="font-mono text-slate-900 dark:text-slate-50">{viewInvoice.po_number || 'Direct / Opening AP'}</span>
                   </div>
                   {viewInvoice.grn_number && (
                     <div className="flex justify-between">
-                      <span className="text-slate-500">GRN Reference</span>
-                      <span className="font-mono text-slate-900">{viewInvoice.grn_number}</span>
+                      <span className="text-slate-500 dark:text-slate-400">GRN Reference</span>
+                      <span className="font-mono text-slate-900 dark:text-slate-50">{viewInvoice.grn_number}</span>
                     </div>
                   )}
                   {viewInvoice.location_name && (
                     <div className="flex justify-between">
-                      <span className="text-slate-500">Receiving Location</span>
-                      <span className="text-slate-900">{viewInvoice.location_name}</span>
+                      <span className="text-slate-500 dark:text-slate-400">Receiving Location</span>
+                      <span className="text-slate-900 dark:text-slate-50">{viewInvoice.location_name}</span>
                     </div>
                   )}
                   {Number(viewInvoice.payment_terms || 0) > 0 && (
                     <div className="flex justify-between">
-                      <span className="text-slate-500">Payment Terms</span>
-                      <span className="font-mono text-slate-900">Net {viewInvoice.payment_terms} days</span>
+                      <span className="text-slate-500 dark:text-slate-400">Payment Terms</span>
+                      <span className="font-mono text-slate-900 dark:text-slate-50">Net {viewInvoice.payment_terms} days</span>
                     </div>
                   )}
                 </div>
@@ -2240,11 +2240,11 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
 
               {/* Line Items */}
               <div className="space-y-2">
-                <p className="text-xs font-semibold text-slate-700">Billed Line Items</p>
+                <p className="text-xs font-semibold text-slate-700 dark:text-slate-200">Billed Line Items</p>
                 {invItemsList.length > 0 ? (
-                  <div className="rounded-lg border border-slate-200 overflow-x-auto">
+                  <div className="rounded-lg border border-slate-200 dark:border-slate-800 overflow-x-auto">
                     <table className="w-full text-left text-xs">
-                      <thead className="border-b border-slate-200 bg-slate-50 text-slate-500">
+                      <thead className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 text-slate-500 dark:text-slate-400">
                         <tr>
                           <th className="p-2.5 font-medium">Item</th>
                           <th className="p-2.5 font-medium">Batch / Lot</th>
@@ -2253,16 +2253,16 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                           <th className="p-2.5 font-medium text-right">Amount</th>
                         </tr>
                       </thead>
-                      <tbody className="divide-y divide-slate-100">
+                      <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                         {invItemsList.map((it: any, idx: number) => (
                           <tr key={it.id || idx}>
-                            <td className="p-2.5 font-medium text-slate-900">{it.item_name}</td>
-                            <td className="p-2.5 font-mono text-slate-500">{it.batch_number || '—'}</td>
+                            <td className="p-2.5 font-medium text-slate-900 dark:text-slate-50">{it.item_name}</td>
+                            <td className="p-2.5 font-mono text-slate-500 dark:text-slate-400">{it.batch_number || '—'}</td>
                             <td className="p-2.5 text-right font-mono tabular-nums">
                               {formatNum(it.quantity, 2)} {it.uom_code}
                             </td>
                             <td className="p-2.5 text-right font-mono tabular-nums">{formatPHP(it.unit_cost)}</td>
-                            <td className="p-2.5 text-right font-mono tabular-nums font-semibold text-slate-900">
+                            <td className="p-2.5 text-right font-mono tabular-nums font-semibold text-slate-900 dark:text-slate-50">
                               {formatPHP(it.line_total)}
                             </td>
                           </tr>
@@ -2271,26 +2271,26 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                     </table>
                   </div>
                 ) : (
-                  <div className="rounded-lg border border-dashed border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
-                    Summary supplier billing voucher for <span className="font-semibold text-slate-800">{viewInvoice.supplier_name}</span> (no linked PO line breakdown).
+                  <div className="rounded-lg border border-dashed border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 p-3 text-xs text-slate-600 dark:text-slate-300">
+                    Summary supplier billing voucher for <span className="font-semibold text-slate-800 dark:text-slate-100">{viewInvoice.supplier_name}</span> (no linked PO line breakdown).
                   </div>
                 )}
               </div>
 
               {/* AP Financial Summary */}
               <div className="flex justify-end">
-                <div className="w-full sm:w-72 rounded-lg border border-slate-200 bg-slate-50 p-3.5 space-y-1.5 text-xs">
-                  <div className="flex justify-between text-slate-600">
+                <div className="w-full sm:w-72 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 p-3.5 space-y-1.5 text-xs">
+                  <div className="flex justify-between text-slate-600 dark:text-slate-300">
                     <span>Invoice Total</span>
-                    <span className="font-mono tabular-nums font-semibold text-slate-900">{formatPHP(viewInvoice.total_amount)}</span>
+                    <span className="font-mono tabular-nums font-semibold text-slate-900 dark:text-slate-50">{formatPHP(viewInvoice.total_amount)}</span>
                   </div>
-                  <div className="flex justify-between text-slate-600">
+                  <div className="flex justify-between text-slate-600 dark:text-slate-300">
                     <span>Amount Paid</span>
-                    <span className="font-mono tabular-nums font-medium text-emerald-700">-{formatPHP(viewInvoice.paid_amount)}</span>
+                    <span className="font-mono tabular-nums font-medium text-emerald-700 dark:text-emerald-300">-{formatPHP(viewInvoice.paid_amount)}</span>
                   </div>
-                  <div className="border-t border-slate-200 pt-1.5 flex justify-between text-sm font-bold text-slate-900">
+                  <div className="border-t border-slate-200 dark:border-slate-800 pt-1.5 flex justify-between text-sm font-bold text-slate-900 dark:text-slate-50">
                     <span>Balance Due</span>
-                    <span className={`font-mono tabular-nums ${balance > 0 ? 'text-red-700' : 'text-emerald-700'}`}>
+                    <span className={`font-mono tabular-nums ${balance > 0 ? 'text-red-700 dark:text-red-300' : 'text-emerald-700 dark:text-emerald-300'}`}>
                       {formatPHP(balance)}
                     </span>
                   </div>
@@ -2299,11 +2299,11 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
 
               {/* Payment History */}
               <div className="space-y-2">
-                <p className="text-xs font-semibold text-slate-700">Payment History</p>
+                <p className="text-xs font-semibold text-slate-700 dark:text-slate-200">Payment History</p>
                 {invPayments.length > 0 ? (
-                  <div className="rounded-lg border border-slate-200 overflow-x-auto">
+                  <div className="rounded-lg border border-slate-200 dark:border-slate-800 overflow-x-auto">
                     <table className="w-full text-left text-xs">
-                      <thead className="border-b border-slate-200 bg-slate-50 text-slate-500">
+                      <thead className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 text-slate-500 dark:text-slate-400">
                         <tr>
                           <th className="p-2.5 font-medium">Payment #</th>
                           <th className="p-2.5 font-medium">Date</th>
@@ -2312,14 +2312,14 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                           <th className="p-2.5 font-medium text-right">Amount</th>
                         </tr>
                       </thead>
-                      <tbody className="divide-y divide-slate-100">
+                      <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                         {invPayments.map((pmt: any, idx: number) => (
                           <tr key={pmt.id || idx}>
-                            <td className="p-2.5 font-mono font-semibold text-slate-900">{pmt.payment_number || '—'}</td>
-                            <td className="p-2.5 font-mono text-slate-500">{pmt.paid_at ? String(pmt.paid_at).slice(0, 10) : '—'}</td>
-                            <td className="p-2.5 text-slate-700">{pmt.method}</td>
-                            <td className="p-2.5 font-mono text-slate-600">{pmt.reference_no || '—'}</td>
-                            <td className="p-2.5 text-right font-mono tabular-nums font-semibold text-emerald-700">
+                            <td className="p-2.5 font-mono font-semibold text-slate-900 dark:text-slate-50">{pmt.payment_number || '—'}</td>
+                            <td className="p-2.5 font-mono text-slate-500 dark:text-slate-400">{pmt.paid_at ? String(pmt.paid_at).slice(0, 10) : '—'}</td>
+                            <td className="p-2.5 text-slate-700 dark:text-slate-200">{pmt.method}</td>
+                            <td className="p-2.5 font-mono text-slate-600 dark:text-slate-300">{pmt.reference_no || '—'}</td>
+                            <td className="p-2.5 text-right font-mono tabular-nums font-semibold text-emerald-700 dark:text-emerald-300">
                               {formatPHP(pmt.amount)}
                             </td>
                           </tr>
@@ -2328,27 +2328,27 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                     </table>
                   </div>
                 ) : Number(viewInvoice.paid_amount || 0) > 0 ? (
-                  <p className="text-xs text-slate-500">
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
                     Initial partial payment of {formatPHP(viewInvoice.paid_amount)} recorded prior to detailed payment log.
                   </p>
                 ) : (
-                  <p className="text-xs text-slate-500">No payments recorded yet.</p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">No payments recorded yet.</p>
                 )}
               </div>
 
               {/* Print Signature Lines */}
-              <div className="hidden print:grid grid-cols-3 gap-6 pt-8 text-xs text-slate-600">
-                <div className="border-t border-slate-400 pt-1.5 text-center">Prepared By</div>
-                <div className="border-t border-slate-400 pt-1.5 text-center">Verified / Approved By</div>
-                <div className="border-t border-slate-400 pt-1.5 text-center">Received By (Supplier)</div>
+              <div className="hidden print:grid grid-cols-3 gap-6 pt-8 text-xs text-slate-600 dark:text-slate-300">
+                <div className="border-t border-slate-400 dark:border-slate-600 pt-1.5 text-center">Prepared By</div>
+                <div className="border-t border-slate-400 dark:border-slate-600 pt-1.5 text-center">Verified / Approved By</div>
+                <div className="border-t border-slate-400 dark:border-slate-600 pt-1.5 text-center">Received By (Supplier)</div>
               </div>
 
               {/* Footer Actions */}
-              <div className="flex flex-wrap items-center justify-end gap-2 border-t border-slate-100 pt-3 no-print">
+              <div className="flex flex-wrap items-center justify-end gap-2 border-t border-slate-100 dark:border-slate-800/80 pt-3 no-print">
                 <button
                   type="button"
                   onClick={() => setViewInvoice(null)}
-                  className="px-4 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                  className="px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
                 >
                   Close
                 </button>
@@ -2364,7 +2364,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                 <button
                   type="button"
                   onClick={() => window.print()}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800"
+                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950 text-xs font-semibold hover:bg-slate-800 dark:hover:bg-white"
                 >
                   <Printer className="w-3.5 h-3.5" /> Print / Save PDF
                 </button>
@@ -2379,106 +2379,106 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/45 p-4">
           <form
             onSubmit={handleSaveSupplier}
-            className="w-full max-w-lg max-h-[90vh] overflow-y-auto rounded-xl bg-white p-5 space-y-4 border border-slate-200 shadow-xl"
+            className="w-full max-w-lg max-h-[90vh] overflow-y-auto rounded-xl bg-white dark:bg-slate-900 p-5 space-y-4 border border-slate-200 dark:border-slate-800 shadow-xl"
           >
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+            <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800/80 pb-3">
               <div>
-                <h3 className="font-display text-base font-semibold text-slate-900">
+                <h3 className="font-display text-base font-semibold text-slate-900 dark:text-slate-50">
                   {supplierModal === 'add' ? 'Add Supplier' : 'Edit Supplier'}
                 </h3>
-                <p className="text-xs text-slate-500">Manage supplier profile, contact info, and payment terms</p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">Manage supplier profile, contact info, and payment terms</p>
               </div>
               <button
                 type="button"
                 onClick={() => setSupplierModal(null)}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                className="p-1.5 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
             {supplierModalErr && (
-              <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">
+              <div className="p-2.5 rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800/80 text-xs text-red-700 dark:text-red-300 font-medium">
                 {supplierModalErr}
               </div>
             )}
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
               <div>
-                <label className="block font-medium text-slate-600 mb-1">Supplier Code *</label>
+                <label className="block font-medium text-slate-600 dark:text-slate-300 mb-1">Supplier Code *</label>
                 <input
                   required
                   placeholder="e.g. SUP-004"
                   value={supplierForm.code}
                   onChange={(e) => setSupplierForm({ ...supplierForm, code: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
               <div>
-                <label className="block font-medium text-slate-600 mb-1">Payment Terms (Days)</label>
+                <label className="block font-medium text-slate-600 dark:text-slate-300 mb-1">Payment Terms (Days)</label>
                 <input
                   type="number"
                   min="0"
                   step="1"
                   value={supplierForm.paymentTerms}
                   onChange={(e) => setSupplierForm({ ...supplierForm, paymentTerms: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
               <div className="sm:col-span-2">
-                <label className="block font-medium text-slate-600 mb-1">Supplier Name *</label>
+                <label className="block font-medium text-slate-600 dark:text-slate-300 mb-1">Supplier Name *</label>
                 <input
                   required
                   placeholder="e.g. Prime Grill Poultry & Meat Corp."
                   value={supplierForm.name}
                   onChange={(e) => setSupplierForm({ ...supplierForm, name: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs"
                 />
               </div>
               <div>
-                <label className="block font-medium text-slate-600 mb-1">Contact Person</label>
+                <label className="block font-medium text-slate-600 dark:text-slate-300 mb-1">Contact Person</label>
                 <input
                   placeholder="e.g. Maria Santos"
                   value={supplierForm.contactPerson}
                   onChange={(e) => setSupplierForm({ ...supplierForm, contactPerson: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs"
                 />
               </div>
               <div>
-                <label className="block font-medium text-slate-600 mb-1">Phone</label>
+                <label className="block font-medium text-slate-600 dark:text-slate-300 mb-1">Phone</label>
                 <input
                   placeholder="e.g. +63 917 555 0199"
                   value={supplierForm.phone}
                   onChange={(e) => setSupplierForm({ ...supplierForm, phone: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
               <div>
-                <label className="block font-medium text-slate-600 mb-1">Email</label>
+                <label className="block font-medium text-slate-600 dark:text-slate-300 mb-1">Email</label>
                 <input
                   type="email"
                   placeholder="orders@supplier.ph"
                   value={supplierForm.email}
                   onChange={(e) => setSupplierForm({ ...supplierForm, email: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs"
                 />
               </div>
               <div>
-                <label className="block font-medium text-slate-600 mb-1">TIN</label>
+                <label className="block font-medium text-slate-600 dark:text-slate-300 mb-1">TIN</label>
                 <input
                   placeholder="000-000-000-000"
                   value={supplierForm.tin}
                   onChange={(e) => setSupplierForm({ ...supplierForm, tin: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
               <div className="sm:col-span-2">
-                <label className="block font-medium text-slate-600 mb-1">Business Address</label>
+                <label className="block font-medium text-slate-600 dark:text-slate-300 mb-1">Business Address</label>
                 <input
                   placeholder="Warehouse / pickup address"
                   value={supplierForm.address}
                   onChange={(e) => setSupplierForm({ ...supplierForm, address: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs"
                 />
               </div>
             </div>
@@ -2488,19 +2488,19 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
               if (!editedSupplier) return null;
               const supLogs = allSupplierAuditLogs.filter((l) => l.supplier_id === editedSupplier.id).slice(0, 3);
               return (
-                <div className="rounded-lg border border-slate-200 bg-slate-50/80 p-3 space-y-2 text-xs">
+                <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-800/80 p-3 space-y-2 text-xs">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div>
-                      <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Audit Trail</span>
-                      <p className="text-[11px] text-slate-700 mt-0.5">
-                        Last modified <span className="font-mono font-semibold text-slate-900">{formatAuditTimestamp(editedSupplier.updated_at)}</span> by{' '}
-                        <span className="font-semibold text-slate-900">{editedSupplier.updated_by_name || 'System Seed'}</span>
+                      <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Audit Trail</span>
+                      <p className="text-[11px] text-slate-700 dark:text-slate-200 mt-0.5">
+                        Last modified <span className="font-mono font-semibold text-slate-900 dark:text-slate-50">{formatAuditTimestamp(editedSupplier.updated_at)}</span> by{' '}
+                        <span className="font-semibold text-slate-900 dark:text-slate-50">{editedSupplier.updated_by_name || 'System Seed'}</span>
                       </p>
                     </div>
                     <button
                       type="button"
                       onClick={() => setAuditSupplierTarget(editedSupplier)}
-                      className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100"
+                      className="inline-flex items-center gap-1 rounded-md border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
                     >
                       <History className="w-3 h-3" /> View History
                     </button>
@@ -2509,11 +2509,11 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                     <div className="space-y-1 border-t border-slate-200/80 pt-2">
                       {supLogs.map((entry: any) => (
                         <div key={entry.id} className="flex items-start justify-between gap-2 text-[11px]">
-                          <div className="text-slate-600 truncate">
-                            <span className="font-semibold text-slate-800">{entry.user_name || 'System'}:</span>{' '}
+                          <div className="text-slate-600 dark:text-slate-300 truncate">
+                            <span className="font-semibold text-slate-800 dark:text-slate-100">{entry.user_name || 'System'}:</span>{' '}
                             <span>{entry.details || entry.action}</span>
                           </div>
-                          <span className="font-mono text-[10px] text-slate-400 shrink-0">
+                          <span className="font-mono text-[10px] text-slate-500 dark:text-slate-400 shrink-0">
                             {formatAuditTimestamp(entry.logged_at)}
                           </span>
                         </div>
@@ -2524,18 +2524,18 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
               );
             })()}
 
-            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800/80">
               <button
                 type="button"
                 onClick={() => setSupplierModal(null)}
-                className="px-4 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                className="px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
               >
                 Cancel
               </button>
               <button
                 type="submit"
                 disabled={savingSupplier}
-                className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-50"
+                className="px-4 py-2 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950 text-xs font-semibold hover:bg-slate-800 dark:hover:bg-white disabled:opacity-50"
               >
                 {savingSupplier ? 'Saving...' : supplierModal === 'add' ? 'Save Supplier' : 'Update Supplier'}
               </button>
@@ -2549,44 +2549,44 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
         const targetLogs = allSupplierAuditLogs.filter((l) => l.supplier_id === auditSupplierTarget.id);
         return (
           <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/45 p-4">
-            <div className="w-full max-w-2xl max-h-[85vh] overflow-y-auto rounded-xl bg-white p-5 space-y-4 border border-slate-200 shadow-xl">
-              <div className="flex items-start justify-between gap-3 border-b border-slate-100 pb-3">
+            <div className="w-full max-w-2xl max-h-[85vh] overflow-y-auto rounded-xl bg-white dark:bg-slate-900 p-5 space-y-4 border border-slate-200 dark:border-slate-800 shadow-xl">
+              <div className="flex items-start justify-between gap-3 border-b border-slate-100 dark:border-slate-800/80 pb-3">
                 <div>
-                  <h3 className="font-display text-base font-semibold text-slate-900">
+                  <h3 className="font-display text-base font-semibold text-slate-900 dark:text-slate-50">
                     Supplier Audit Trail — {auditSupplierTarget.name}
                   </h3>
-                  <p className="text-xs text-slate-500 font-mono mt-0.5">
+                  <p className="text-xs text-slate-500 dark:text-slate-400 font-mono mt-0.5">
                     {[auditSupplierTarget.code, auditSupplierTarget.tin].filter(Boolean).join(' · ') || 'Supplier Profile'}
                   </p>
                 </div>
                 <button
                   type="button"
                   onClick={() => setAuditSupplierTarget(null)}
-                  className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                  className="p-1.5 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
                 >
                   <X className="w-4 h-4" />
                 </button>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-                <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                  <span className="block text-[11px] font-medium text-slate-500">Last Modified Date</span>
-                  <span className="mt-0.5 block font-mono font-semibold text-slate-900">
+                <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 p-3">
+                  <span className="block text-[11px] font-medium text-slate-500 dark:text-slate-400">Last Modified Date</span>
+                  <span className="mt-0.5 block font-mono font-semibold text-slate-900 dark:text-slate-50">
                     {formatAuditTimestamp(auditSupplierTarget.updated_at)}
                   </span>
                 </div>
-                <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                  <span className="block text-[11px] font-medium text-slate-500">Last Modified By</span>
-                  <span className="mt-0.5 inline-flex items-center gap-1.5 font-semibold text-slate-900">
-                    <User className="w-3.5 h-3.5 text-slate-500" />
+                <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 p-3">
+                  <span className="block text-[11px] font-medium text-slate-500 dark:text-slate-400">Last Modified By</span>
+                  <span className="mt-0.5 inline-flex items-center gap-1.5 font-semibold text-slate-900 dark:text-slate-50">
+                    <User className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400" />
                     {auditSupplierTarget.updated_by_name || 'System Seed'}
                   </span>
                 </div>
               </div>
 
-              <div className="rounded-lg border border-slate-200 overflow-x-auto">
+              <div className="rounded-lg border border-slate-200 dark:border-slate-800 overflow-x-auto">
                 <table className="w-full text-left text-xs">
-                  <thead className="border-b border-slate-200 bg-slate-50 text-slate-500">
+                  <thead className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 text-slate-500 dark:text-slate-400">
                     <tr>
                       <th className="p-2.5 font-medium">Date &amp; Time</th>
                       <th className="p-2.5 font-medium">Action</th>
@@ -2594,22 +2594,22 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                       <th className="p-2.5 font-medium">Changes / Details</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-slate-100">
+                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                     {targetLogs.length === 0 ? (
                       <tr>
-                        <td colSpan={4} className="p-5 text-center text-xs text-slate-400">
+                        <td colSpan={4} className="p-5 text-center text-xs text-slate-500 dark:text-slate-400">
                           No detailed change events recorded after initial workspace setup.
                         </td>
                       </tr>
                     ) : (
                       targetLogs.map((log: any) => (
-                        <tr key={log.id} className="hover:bg-slate-50">
-                          <td className="p-2.5 font-mono text-[11px] text-slate-700 whitespace-nowrap">
+                        <tr key={log.id} className="hover:bg-slate-50 dark:hover:bg-slate-800">
+                          <td className="p-2.5 font-mono text-[11px] text-slate-700 dark:text-slate-200 whitespace-nowrap">
                             {formatAuditTimestamp(log.logged_at)}
                           </td>
                           <td className="p-2.5 whitespace-nowrap">{renderSupplierAuditActionBadge(log.action)}</td>
-                          <td className="p-2.5 font-medium text-slate-800 whitespace-nowrap">{log.user_name || 'System'}</td>
-                          <td className="p-2.5 text-slate-600">{log.details || '—'}</td>
+                          <td className="p-2.5 font-medium text-slate-800 dark:text-slate-100 whitespace-nowrap">{log.user_name || 'System'}</td>
+                          <td className="p-2.5 text-slate-600 dark:text-slate-300">{log.details || '—'}</td>
                         </tr>
                       ))
                     )}
@@ -2621,7 +2621,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                 <button
                   type="button"
                   onClick={() => setAuditSupplierTarget(null)}
-                  className="px-4 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                  className="px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
                 >
                   Close
                 </button>
@@ -2634,27 +2634,27 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
       {/* Delete Supplier Confirmation Modal */}
       {deleteSupplierTarget && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/45 p-4">
-          <div className="w-full max-w-md rounded-xl bg-white p-5 space-y-4 border border-slate-200 shadow-xl">
+          <div className="w-full max-w-md rounded-xl bg-white dark:bg-slate-900 p-5 space-y-4 border border-slate-200 dark:border-slate-800 shadow-xl">
             <div className="flex items-start justify-between gap-2">
-              <h3 className="font-display text-base font-semibold text-slate-900">
+              <h3 className="font-display text-base font-semibold text-slate-900 dark:text-slate-50">
                 Delete {deleteSupplierTarget.name}?
               </h3>
               <button
                 type="button"
                 onClick={() => setDeleteSupplierTarget(null)}
-                className="p-1 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                className="p-1 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
-            <p className="text-xs text-slate-600">
-              This will remove <span className="font-semibold text-slate-900">{deleteSupplierTarget.name}</span> from active suppliers. If purchase orders or supplier invoices reference this supplier, it will be archived safely to preserve historical records.
+            <p className="text-xs text-slate-600 dark:text-slate-300">
+              This will remove <span className="font-semibold text-slate-900 dark:text-slate-50">{deleteSupplierTarget.name}</span> from active suppliers. If purchase orders or supplier invoices reference this supplier, it will be archived safely to preserve historical records.
             </p>
             <div className="flex justify-end gap-2">
               <button
                 type="button"
                 onClick={() => setDeleteSupplierTarget(null)}
-                className="px-4 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                className="px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
               >
                 Cancel
               </button>
@@ -2674,29 +2674,29 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
       {/* Configurable Financial Approval Threshold Modal */}
       {showThresholdModal && (
         <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/45 p-4">
-          <form onSubmit={saveApprovalThreshold} className="w-full max-w-md rounded-xl bg-white p-5 space-y-4 border border-slate-200 shadow-xl">
-            <div className="flex items-start justify-between gap-2 border-b border-slate-100 pb-3">
+          <form onSubmit={saveApprovalThreshold} className="w-full max-w-md rounded-xl bg-white dark:bg-slate-900 p-5 space-y-4 border border-slate-200 dark:border-slate-800 shadow-xl">
+            <div className="flex items-start justify-between gap-2 border-b border-slate-100 dark:border-slate-800/80 pb-3">
               <div>
-                <h3 className="font-display text-base font-semibold text-slate-900">PO Signature Threshold</h3>
-                <p className="text-xs text-slate-500">
+                <h3 className="font-display text-base font-semibold text-slate-900 dark:text-slate-50">PO Signature Threshold</h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
                   Set the order amount above which Stage 2 Manager Digital Signature is mandatory.
                 </p>
               </div>
               <button
                 type="button"
                 onClick={() => setShowThresholdModal(false)}
-                className="p-1 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                className="p-1 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
             {thresholdErr && (
-              <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{thresholdErr}</div>
+              <div className="p-2.5 rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800/80 text-xs text-red-700 dark:text-red-300 font-medium">{thresholdErr}</div>
             )}
 
             <div className="space-y-2">
-              <label className="block text-xs font-medium text-slate-700">Threshold Amount (PHP)</label>
+              <label className="block text-xs font-medium text-slate-700 dark:text-slate-200">Threshold Amount (PHP)</label>
               <input
                 type="number"
                 min="0"
@@ -2704,7 +2704,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                 required
                 value={thresholdInput}
                 onChange={(e) => setThresholdInput(e.target.value)}
-                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-mono font-semibold text-slate-900"
+                className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-sm font-mono font-semibold text-slate-900 dark:text-slate-50"
               />
               <div className="flex flex-wrap gap-1.5 pt-1">
                 {[5000, 10000, 25000, 50000].map((preset) => (
@@ -2712,7 +2712,7 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                     key={preset}
                     type="button"
                     onClick={() => setThresholdInput(String(preset))}
-                    className="rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-mono text-slate-700 hover:bg-slate-100"
+                    className="rounded-md border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 px-2.5 py-1 text-[11px] font-mono text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
                   >
                     {formatPHP(preset)}
                   </button>
@@ -2720,18 +2720,18 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
               </div>
             </div>
 
-            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800/80">
               <button
                 type="button"
                 onClick={() => setShowThresholdModal(false)}
-                className="px-4 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                className="px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
               >
                 Cancel
               </button>
               <button
                 type="submit"
                 disabled={savingThreshold}
-                className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-50"
+                className="px-4 py-2 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950 text-xs font-semibold hover:bg-slate-800 dark:hover:bg-white disabled:opacity-50"
               >
                 {savingThreshold ? 'Saving...' : 'Save Threshold'}
               </button>
@@ -2743,77 +2743,77 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
       {/* Stage 2 Manager Digital Signature Approval Modal */}
       {signaturePo && (
         <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 p-4">
-          <form onSubmit={submitManagerSignature} className="w-full max-w-lg max-h-[92vh] overflow-y-auto rounded-xl bg-white p-5 space-y-4 border border-slate-200 shadow-2xl">
-            <div className="flex items-start justify-between gap-2 border-b border-slate-100 pb-3">
+          <form onSubmit={submitManagerSignature} className="w-full max-w-lg max-h-[92vh] overflow-y-auto rounded-xl bg-white dark:bg-slate-900 p-5 space-y-4 border border-slate-200 dark:border-slate-800 shadow-2xl">
+            <div className="flex items-start justify-between gap-2 border-b border-slate-100 dark:border-slate-800/80 pb-3">
               <div>
-                <div className="inline-flex items-center gap-1.5 rounded-md border border-violet-200 bg-violet-50 px-2 py-0.5 text-[11px] font-semibold text-violet-800 mb-1.5">
+                <div className="inline-flex items-center gap-1.5 rounded-md border border-violet-200 dark:border-violet-700/80 bg-violet-50 dark:bg-violet-950/50 px-2 py-0.5 text-[11px] font-semibold text-violet-800 dark:text-violet-300 mb-1.5">
                   <PenTool className="w-3 h-3" /> Stage 2 · Manager Digital Signature
                 </div>
-                <h3 className="font-display text-base font-semibold text-slate-900">
+                <h3 className="font-display text-base font-semibold text-slate-900 dark:text-slate-50">
                   Authorize {signaturePo.po_number}
                 </h3>
-                <p className="text-xs text-slate-500">
+                <p className="text-xs text-slate-500 dark:text-slate-400">
                   {signaturePo.supplier_name} · {signaturePo.location_name}
                 </p>
               </div>
               <button
                 type="button"
                 onClick={() => setSignaturePo(null)}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                className="p-1.5 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
             {signatureErr && (
-              <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{signatureErr}</div>
+              <div className="p-2.5 rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800/80 text-xs text-red-700 dark:text-red-300 font-medium">{signatureErr}</div>
             )}
 
-            <div className="grid grid-cols-2 gap-2.5 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs">
+            <div className="grid grid-cols-2 gap-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 p-3 text-xs">
               <div>
-                <span className="block text-[11px] text-slate-500">Purchase Order Total</span>
-                <span className="font-mono text-sm font-bold text-slate-900">{formatPHP(signaturePo.total_amount)}</span>
+                <span className="block text-[11px] text-slate-500 dark:text-slate-400">Purchase Order Total</span>
+                <span className="font-mono text-sm font-bold text-slate-900 dark:text-slate-50">{formatPHP(signaturePo.total_amount)}</span>
               </div>
               <div>
-                <span className="block text-[11px] text-slate-500">Approval Threshold</span>
-                <span className="font-mono text-sm font-semibold text-violet-800">{formatPHP(approvalThreshold)}</span>
+                <span className="block text-[11px] text-slate-500 dark:text-slate-400">Approval Threshold</span>
+                <span className="font-mono text-sm font-semibold text-violet-800 dark:text-violet-300">{formatPHP(approvalThreshold)}</span>
               </div>
-              <div className="col-span-2 border-t border-slate-200 pt-2 text-[11px] text-slate-600">
-                Stage 1 Verified By: <span className="font-semibold text-slate-900">{signaturePo.stage1_approved_by_name || user.fullName}</span>
+              <div className="col-span-2 border-t border-slate-200 dark:border-slate-800 pt-2 text-[11px] text-slate-600 dark:text-slate-300">
+                Stage 1 Verified By: <span className="font-semibold text-slate-900 dark:text-slate-50">{signaturePo.stage1_approved_by_name || user.fullName}</span>
                 {signaturePo.stage1_approved_at ? ` · ${formatAuditTimestamp(signaturePo.stage1_approved_at)}` : ''}
               </div>
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">Signing Manager Name</label>
+              <label className="block text-xs font-medium text-slate-700 dark:text-slate-200 mb-1">Signing Manager Name</label>
               <input
                 type="text"
                 required
                 value={signerName}
                 onChange={(e) => setSignerName(e.target.value)}
                 placeholder="Full name of authorizing manager"
-                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium text-slate-900"
+                className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-medium text-slate-900 dark:text-slate-50"
               />
             </div>
 
             <div className="space-y-1.5">
               <div className="flex items-center justify-between">
-                <label className="block text-xs font-medium text-slate-700">Draw Digital Signature</label>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-200">Draw Digital Signature</label>
                 <button
                   type="button"
                   onClick={clearSignatureCanvas}
-                  className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-50"
+                  className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2 py-1 text-[11px] font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
                 >
                   <RotateCcw className="w-3 h-3" /> Clear Pad
                 </button>
               </div>
-              <div className="relative rounded-lg border-2 border-dashed border-slate-300 bg-slate-50/50 overflow-hidden">
+              <div className="relative rounded-lg border-2 border-dashed border-slate-300 dark:border-slate-700 bg-slate-50/50 dark:bg-slate-800/50 overflow-hidden">
                 {!hasSignatureStroke && (
-                  <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-xs text-slate-400">
+                  <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-xs text-slate-500 dark:text-slate-400">
                     Sign here using mouse or touch
                   </div>
                 )}
-                <div className="pointer-events-none absolute left-6 right-6 bottom-6 border-b border-slate-300" />
+                <div className="pointer-events-none absolute left-6 right-6 bottom-6 border-b border-slate-300 dark:border-slate-700" />
                 <canvas
                   ref={sigCanvasRef}
                   width={520}
@@ -2825,18 +2825,18 @@ export function ProcurementModule({ user, locations, activeLocationId = 'ALL', q
                   className="relative z-10 w-full h-40 touch-none cursor-crosshair block"
                 />
               </div>
-              <p className="text-[11px] text-slate-500">
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
                 {hasSignatureStroke
                   ? 'Signature captured and ready to attach to the purchase order approval record.'
                   : 'Signature stroke required before final approval.'}
               </p>
             </div>
 
-            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800/80">
               <button
                 type="button"
                 onClick={() => setSignaturePo(null)}
-                className="px-4 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                className="px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
               >
                 Leave Pending Signature
               </button>

@@ -590,6 +590,39 @@ export function initSchema() {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS shift_templates (
+      id TEXT PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      start_time TEXT NOT NULL,
+      end_time TEXT NOT NULL,
+      break_minutes INTEGER NOT NULL DEFAULT 60,
+      days_of_week_json TEXT NOT NULL DEFAULT '["MON","TUE","WED","THU","FRI","SAT","SUN"]',
+      location_ids_json TEXT NOT NULL DEFAULT '[]',
+      default_role TEXT,
+      headcount_needed INTEGER NOT NULL DEFAULT 2,
+      notes TEXT,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS shift_schedules (
+      id TEXT PRIMARY KEY,
+      template_id TEXT REFERENCES shift_templates(id) ON DELETE SET NULL,
+      template_name TEXT NOT NULL,
+      location_id TEXT NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+      employee_id TEXT REFERENCES employees(id) ON DELETE SET NULL,
+      shift_date TEXT NOT NULL,
+      start_time TEXT NOT NULL,
+      end_time TEXT NOT NULL,
+      break_minutes INTEGER NOT NULL DEFAULT 60,
+      status TEXT NOT NULL DEFAULT 'SCHEDULED',
+      notes TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
 
   const ensureColumn = (table: string, column: string, colDef: string) => {
@@ -642,6 +675,53 @@ export function initSchema() {
     const demoHash = bcrypt.hashSync('erp2026!', 10);
     db.prepare('INSERT OR IGNORE INTO users (id, email, password_hash, full_name, role_id, assigned_location_id) VALUES (?, ?, ?, ?, ?, ?)')
       .run('usr_superadmin', 'superadmin@maximusbbq.ph', demoHash, 'System Super Admin', 'role_super_admin', null);
+  }
+
+  const tplCount = (db.prepare('SELECT COUNT(*) AS cnt FROM shift_templates').get() as any)?.cnt || 0;
+  if (tplCount === 0) {
+    const insTpl = db.prepare(`
+      INSERT OR IGNORE INTO shift_templates (id, code, name, start_time, end_time, break_minutes, days_of_week_json, location_ids_json, default_role, headcount_needed, notes, is_active)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+    `);
+    insTpl.run(
+      'tpl_opening',
+      'OPEN',
+      'Opening Shift',
+      '07:00',
+      '15:00',
+      60,
+      JSON.stringify(['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']),
+      JSON.stringify(['loc_truck_1', 'loc_truck_2', 'loc_commissary']),
+      'Lead Cashier / Prep Cook',
+      2,
+      'Truck power-up, grill pre-heat, morning commissary stock check, and POS float count.',
+    );
+    insTpl.run(
+      'tpl_midday',
+      'MID',
+      'Mid-Day Shift',
+      '11:00',
+      '19:00',
+      60,
+      JSON.stringify(['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT']),
+      JSON.stringify(['loc_truck_1', 'loc_truck_2']),
+      'Line Cook / Service Crew',
+      2,
+      'Peak lunch & early dinner service coverage across active food truck sites.',
+    );
+    insTpl.run(
+      'tpl_closing',
+      'CLOSE',
+      'Closing Shift',
+      '15:00',
+      '23:00',
+      60,
+      JSON.stringify(['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']),
+      JSON.stringify(['loc_truck_1', 'loc_truck_2']),
+      'Griller / Closer',
+      2,
+      'Dinner rush, grill sanitization, cold-chain batch sealing, and daily Z-reading sign-off.',
+    );
   }
 }
 

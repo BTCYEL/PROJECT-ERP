@@ -1,8 +1,22 @@
 @import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+@custom-variant high-contrast (&:where(.high-contrast, .high-contrast *));
 
 @layer base {
+  html {
+    color-scheme: light;
+  }
+
+  html.dark {
+    color-scheme: dark;
+  }
+
   body {
     font-family: 'DM Sans', system-ui, -apple-system, sans-serif;
+  }
+
+  html.dark body {
+    letter-spacing: 0.005em;
   }
 
   h1, h2, h3, h4, .font-display {
@@ -16,10 +30,92 @@
   .font-mono {
     font-family: 'JetBrains Mono', ui-monospace, monospace;
   }
+
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]),
+  select,
+  textarea {
+    color: inherit;
+  }
+
+  html.dark input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]),
+  html.dark select,
+  html.dark textarea {
+    color-scheme: dark;
+  }
+
+  :focus-visible {
+    outline: 2px solid #0f172a;
+    outline-offset: 2px;
+  }
+
+  html.dark :focus-visible {
+    outline-color: #f8fafc;
+  }
+
+  /* Bright Outdoor Food Truck High-Contrast Light Mode */
+  html.high-contrast:not(.dark) {
+    --color-slate-50: #ffffff;
+    --color-slate-400: #334155;
+    --color-slate-500: #1e293b;
+    --color-slate-600: #0f172a;
+    --color-slate-700: #020617;
+    --color-slate-800: #020617;
+    --color-slate-900: #000000;
+  }
+
+  html.high-contrast:not(.dark) [class*="border-slate-200"],
+  html.high-contrast:not(.dark) [class*="border-slate-300"] {
+    border-color: #0f172a;
+  }
+
+  html.high-contrast:not(.dark) [class*="border-slate-100"],
+  html.high-contrast:not(.dark) [class*="divide-slate-100"] > :not(:last-child) {
+    border-color: #475569;
+  }
+
+  html.high-contrast:not(.dark) :focus-visible {
+    outline: 3px solid #000000;
+    outline-offset: 2px;
+  }
+
+  /* High-Contrast Dark Mode (Glare-Shield / Night Service) */
+  html.dark.high-contrast {
+    --color-slate-300: #ffffff;
+    --color-slate-400: #f1f5f9;
+    --color-slate-500: #e2e8f0;
+    --color-slate-800: #1e293b;
+    --color-slate-900: #070b14;
+    --color-slate-950: #000000;
+  }
+
+  html.dark.high-contrast [class*="border-slate-200"],
+  html.dark.high-contrast [class*="border-slate-300"],
+  html.dark.high-contrast [class*="border-slate-800"],
+  html.dark.high-contrast [class*="border-slate-700"] {
+    border-color: #94a3b8;
+  }
+
+  html.dark.high-contrast [class*="border-slate-100"],
+  html.dark.high-contrast [class*="divide-slate-100"] > :not(:last-child),
+  html.dark.high-contrast [class*="divide-slate-800"] > :not(:last-child) {
+    border-color: #64748b;
+  }
+
+  html.dark.high-contrast :focus-visible {
+    outline: 3px solid #fbbf24;
+    outline-offset: 2px;
+  }
 }
 
 @media print {
   .no-print {
     display: none !important;
+  }
+
+  html,
+  body {
+    background: #ffffff !important;
+    color: #000000 !important;
+    color-scheme: light !important;
   }
 }

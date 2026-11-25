@@ -42,6 +42,23 @@ service cloud.firestore {
       return isEmailVerified() && (isBootstrapAdmin() || (resource != null && existing().ownerUid == request.auth.uid));
     }
 
+    function getRequesterErpUser() {
+      return get(/databases/$(database)/documents/erp_users/$(request.auth.uid)).data;
+    }
+
+    function hasSuperAdminOrOwnerRole() {
+      return isEmailVerified() && (
+        isBootstrapAdmin() ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin') ||
+        (resource != null &&
+         exists(/databases/$(database)/documents/erp_users/$(request.auth.uid)) &&
+         getRequesterErpUser().isActive == true &&
+         getRequesterErpUser().roleCode in ['SUPER_ADMIN', 'BUSINESS_OWNER'] &&
+         getRequesterErpUser().ownerUid == existing().ownerUid)
+      );
+    }
+
     function isValidString(val, minLen, maxLen) {
       return val is string && val.size() >= minLen && val.size() <= maxLen;
     }
@@ -81,11 +98,13 @@ service cloud.firestore {
 
     function isValidErpUser(data) {
       return data.keys().hasAll(['id', 'ownerUid', 'email', 'fullName', 'roleId', 'roleCode', 'roleName', 'assignedLocationId', 'avatarUrl', 'passwordHash', 'isActive', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['id', 'ownerUid', 'email', 'fullName', 'roleId', 'roleCode', 'roleName', 'assignedLocationId', 'avatarUrl', 'passwordHash', 'shiftPinHash', 'failedLoginAttempts', 'lockedUntil', 'isActive', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'email', 'fullName', 'phone', 'address', 'roleId', 'roleCode', 'roleName', 'assignedLocationId', 'avatarUrl', 'passwordHash', 'shiftPinHash', 'failedLoginAttempts', 'lockedUntil', 'isActive', 'createdAt', 'updatedAt'])
         && isValidId(data.id)
         && isValidId(data.ownerUid)
         && isValidString(data.email, 3, 200)
         && isValidString(data.fullName, 1, 150)
+        && (!('phone' in data) || isNullableString(data.phone, 40))
+        && (!('address' in data) || isNullableString(data.address, 300))
         && isValidId(data.roleId)
         && isValidString(data.roleCode, 1, 64)
         && isValidString(data.roleName, 1, 120)
@@ -102,11 +121,13 @@ service cloud.firestore {
 
     function isValidEmployee(data) {
       return data.keys().hasAll(['id', 'ownerUid', 'employeeCode', 'fullName', 'department', 'position', 'locationId', 'payType', 'baseRate', 'avatarUrl', 'isActive', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['id', 'ownerUid', 'employeeCode', 'fullName', 'department', 'position', 'locationId', 'payType', 'baseRate', 'avatarUrl', 'faceDescriptorJson', 'faceEnrolledAt', 'attendancePin', 'isActive', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'employeeCode', 'fullName', 'phone', 'address', 'department', 'position', 'locationId', 'payType', 'baseRate', 'avatarUrl', 'faceDescriptorJson', 'faceEnrolledAt', 'attendancePin', 'isActive', 'createdAt', 'updatedAt'])
         && isValidId(data.id)
         && isValidId(data.ownerUid)
         && isValidString(data.employeeCode, 1, 64)
         && isValidString(data.fullName, 1, 150)
+        && (!('phone' in data) || isNullableString(data.phone, 40))
+        && (!('address' in data) || isNullableString(data.address, 300))
         && isValidString(data.department, 1, 100)
         && isValidString(data.position, 1, 100)
         && isNullableString(data.locationId, 128)
@@ -458,7 +479,7 @@ service cloud.firestore {
 
     function isValidFleetLog(data) {
       return data.keys().hasAll(['id', 'ownerUid', 'logType', 'truckId', 'siteName', 'assignedDate', 'shiftNotes', 'liters', 'totalCost', 'odometerKm', 'title', 'description', 'serviceDate', 'nextDueDate', 'createdAt'])
-        && data.keys().hasOnly(['id', 'ownerUid', 'logType', 'truckId', 'siteName', 'assignedDate', 'shiftNotes', 'liters', 'totalCost', 'odometerKm', 'title', 'description', 'serviceDate', 'nextDueDate', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'logType', 'truckId', 'siteName', 'assignedDate', 'shiftNotes', 'liters', 'totalCost', 'odometerKm', 'title', 'description', 'serviceDate', 'nextDueDate', 'maintenanceCategory', 'serviceProvider', 'maintenanceStatus', 'alertLeadDays', 'expenseId', 'createdAt', 'updatedAt'])
         && isValidId(data.id)
         && isValidId(data.ownerUid)
         && data.logType in ['ASSIGNMENT', 'FUEL', 'MAINTENANCE']
@@ -466,14 +487,20 @@ service cloud.firestore {
         && isNullableString(data.siteName, 160)
         && isNullableString(data.assignedDate, 40)
         && isNullableString(data.shiftNotes, 300)
-        && (data.liters == null || isValidNum(data.liters))
-        && (data.totalCost == null || isValidNum(data.totalCost))
-        && (data.odometerKm == null || isValidNum(data.odometerKm))
+        && (data.liters == null || (isValidNum(data.liters) && data.liters >= 0))
+        && (data.totalCost == null || (isValidNum(data.totalCost) && data.totalCost >= 0))
+        && (data.odometerKm == null || (isValidNum(data.odometerKm) && data.odometerKm >= 0))
         && isNullableString(data.title, 160)
         && isNullableString(data.description, 400)
         && isNullableString(data.serviceDate, 40)
         && isNullableString(data.nextDueDate, 40)
-        && data.createdAt is timestamp;
+        && (!('maintenanceCategory' in data) || data.maintenanceCategory == null || data.maintenanceCategory in ['ENGINE_OIL', 'TIRES_BRAKES', 'GENERATOR_LPG', 'KITCHEN_EQUIP', 'LTO_EMISSIONS', 'GENERAL'])
+        && (!('serviceProvider' in data) || isNullableString(data.serviceProvider, 140))
+        && (!('maintenanceStatus' in data) || data.maintenanceStatus == null || data.maintenanceStatus in ['OPEN', 'COMPLETED'])
+        && (!('alertLeadDays' in data) || data.alertLeadDays == null || (data.alertLeadDays is int && data.alertLeadDays >= 0 && data.alertLeadDays <= 90))
+        && (!('expenseId' in data) || isNullableString(data.expenseId, 128))
+        && data.createdAt is timestamp
+        && (!('updatedAt' in data) || data.updatedAt is timestamp);
     }
 
     function isValidAttendanceLog(data) {
@@ -512,6 +539,45 @@ service cloud.firestore {
         && data.createdAt is timestamp;
     }
 
+    function isValidShiftTemplate(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'code', 'name', 'startTime', 'endTime', 'breakMinutes', 'daysOfWeek', 'locationIds', 'headcountNeeded', 'isActive', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'code', 'name', 'startTime', 'endTime', 'breakMinutes', 'daysOfWeek', 'locationIds', 'defaultRole', 'headcountNeeded', 'notes', 'isActive', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.code, 1, 32)
+        && isValidString(data.name, 1, 120)
+        && isValidString(data.startTime, 4, 10)
+        && isValidString(data.endTime, 4, 10)
+        && data.breakMinutes is int && data.breakMinutes >= 0 && data.breakMinutes <= 480
+        && data.daysOfWeek is list && data.daysOfWeek.size() <= 7 && (data.daysOfWeek.size() == 0 || data.daysOfWeek[0] is string)
+        && data.locationIds is list && data.locationIds.size() <= 25 && (data.locationIds.size() == 0 || data.locationIds[0] is string)
+        && (!('defaultRole' in data) || isNullableString(data.defaultRole, 120))
+        && data.headcountNeeded is int && data.headcountNeeded >= 1 && data.headcountNeeded <= 100
+        && (!('notes' in data) || isNullableString(data.notes, 400))
+        && data.isActive is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidShiftSchedule(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'templateId', 'templateName', 'locationId', 'employeeId', 'shiftDate', 'startTime', 'endTime', 'breakMinutes', 'status', 'notes', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'templateId', 'templateName', 'locationId', 'employeeId', 'shiftDate', 'startTime', 'endTime', 'breakMinutes', 'status', 'notes', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isNullableString(data.templateId, 128)
+        && isValidString(data.templateName, 1, 120)
+        && isValidId(data.locationId)
+        && isNullableString(data.employeeId, 128)
+        && isValidString(data.shiftDate, 8, 20)
+        && isValidString(data.startTime, 4, 10)
+        && isValidString(data.endTime, 4, 10)
+        && data.breakMinutes is int && data.breakMinutes >= 0 && data.breakMinutes <= 480
+        && data.status in ['SCHEDULED', 'CONFIRMED', 'COMPLETED', 'CANCELLED']
+        && isNullableString(data.notes, 400)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     function isValidCustomer(data) {
       return data.keys().hasAll(['id', 'ownerUid', 'fullName', 'phone', 'email', 'loyaltyPoints', 'tier', 'preferences', 'feedbackNotes', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly(['id', 'ownerUid', 'fullName', 'phone', 'email', 'loyaltyPoints', 'tier', 'preferences', 'feedbackNotes', 'registeredAt', 'locationId', 'createdAt', 'updatedAt'])
@@ -541,6 +607,30 @@ service cloud.firestore {
         && isValidString(data.message, 1, 500)
         && (!('locationId' in data) || isNullableString(data.locationId, 128))
         && data.isRead is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidDailyHuddle(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'title', 'message', 'priority', 'targetChannels', 'locationId', 'locationName', 'shiftWindow', 'authorId', 'authorName', 'authorRole', 'acknowledgedBy', 'isPinned', 'isActive', 'expiresAt', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'title', 'message', 'priority', 'targetChannels', 'locationId', 'locationName', 'shiftWindow', 'authorId', 'authorName', 'authorRole', 'acknowledgedBy', 'isPinned', 'isActive', 'expiresAt', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidString(data.title, 1, 140)
+        && isValidString(data.message, 1, 800)
+        && data.priority in ['NORMAL', 'URGENT', 'CRITICAL']
+        && data.targetChannels is list && data.targetChannels.size() >= 1 && data.targetChannels.size() <= 5
+        && data.targetChannels[0] is string && data.targetChannels.hasOnly(['POS', 'KDS', 'MOBILE'])
+        && isNullableString(data.locationId, 128)
+        && isNullableString(data.locationName, 140)
+        && data.shiftWindow in ['ALL_DAY', 'OPENING', 'MID_DAY', 'CLOSING']
+        && isValidId(data.authorId)
+        && isValidString(data.authorName, 1, 150)
+        && isValidString(data.authorRole, 1, 80)
+        && data.acknowledgedBy is list && data.acknowledgedBy.size() <= 100 && (data.acknowledgedBy.size() == 0 || data.acknowledgedBy[0] is string)
+        && data.isPinned is bool
+        && data.isActive is bool
+        && isNullableString(data.expiresAt, 40)
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -579,6 +669,59 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidWasteLog(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'locationId', 'locationName', 'entryMode', 'txnType', 'reasonCategory', 'reasonNotes', 'productId', 'productName', 'servingsWasted', 'primaryItemId', 'primaryItemName', 'items', 'totalQuantityBase', 'totalLossCost', 'loggedBy', 'loggedByName', 'wastedAt', 'createdAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'locationId', 'locationName', 'entryMode', 'txnType', 'reasonCategory', 'reasonNotes', 'productId', 'productName', 'servingsWasted', 'primaryItemId', 'primaryItemName', 'items', 'totalQuantityBase', 'totalLossCost', 'loggedBy', 'loggedByName', 'wastedAt', 'createdAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidId(data.locationId)
+        && isValidString(data.locationName, 1, 140)
+        && data.entryMode in ['RECIPE_PREP', 'SINGLE_INGREDIENT']
+        && data.txnType in ['OUT_WASTE', 'OUT_SPOILAGE']
+        && data.reasonCategory in ['PREP_TRIM', 'BURNT_OVERCOOKED', 'EXPIRED_SPOILED', 'CONTAMINATION', 'DROPPED_SPILL', 'QUALITY_REJECT', 'OTHER']
+        && isNullableString(data.reasonNotes, 400)
+        && (data.productId == null || isValidId(data.productId))
+        && isNullableString(data.productName, 160)
+        && isValidNum(data.servingsWasted) && data.servingsWasted >= 0
+        && (data.primaryItemId == null || isValidId(data.primaryItemId))
+        && isNullableString(data.primaryItemName, 160)
+        && isBoundedMapList(data.items, 40) && data.items.size() >= 1
+        && isValidNum(data.totalQuantityBase) && data.totalQuantityBase > 0
+        && isValidNum(data.totalLossCost) && data.totalLossCost >= 0
+        && isValidId(data.loggedBy)
+        && isValidString(data.loggedByName, 1, 150)
+        && isValidString(data.wastedAt, 1, 40)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidTerminalDevice(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'hardwareUuid', 'deviceName', 'locationId', 'stationEmail', 'status', 'pairedByUserId', 'pairedByName', 'pairedAt', 'lastSeenAt', 'userAgentSummary', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'hardwareUuid', 'deviceName', 'locationId', 'stationEmail', 'status', 'pairedByUserId', 'pairedByName', 'pairedAt', 'lastSeenAt', 'userAgentSummary', 'printerConnectionType', 'printerName', 'printerIp', 'printerPort', 'printerBtDeviceId', 'printerBtServiceUuid', 'printerBtCharacteristicUuid', 'printerPaperWidthMm', 'printerAutoPrint', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && isValidId(data.hardwareUuid) && data.hardwareUuid.size() >= 8
+        && isValidString(data.deviceName, 1, 120)
+        && isNullableString(data.locationId, 128)
+        && isNullableString(data.stationEmail, 200)
+        && data.status in ['AUTHORIZED', 'REVOKED']
+        && isValidId(data.pairedByUserId)
+        && isValidString(data.pairedByName, 1, 150)
+        && isValidString(data.pairedAt, 1, 40)
+        && isValidString(data.lastSeenAt, 1, 40)
+        && isNullableString(data.userAgentSummary, 160)
+        && (!('printerConnectionType' in data) || data.printerConnectionType == null || data.printerConnectionType in ['NETWORK', 'BLUETOOTH'])
+        && (!('printerName' in data) || isNullableString(data.printerName, 120))
+        && (!('printerIp' in data) || isNullableString(data.printerIp, 45))
+        && (!('printerPort' in data) || data.printerPort == null || (isValidNum(data.printerPort) && data.printerPort >= 1 && data.printerPort <= 65535))
+        && (!('printerBtDeviceId' in data) || isNullableString(data.printerBtDeviceId, 160))
+        && (!('printerBtServiceUuid' in data) || isNullableString(data.printerBtServiceUuid, 128))
+        && (!('printerBtCharacteristicUuid' in data) || isNullableString(data.printerBtCharacteristicUuid, 128))
+        && (!('printerPaperWidthMm' in data) || data.printerPaperWidthMm == null || data.printerPaperWidthMm in [58, 80])
+        && (!('printerAutoPrint' in data) || data.printerAutoPrint is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     // =====================================================
     // COLLECTION MATCH BLOCKS
     // =====================================================
@@ -606,18 +749,27 @@ service cloud.firestore {
     }
 
     match /erp_users/{erpUserId} {
-      allow get: if isValidId(erpUserId) && isDocOwner();
+      allow get: if isValidId(erpUserId) && (isDocOwner() || isOwner(erpUserId) || hasSuperAdminOrOwnerRole());
       allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
       allow create: if isEmailVerified() && isValidId(erpUserId) && isValidErpUser(incoming())
         && incoming().ownerUid == request.auth.uid
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time;
-      allow update: if isValidId(erpUserId) && isDocOwner() && isValidErpUser(incoming())
+      allow update: if isValidId(erpUserId) && isValidErpUser(incoming())
         && preservesImmutableOwnerAndCreated()
         && incoming().updatedAt == request.time
         && (
-          isBootstrapAdmin() ||
-          incoming().diff(existing()).affectedKeys().hasOnly(['email', 'fullName', 'roleId', 'roleCode', 'roleName', 'assignedLocationId', 'avatarUrl', 'passwordHash', 'shiftPinHash', 'failedLoginAttempts', 'lockedUntil', 'isActive', 'updatedAt'])
+          (isBootstrapAdmin() || (
+            (isDocOwner() || hasSuperAdminOrOwnerRole()) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['email', 'fullName', 'phone', 'address', 'roleId', 'roleCode', 'roleName', 'assignedLocationId', 'avatarUrl', 'passwordHash', 'shiftPinHash', 'failedLoginAttempts', 'lockedUntil', 'isActive', 'updatedAt'])
+          )) ||
+          (isOwner(erpUserId)
+            && incoming().roleId == existing().roleId
+            && incoming().roleCode == existing().roleCode
+            && incoming().roleName == existing().roleName
+            && incoming().assignedLocationId == existing().assignedLocationId
+            && incoming().isActive == existing().isActive
+            && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'fullName', 'phone', 'address', 'avatarUrl', 'passwordHash', 'shiftPinHash', 'updatedAt']))
         );
       allow delete: if isValidId(erpUserId) && isDocOwner();
     }
@@ -634,7 +786,7 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && (
           isBootstrapAdmin() ||
-          incoming().diff(existing()).affectedKeys().hasOnly(['employeeCode', 'fullName', 'department', 'position', 'locationId', 'payType', 'baseRate', 'avatarUrl', 'faceDescriptorJson', 'faceEnrolledAt', 'attendancePin', 'isActive', 'updatedAt'])
+          incoming().diff(existing()).affectedKeys().hasOnly(['employeeCode', 'fullName', 'phone', 'address', 'department', 'position', 'locationId', 'payType', 'baseRate', 'avatarUrl', 'faceDescriptorJson', 'faceEnrolledAt', 'attendancePin', 'isActive', 'updatedAt'])
         );
       allow delete: if isValidId(employeeId) && isDocOwner();
     }
@@ -741,6 +893,7 @@ service cloud.firestore {
         && (
           isBootstrapAdmin() ||
           (existing().status == 'COMPLETED' && incoming().diff(existing()).affectedKeys().hasOnly(['kdsStatus', 'updatedAt'])) ||
+          (existing().status == 'COMPLETED' && incoming().diff(existing()).affectedKeys().hasOnly(['customerId', 'notes', 'updatedAt'])) ||
           (existing().status == 'COMPLETED' && incoming().status == 'REFUNDED' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'kdsStatus', 'notes', 'updatedAt']))
         );
       allow delete: if isValidId(saleId) && isDocOwner();
@@ -925,8 +1078,18 @@ service cloud.firestore {
       allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
       allow create: if isEmailVerified() && isValidId(logId) && isValidFleetLog(incoming())
         && incoming().ownerUid == request.auth.uid
-        && incoming().createdAt == request.time;
-      allow update, delete: if false;
+        && incoming().createdAt == request.time
+        && (!('updatedAt' in incoming()) || incoming().updatedAt == request.time);
+      allow update: if isValidId(logId) && isDocOwner() && isValidFleetLog(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && existing().logType == 'MAINTENANCE'
+        && incoming().logType == 'MAINTENANCE'
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['truckId', 'title', 'description', 'serviceDate', 'nextDueDate', 'totalCost', 'odometerKm', 'maintenanceCategory', 'serviceProvider', 'maintenanceStatus', 'alertLeadDays', 'expenseId', 'updatedAt'])
+        );
+      allow delete: if isValidId(logId) && isDocOwner() && existing().logType == 'MAINTENANCE';
     }
 
     match /attendance_logs/{attId} {
@@ -959,6 +1122,40 @@ service cloud.firestore {
       allow delete: if isValidId(runId) && isDocOwner();
     }
 
+    match /shift_templates/{templateId} {
+      allow get: if isValidId(templateId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(templateId) && isValidShiftTemplate(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(templateId) && isDocOwner() && isValidShiftTemplate(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['code', 'name', 'startTime', 'endTime', 'breakMinutes', 'daysOfWeek', 'locationIds', 'defaultRole', 'headcountNeeded', 'notes', 'isActive', 'updatedAt'])
+        );
+      allow delete: if isValidId(templateId) && isDocOwner();
+    }
+
+    match /shift_schedules/{scheduleId} {
+      allow get: if isValidId(scheduleId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(scheduleId) && isValidShiftSchedule(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(scheduleId) && isDocOwner() && isValidShiftSchedule(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['locationId', 'employeeId', 'shiftDate', 'startTime', 'endTime', 'breakMinutes', 'status', 'notes', 'updatedAt'])
+        );
+      allow delete: if isValidId(scheduleId) && isDocOwner();
+    }
+
     match /customers/{customerId} {
       allow get: if isValidId(customerId) && isDocOwner();
       allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
@@ -971,7 +1168,7 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && (
           isBootstrapAdmin() ||
-          incoming().diff(existing()).affectedKeys().hasOnly(['loyaltyPoints', 'tier', 'preferences', 'feedbackNotes', 'registeredAt', 'locationId', 'updatedAt'])
+          incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'phone', 'email', 'loyaltyPoints', 'tier', 'preferences', 'feedbackNotes', 'registeredAt', 'locationId', 'updatedAt'])
         );
       allow delete: if isValidId(customerId) && isDocOwner();
     }
@@ -993,6 +1190,24 @@ service cloud.firestore {
       allow delete: if isValidId(notifId) && isDocOwner();
     }
 
+    match /daily_huddles/{huddleId} {
+      allow get: if isValidId(huddleId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(huddleId) && isValidDailyHuddle(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(huddleId) && isDocOwner() && isValidDailyHuddle(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['acknowledgedBy', 'updatedAt']) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['title', 'message', 'priority', 'targetChannels', 'locationId', 'locationName', 'shiftWindow', 'isPinned', 'isActive', 'expiresAt', 'updatedAt'])
+        );
+      allow delete: if isValidId(huddleId) && isDocOwner();
+    }
+
     match /audit_logs/{logId} {
       allow get: if isValidId(logId) && isDocOwner();
       allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
@@ -1000,6 +1215,33 @@ service cloud.firestore {
         && incoming().ownerUid == request.auth.uid
         && incoming().createdAt == request.time;
       allow update, delete: if false;
+    }
+
+    match /waste_logs/{wasteId} {
+      allow get: if isValidId(wasteId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(wasteId) && isValidWasteLog(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    match /terminal_devices/{deviceId} {
+      allow get: if isValidId(deviceId) && isDocOwner();
+      allow list: if isEmailVerified() && (resource.data.ownerUid == request.auth.uid || isBootstrapAdmin());
+      allow create: if isEmailVerified() && isValidId(deviceId) && isValidTerminalDevice(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(deviceId) && isDocOwner() && isValidTerminalDevice(incoming())
+        && preservesImmutableOwnerAndCreated()
+        && incoming().hardwareUuid == existing().hardwareUuid
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrapAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['deviceName', 'locationId', 'stationEmail', 'status', 'pairedByUserId', 'pairedByName', 'pairedAt', 'lastSeenAt', 'userAgentSummary', 'printerConnectionType', 'printerName', 'printerIp', 'printerPort', 'printerBtDeviceId', 'printerBtServiceUuid', 'printerBtCharacteristicUuid', 'printerPaperWidthMm', 'printerAutoPrint', 'updatedAt'])
+        );
+      allow delete: if isValidId(deviceId) && isDocOwner();
     }
 
     match /workspace_meta/{metaId} {

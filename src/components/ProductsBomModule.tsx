@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Plus, Trash2, Save, AlertTriangle, Pencil, X, Upload, Utensils, Tag } from 'lucide-react';
+import { Plus, Trash2, Save, AlertTriangle, Pencil, X, Upload, Utensils, Tag, BarChart3 } from 'lucide-react';
 import { apiFetch, formatNum, formatPHP } from '../lib/api.ts';
+import { MenuEngineeringDashboard } from './MenuEngineeringDashboard.tsx';
 
 function resizeProductPhotoToDataUrl(file: File, maxDim = 560): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -43,7 +44,15 @@ function resizeProductPhotoToDataUrl(file: File, maxDim = 560): Promise<string> 
   });
 }
 
-export function ProductsBomModule() {
+export function ProductsBomModule({
+  locations = [],
+  activeLocationId,
+}: {
+  locations?: any[];
+  activeLocationId?: string;
+} = {}) {
+  const [activeView, setActiveView] = useState<'bom' | 'menu-engineering'>('bom');
+  const [menuRefreshTick, setMenuRefreshTick] = useState(0);
   const [products, setProducts] = useState<any[]>([]);
   const [categories, setCategories] = useState<any[]>([]);
   const [inventoryItems, setInventoryItems] = useState<any[]>([]);
@@ -105,6 +114,7 @@ export function ProductsBomModule() {
       setInventoryItems(data.inventoryItems || []);
       setUoms(data.uoms || []);
       setTaxConfigs(data.taxConfigs || []);
+      setMenuRefreshTick((n) => n + 1);
       if (!newProd.categoryId && data.categories?.[0]?.id) {
         setNewProd((p) => ({ ...p, categoryId: data.categories[0].id }));
       }
@@ -577,63 +587,109 @@ export function ProductsBomModule() {
     <div className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="font-display text-2xl font-semibold text-slate-900">Products, Menus &amp; Recipe BOM</h1>
-          <p className="text-sm text-slate-500">Every menu item links to a Bill of Materials that auto-deducts ingredients on POS checkout</p>
+          <h1 className="font-display text-2xl font-semibold text-slate-900 dark:text-slate-50">Products, Menus &amp; Recipe BOM</h1>
+          <p className="text-sm text-slate-500 dark:text-slate-400">
+            {activeView === 'menu-engineering'
+              ? 'Analyze contribution margin vs POS menu popularity to classify Stars, Plowhorses, Puzzles, and Dogs'
+              : 'Every menu item links to a Bill of Materials that auto-deducts ingredients on POS checkout'}
+          </p>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => {
-              setErr('');
-              setCatEditor(null);
-              setShowCategoriesModal(true);
-            }}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 whitespace-nowrap shrink-0"
-          >
-            <Tag className="w-3.5 h-3.5" />
-            Categories ({categories.length})
-          </button>
-          <button
-            onClick={openCreateProduct}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 whitespace-nowrap shrink-0"
-          >
-            <Plus className="w-4 h-4" />
-            New Menu Product
-          </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="inline-flex rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 p-0.5">
+            <button
+              type="button"
+              onClick={() => setActiveView('bom')}
+              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${
+                activeView === 'bom'
+                  ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950'
+                  : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+              }`}
+            >
+              <Utensils className="w-3.5 h-3.5" />
+              BOM &amp; Recipes
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveView('menu-engineering')}
+              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${
+                activeView === 'menu-engineering'
+                  ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950'
+                  : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+              }`}
+            >
+              <BarChart3 className="w-3.5 h-3.5" />
+              Menu Engineering
+            </button>
+          </div>
+          {activeView === 'bom' && (
+            <>
+              <button
+                type="button"
+                onClick={() => {
+                  setErr('');
+                  setCatEditor(null);
+                  setShowCategoriesModal(true);
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3.5 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
+              >
+                <Tag className="w-3.5 h-3.5" />
+                Categories ({categories.length})
+              </button>
+              <button
+                onClick={openCreateProduct}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 dark:bg-slate-100 px-4 py-2 text-xs font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white whitespace-nowrap shrink-0"
+              >
+                <Plus className="w-4 h-4" />
+                New Menu Product
+              </button>
+            </>
+          )}
         </div>
       </div>
 
-      {msg && <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 font-medium">{msg}</div>}
+      {msg && <div className="p-3 rounded-lg bg-emerald-50 dark:bg-emerald-950/45 border border-emerald-200 dark:border-emerald-700/80 text-xs text-emerald-800 dark:text-emerald-300 font-medium">{msg}</div>}
       {err && !showCreate && !editingProd && !bomModal && !showCategoriesModal && (
-        <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{err}</div>
+        <div className="p-3 rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800/80 text-xs text-red-700 dark:text-red-300 font-medium">{err}</div>
       )}
 
+      {activeView === 'menu-engineering' ? (
+        <MenuEngineeringDashboard
+          locations={locations}
+          activeLocationId={activeLocationId}
+          refreshTrigger={menuRefreshTick}
+          onSelectProductForEdit={(productId) => {
+            const found = products.find((p) => p.id === productId);
+            if (found) selectProduct(found);
+            setActiveView('bom');
+          }}
+        />
+      ) : (
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
         {/* Product List */}
-        <div className="lg:col-span-5 rounded-xl border border-slate-200 bg-white overflow-hidden">
-          <div className="p-4 border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
+        <div className="lg:col-span-5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden">
+          <div className="p-4 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 text-xs font-semibold text-slate-600 dark:text-slate-300">
             Menu Items ({products.length})
           </div>
-          <div className="divide-y divide-slate-100">
+          <div className="divide-y divide-slate-100 dark:divide-slate-800">
             {products.map((p) => (
               <div
                 key={p.id}
                 onClick={() => selectProduct(p)}
                 className={`p-3.5 cursor-pointer flex items-center justify-between gap-3 transition-colors ${
-                  selected?.id === p.id ? 'bg-slate-900 text-white' : 'hover:bg-slate-50'
+                  selected?.id === p.id ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950' : 'hover:bg-slate-50 dark:hover:bg-slate-800'
                 }`}
               >
                 <div className="flex items-center gap-3 min-w-0">
-                  <div className="w-10 h-10 rounded-lg overflow-hidden bg-slate-100 border border-slate-200/70 flex items-center justify-center shrink-0">
+                  <div className="w-10 h-10 rounded-lg overflow-hidden bg-slate-100 dark:bg-slate-800 border border-slate-200/70 flex items-center justify-center shrink-0">
                     {p.image_url ? (
                       <img src={p.image_url} alt={p.name} referrerPolicy="no-referrer" className="w-full h-full object-cover" />
                     ) : (
-                      <Utensils className="w-4 h-4 text-slate-400" />
+                      <Utensils className="w-4 h-4 text-slate-500 dark:text-slate-400" />
                     )}
                   </div>
                   <div className="min-w-0">
                     <p className="text-sm font-semibold truncate">{p.name}</p>
-                    <p className={`text-xs mt-0.5 truncate ${selected?.id === p.id ? 'text-slate-300' : 'text-slate-500'}`}>
+                    <p className={`text-xs mt-0.5 truncate ${selected?.id === p.id ? 'text-slate-500 dark:text-slate-500' : 'text-slate-500 dark:text-slate-400'}`}>
                       {p.category_name}{p.category_show_in_pos === 0 ? ' (Hidden in POS)' : ''} · Food Cost {formatNum(p.costing.foodCostPct, 1)}% · Margin {formatNum(p.costing.marginPct, 1)}%
                       {p.expiry_date ? ` · Exp: ${String(p.expiry_date).slice(0, 10)}` : ''}
                     </p>
@@ -650,7 +706,7 @@ export function ProductsBomModule() {
                       }}
                       className={`text-[11px] font-medium underline ${
                         p.is_available === 1
-                          ? selected?.id === p.id ? 'text-emerald-300' : 'text-emerald-700'
+                          ? selected?.id === p.id ? 'text-emerald-300' : 'text-emerald-700 dark:text-emerald-300'
                           : 'text-red-500'
                       }`}
                     >
@@ -666,8 +722,8 @@ export function ProductsBomModule() {
                     }}
                     className={`p-1.5 rounded-md border transition-colors ${
                       selected?.id === p.id
-                        ? 'border-slate-700 text-slate-200 hover:bg-slate-800'
-                        : 'border-slate-200 text-slate-500 hover:bg-slate-100 hover:text-slate-900'
+                        ? 'border-slate-700 text-slate-200 hover:bg-slate-800 dark:hover:bg-white'
+                        : 'border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-white'
                     }`}
                   >
                     <Pencil className="w-3.5 h-3.5" />
@@ -680,19 +736,19 @@ export function ProductsBomModule() {
 
         {/* BOM & Costing Editor */}
         {selected && (
-          <div className="lg:col-span-7 rounded-xl border border-slate-200 bg-white p-5 space-y-5">
-            <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-100 pb-4">
+          <div className="lg:col-span-7 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 space-y-5">
+            <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-100 dark:border-slate-800/80 pb-4">
               <div className="flex items-center gap-3">
-                <div className="w-12 h-12 rounded-lg overflow-hidden bg-slate-100 border border-slate-200 flex items-center justify-center shrink-0">
+                <div className="w-12 h-12 rounded-lg overflow-hidden bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-800 flex items-center justify-center shrink-0">
                   {selected.image_url ? (
                     <img src={selected.image_url} alt={selected.name} referrerPolicy="no-referrer" className="w-full h-full object-cover" />
                   ) : (
-                    <Utensils className="w-5 h-5 text-slate-400" />
+                    <Utensils className="w-5 h-5 text-slate-500 dark:text-slate-400" />
                   )}
                 </div>
                 <div>
-                  <h2 className="font-display text-lg font-semibold text-slate-900">{selected.name}</h2>
-                  <p className="text-xs text-slate-500">
+                  <h2 className="font-display text-lg font-semibold text-slate-900 dark:text-slate-50">{selected.name}</h2>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
                     {selected.sku} · {selected.category_name}{selected.category_show_in_pos === 0 ? ' (Hidden in POS)' : ''} · {selected.tax_code}
                     {selected.expiry_date ? ` · Expiry: ${String(selected.expiry_date).slice(0, 10)}` : ''}
                   </p>
@@ -700,7 +756,7 @@ export function ProductsBomModule() {
               </div>
               <div className="flex items-center gap-2.5">
                 {selected.costing.isMarginAlert && (
-                  <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-amber-700">
+                  <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-amber-700 dark:text-amber-300">
                     <AlertTriangle className="w-4 h-4" />
                     Food cost exceeds {selected.target_food_cost_pct}% target
                   </div>
@@ -708,7 +764,7 @@ export function ProductsBomModule() {
                 <button
                   type="button"
                   onClick={() => openEditProduct(selected)}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap shrink-0"
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
                 >
                   <Pencil className="w-3.5 h-3.5" />
                   Edit Product
@@ -717,63 +773,63 @@ export function ProductsBomModule() {
             </div>
 
             {/* Live Costing Summary */}
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 bg-slate-50 p-3.5 rounded-lg border border-slate-200">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 bg-slate-50 dark:bg-slate-800/70 p-3.5 rounded-lg border border-slate-200 dark:border-slate-800">
               <div>
-                <p className="text-[11px] text-slate-500">Ingredient Cost</p>
-                <p className="font-mono tabular-nums text-base font-semibold text-slate-900">{formatPHP(selected.costing.ingredientCost)}</p>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">Ingredient Cost</p>
+                <p className="font-mono tabular-nums text-base font-semibold text-slate-900 dark:text-slate-50">{formatPHP(selected.costing.ingredientCost)}</p>
               </div>
               <div>
-                <p className="text-[11px] text-slate-500">Total Direct Cost</p>
-                <p className="font-mono tabular-nums text-base font-semibold text-slate-900">{formatPHP(selected.costing.directCost)}</p>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">Total Direct Cost</p>
+                <p className="font-mono tabular-nums text-base font-semibold text-slate-900 dark:text-slate-50">{formatPHP(selected.costing.directCost)}</p>
               </div>
               <div>
-                <p className="text-[11px] text-slate-500">Food Cost %</p>
-                <p className={`font-mono tabular-nums text-base font-semibold ${selected.costing.isMarginAlert ? 'text-amber-700' : 'text-slate-900'}`}>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">Food Cost %</p>
+                <p className={`font-mono tabular-nums text-base font-semibold ${selected.costing.isMarginAlert ? 'text-amber-700 dark:text-amber-300' : 'text-slate-900 dark:text-slate-50'}`}>
                   {formatNum(selected.costing.foodCostPct, 1)}%
                 </p>
               </div>
               <div>
-                <p className="text-[11px] text-slate-500">Gross Profit / Unit</p>
-                <p className="font-mono tabular-nums text-base font-semibold text-emerald-700">{formatPHP(selected.costing.grossProfit)}</p>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">Gross Profit / Unit</p>
+                <p className="font-mono tabular-nums text-base font-semibold text-emerald-700 dark:text-emerald-300">{formatPHP(selected.costing.grossProfit)}</p>
               </div>
             </div>
 
             {/* Pricing & Overhead Allocation */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Selling Price (PHP)</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Selling Price (PHP)</label>
                 <input
                   type="number"
                   value={editMeta.basePrice}
                   onChange={(e) => setEditMeta({ ...editMeta, basePrice: Number(e.target.value) })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Packaging Cost</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Packaging Cost</label>
                 <input
                   type="number"
                   value={editMeta.packagingCost}
                   onChange={(e) => setEditMeta({ ...editMeta, packagingCost: Number(e.target.value) })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Direct Labor</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Direct Labor</label>
                 <input
                   type="number"
                   value={editMeta.directLaborCost}
                   onChange={(e) => setEditMeta({ ...editMeta, directLaborCost: Number(e.target.value) })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Target Food Cost %</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Target Food Cost %</label>
                 <input
                   type="number"
                   value={editMeta.targetFoodCostPct}
                   onChange={(e) => setEditMeta({ ...editMeta, targetFoodCostPct: Number(e.target.value) })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
             </div>
@@ -782,22 +838,22 @@ export function ProductsBomModule() {
             <div className="space-y-3">
               <div className="flex items-center justify-between gap-2">
                 <div>
-                  <h3 className="text-xs font-semibold text-slate-700">Recipe Ingredients (Bill of Materials)</h3>
-                  <p className="text-[11px] text-slate-500">Add, edit, or delete ingredients deducted on every POS sale</p>
+                  <h3 className="text-xs font-semibold text-slate-700 dark:text-slate-200">Recipe Ingredients (Bill of Materials)</h3>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400">Add, edit, or delete ingredients deducted on every POS sale</p>
                 </div>
                 <button
                   type="button"
                   disabled={savingBom || inventoryItems.length === 0}
                   onClick={openAddBomIngredient}
-                  className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50 whitespace-nowrap shrink-0"
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 dark:bg-slate-100 px-3 py-1.5 text-xs font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white disabled:opacity-50 whitespace-nowrap shrink-0"
                 >
                   <Plus className="w-3.5 h-3.5" /> Add Ingredient
                 </button>
               </div>
 
-              <div className="rounded-lg border border-slate-200 overflow-x-auto">
+              <div className="rounded-lg border border-slate-200 dark:border-slate-800 overflow-x-auto">
                 <table className="w-full text-left text-xs">
-                  <thead className="border-b border-slate-200 bg-slate-50 text-slate-500">
+                  <thead className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 text-slate-500 dark:text-slate-400">
                     <tr>
                       <th className="p-2.5 font-medium">Ingredient</th>
                       <th className="p-2.5 font-medium text-right">Quantity</th>
@@ -806,10 +862,10 @@ export function ProductsBomModule() {
                       <th className="p-2.5 font-medium text-right">Actions</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-slate-100">
+                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                     {recipeLines.length === 0 ? (
                       <tr>
-                        <td colSpan={5} className="p-6 text-center text-slate-400">
+                        <td colSpan={5} className="p-6 text-center text-slate-500 dark:text-slate-400">
                           No recipe ingredients yet. Click Add Ingredient to build the Bill of Materials.
                         </td>
                       </tr>
@@ -831,18 +887,18 @@ export function ProductsBomModule() {
                         const estCost = Number(line.quantity || 0) * factor * (1 + Number(line.wasteFactorPct || 0) / 100) * unitCost;
 
                         return (
-                          <tr key={`${line.inventoryItemId}-${idx}`} className="hover:bg-slate-50">
-                            <td className="p-2.5 font-medium text-slate-900">
+                          <tr key={`${line.inventoryItemId}-${idx}`} className="hover:bg-slate-50 dark:hover:bg-slate-800">
+                            <td className="p-2.5 font-medium text-slate-900 dark:text-slate-50">
                               {ingItem?.name || 'Unknown Ingredient'}
-                              {ingItem?.sku && <span className="ml-1.5 font-mono text-[11px] text-slate-400">{ingItem.sku}</span>}
+                              {ingItem?.sku && <span className="ml-1.5 font-mono text-[11px] text-slate-500 dark:text-slate-400">{ingItem.sku}</span>}
                             </td>
-                            <td className="p-2.5 text-right font-mono tabular-nums text-slate-800">
+                            <td className="p-2.5 text-right font-mono tabular-nums text-slate-800 dark:text-slate-100">
                               {formatNum(line.quantity, 2)} {uomObj?.code || ''}
                             </td>
-                            <td className="p-2.5 text-right font-mono tabular-nums text-slate-600">
+                            <td className="p-2.5 text-right font-mono tabular-nums text-slate-600 dark:text-slate-300">
                               {formatNum(line.wasteFactorPct, 1)}%
                             </td>
-                            <td className="p-2.5 text-right font-mono tabular-nums font-semibold text-slate-900">
+                            <td className="p-2.5 text-right font-mono tabular-nums font-semibold text-slate-900 dark:text-slate-50">
                               {formatPHP(estCost)}
                             </td>
                             <td className="p-2.5 text-right">
@@ -851,7 +907,7 @@ export function ProductsBomModule() {
                                   type="button"
                                   disabled={savingBom}
                                   onClick={() => openEditBomIngredient(idx)}
-                                  className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-40"
+                                  className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2 py-1 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-40"
                                 >
                                   <Pencil className="w-3 h-3" /> Edit
                                 </button>
@@ -859,7 +915,7 @@ export function ProductsBomModule() {
                                   type="button"
                                   disabled={savingBom}
                                   onClick={() => deleteBomIngredient(idx)}
-                                  className="inline-flex items-center gap-1 rounded border border-red-200 bg-white px-2 py-1 text-[11px] font-medium text-red-700 hover:bg-red-50 disabled:opacity-40"
+                                  className="inline-flex items-center gap-1 rounded border border-red-200 dark:border-red-800/80 bg-white dark:bg-slate-900 px-2 py-1 text-[11px] font-medium text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/70 disabled:opacity-40"
                                 >
                                   <Trash2 className="w-3 h-3" /> Delete
                                 </button>
@@ -879,7 +935,7 @@ export function ProductsBomModule() {
                 Number(editMeta.packagingCost) !== Number(selected.packaging_cost) ||
                 Number(editMeta.directLaborCost) !== Number(selected.direct_labor_cost) ||
                 Number(editMeta.targetFoodCostPct) !== Number(selected.target_food_cost_pct)) ? (
-                <span className="text-xs font-medium text-amber-700">
+                <span className="text-xs font-medium text-amber-700 dark:text-amber-300">
                   Unsaved price/cost edits — click Save Recipe &amp; Recalculate Cost to persist
                 </span>
               ) : (
@@ -887,7 +943,7 @@ export function ProductsBomModule() {
               )}
               <button
                 onClick={saveRecipe}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800"
+                className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 dark:bg-slate-100 px-4 py-2 text-xs font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white"
               >
                 <Save className="w-3.5 h-3.5" />
                 Save Recipe &amp; Recalculate Cost
@@ -896,12 +952,13 @@ export function ProductsBomModule() {
           </div>
         )}
       </div>
+      )}
 
       {showCreate && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <form onSubmit={createProduct} className="w-full max-w-md max-h-[90vh] overflow-y-auto rounded-xl bg-white p-5 space-y-3 border border-slate-200">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
-              <h3 className="font-display text-base font-semibold text-slate-900">Create Menu Product</h3>
+          <form onSubmit={createProduct} className="w-full max-w-md max-h-[90vh] overflow-y-auto rounded-xl bg-white dark:bg-slate-900 p-5 space-y-3 border border-slate-200 dark:border-slate-800">
+            <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800/80 pb-2.5">
+              <h3 className="font-display text-base font-semibold text-slate-900 dark:text-slate-50">Create Menu Product</h3>
               <button
                 type="button"
                 onClick={() => {
@@ -909,28 +966,28 @@ export function ProductsBomModule() {
                   setCatEditor(null);
                   setShowCreate(false);
                 }}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                className="p-1.5 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
-            {err && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{err}</div>}
-            <div className="flex items-center gap-3.5 rounded-lg border border-slate-200 bg-slate-50 p-3">
-              <div className="w-16 h-16 rounded-lg overflow-hidden bg-white border border-slate-200 flex items-center justify-center shrink-0">
+            {err && <div className="p-2.5 rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800/80 text-xs text-red-700 dark:text-red-300 font-medium">{err}</div>}
+            <div className="flex items-center gap-3.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 p-3">
+              <div className="w-16 h-16 rounded-lg overflow-hidden bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 flex items-center justify-center shrink-0">
                 {newProd.imageUrl ? (
                   <img src={newProd.imageUrl} alt={newProd.name || 'Product preview'} className="w-full h-full object-cover" />
                 ) : (
-                  <Utensils className="w-6 h-6 text-slate-300" />
+                  <Utensils className="w-6 h-6 text-slate-400 dark:text-slate-500" />
                 )}
               </div>
               <div className="flex-1 min-w-0 space-y-1.5">
-                <p className="text-xs font-medium text-slate-700">Product Photo</p>
+                <p className="text-xs font-medium text-slate-700 dark:text-slate-200">Product Photo</p>
                 <div className="flex flex-wrap items-center gap-2">
                   <input
                     ref={createPhotoInputRef}
                     type="file"
                     accept="image/*"
-                    className="hidden"
+                    className="hidden bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100"
                     onChange={(e) => {
                       handleProductPhotoUpload(e.target.files?.[0], 'create');
                       e.target.value = '';
@@ -939,7 +996,7 @@ export function ProductsBomModule() {
                   <button
                     type="button"
                     onClick={() => createPhotoInputRef.current?.click()}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
                   >
                     <Upload className="w-3.5 h-3.5" /> {newProd.imageUrl ? 'Change Photo' : 'Upload Photo'}
                   </button>
@@ -947,7 +1004,7 @@ export function ProductsBomModule() {
                     <button
                       type="button"
                       onClick={() => setNewProd((p) => ({ ...p, imageUrl: '' }))}
-                      className="inline-flex items-center gap-1 rounded-lg border border-red-200 bg-white px-2.5 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50"
+                      className="inline-flex items-center gap-1 rounded-lg border border-red-200 dark:border-red-800/80 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/70"
                     >
                       <Trash2 className="w-3.5 h-3.5" /> Remove
                     </button>
@@ -956,32 +1013,32 @@ export function ProductsBomModule() {
               </div>
             </div>
             <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">Product Name *</label>
+              <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Product Name *</label>
               <input
                 required
                 placeholder="e.g. Smoked Beef Brisket Platter"
                 value={newProd.name}
                 onChange={(e) => setNewProd({ ...newProd, name: e.target.value })}
-                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs"
               />
             </div>
             <div className="grid grid-cols-2 gap-2.5">
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">SKU (optional)</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">SKU (optional)</label>
                 <input
                   placeholder="Auto if blank"
                   value={newProd.sku}
                   onChange={(e) => setNewProd({ ...newProd, sku: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Category</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Category</label>
                 <div className="flex items-center gap-1.5">
                   <select
                     value={newProd.categoryId}
                     onChange={(e) => setNewProd({ ...newProd, categoryId: e.target.value })}
-                    className="flex-1 min-w-0 rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                    className="flex-1 min-w-0 rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs"
                   >
                     {categories.map((c) => (
                       <option key={c.id} value={c.id}>{c.name}{c.show_in_pos === false ? ' (Hidden in POS)' : ''}</option>
@@ -991,7 +1048,7 @@ export function ProductsBomModule() {
                     type="button"
                     title="Add Category"
                     onClick={() => openCatAdd('createModal')}
-                    className="p-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-100 hover:text-slate-900 shrink-0"
+                    className="p-2 rounded-lg border border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-white shrink-0"
                   >
                     <Plus className="w-3.5 h-3.5" />
                   </button>
@@ -1000,7 +1057,7 @@ export function ProductsBomModule() {
                     title="Edit Category"
                     disabled={!newProd.categoryId}
                     onClick={() => openCatEdit('createModal', newProd.categoryId)}
-                    className="p-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-100 hover:text-slate-900 disabled:opacity-40 shrink-0"
+                    className="p-2 rounded-lg border border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-white disabled:opacity-40 shrink-0"
                   >
                     <Pencil className="w-3.5 h-3.5" />
                   </button>
@@ -1008,44 +1065,44 @@ export function ProductsBomModule() {
               </div>
             </div>
             {catEditor && catEditor.target === 'createModal' && (
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-2.5">
+              <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 p-3 space-y-2.5">
                 <div className="flex items-center justify-between">
-                  <span className="text-[11px] font-semibold text-slate-700">
+                  <span className="text-[11px] font-semibold text-slate-700 dark:text-slate-200">
                     {catEditor.mode === 'add' ? 'New Category' : 'Edit Category'}
                   </span>
-                  <button type="button" onClick={() => setCatEditor(null)} className="text-[11px] text-slate-500 hover:text-slate-800">Cancel</button>
+                  <button type="button" onClick={() => setCatEditor(null)} className="text-[11px] text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-100">Cancel</button>
                 </div>
                 <div className="flex items-end gap-2">
                   <div className="flex-1">
-                    <label className="block text-[11px] font-medium text-slate-600 mb-1">Category Name</label>
+                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">Category Name</label>
                     <input
                       placeholder="Category Name"
                       value={catEditor.name}
                       onChange={(e) => setCatEditor({ ...catEditor, name: e.target.value })}
-                      className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs"
+                      className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs"
                     />
                   </div>
                   <div className="w-16">
-                    <label className="block text-[11px] font-medium text-slate-600 mb-1">Order</label>
+                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">Order</label>
                     <input
                       type="number"
                       placeholder="Order"
                       title="Sort Order"
                       value={catEditor.sortOrder}
                       onChange={(e) => setCatEditor({ ...catEditor, sortOrder: e.target.value })}
-                      className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs font-mono text-right"
+                      className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2 py-1.5 text-xs font-mono text-right"
                     />
                   </div>
                   <button
                     type="button"
                     disabled={savingCat || !catEditor.name.trim()}
                     onClick={saveCategory}
-                    className="rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-40"
+                    className="rounded-lg bg-slate-900 dark:bg-slate-100 px-3 py-1.5 text-xs font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white disabled:opacity-40"
                   >
                     {savingCat ? 'Saving...' : 'Save'}
                   </button>
                 </div>
-                <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer">
+                <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-200 cursor-pointer">
                   <input
                     type="checkbox"
                     checked={catEditor.showInPos}
@@ -1057,45 +1114,45 @@ export function ProductsBomModule() {
             )}
             <div className="grid grid-cols-3 gap-2">
               <div>
-                <label className="block text-[11px] font-medium text-slate-600 mb-1">Price (PHP)</label>
+                <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">Price (PHP)</label>
                 <input
                   type="number"
                   required
                   placeholder="Price"
                   value={newProd.basePrice}
                   onChange={(e) => setNewProd({ ...newProd, basePrice: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
               <div>
-                <label className="block text-[11px] font-medium text-slate-600 mb-1">Packaging</label>
+                <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">Packaging</label>
                 <input
                   type="number"
                   placeholder="Packaging"
                   value={newProd.packagingCost}
                   onChange={(e) => setNewProd({ ...newProd, packagingCost: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
               <div>
-                <label className="block text-[11px] font-medium text-slate-600 mb-1">Labor</label>
+                <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">Labor</label>
                 <input
                   type="number"
                   placeholder="Labor"
                   value={newProd.directLaborCost}
                   onChange={(e) => setNewProd({ ...newProd, directLaborCost: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
             </div>
             <div>
               <div className="flex items-center justify-between mb-1">
-                <label className="block text-xs font-medium text-slate-600">Expiry Date (optional)</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300">Expiry Date (optional)</label>
                 {newProd.expiryDate && (
                   <button
                     type="button"
                     onClick={() => setNewProd({ ...newProd, expiryDate: '' })}
-                    className="text-[11px] text-slate-500 hover:text-slate-800 underline"
+                    className="text-[11px] text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-100 underline"
                   >
                     Clear date
                   </button>
@@ -1105,7 +1162,7 @@ export function ProductsBomModule() {
                 type="date"
                 value={newProd.expiryDate}
                 onChange={(e) => setNewProd({ ...newProd, expiryDate: e.target.value })}
-                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
               />
             </div>
             <div className="flex justify-end gap-2 pt-2">
@@ -1120,7 +1177,7 @@ export function ProductsBomModule() {
               >
                 Cancel
               </button>
-              <button type="submit" disabled={creatingProd} className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-50">
+              <button type="submit" disabled={creatingProd} className="px-4 py-2 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950 text-xs font-semibold hover:bg-slate-800 dark:hover:bg-white disabled:opacity-50">
                 {creatingProd ? 'Creating...' : 'Create Product'}
               </button>
             </div>
@@ -1130,11 +1187,11 @@ export function ProductsBomModule() {
 
       {editingProd && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <form onSubmit={submitEditProduct} className="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-xl bg-white p-5 space-y-4 border border-slate-200">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+          <form onSubmit={submitEditProduct} className="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-xl bg-white dark:bg-slate-900 p-5 space-y-4 border border-slate-200 dark:border-slate-800">
+            <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800/80 pb-3">
               <div>
-                <h3 className="font-display text-base font-semibold text-slate-900">Edit Menu Product</h3>
-                <p className="text-xs text-slate-500">Update menu item details, pricing, sizes/variants, and add-ons</p>
+                <h3 className="font-display text-base font-semibold text-slate-900 dark:text-slate-50">Edit Menu Product</h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400">Update menu item details, pricing, sizes/variants, and add-ons</p>
               </div>
               <button
                 type="button"
@@ -1142,41 +1199,41 @@ export function ProductsBomModule() {
                   setErr('');
                   setEditingProd(null);
                 }}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                className="p-1.5 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            {err && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{err}</div>}
+            {err && <div className="p-2.5 rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800/80 text-xs text-red-700 dark:text-red-300 font-medium">{err}</div>}
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Product Name</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Product Name</label>
                 <input
                   required
                   value={editProdForm.name}
                   onChange={(e) => setEditProdForm({ ...editProdForm, name: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs"
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">SKU</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">SKU</label>
                 <input
                   required
                   value={editProdForm.sku}
                   onChange={(e) => setEditProdForm({ ...editProdForm, sku: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
               <div>
                 <div className="flex items-center justify-between mb-1">
-                  <label className="block text-xs font-medium text-slate-600">Category</label>
+                  <label className="block text-xs font-medium text-slate-600 dark:text-slate-300">Category</label>
                   <div className="flex items-center gap-1.5">
                     <button
                       type="button"
                       onClick={() => openCatAdd('editModal')}
-                      className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                      className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2 py-0.5 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
                     >
                       <Plus className="w-3 h-3" /> Add
                     </button>
@@ -1184,7 +1241,7 @@ export function ProductsBomModule() {
                       type="button"
                       disabled={!editProdForm.categoryId}
                       onClick={() => openCatEdit('editModal', editProdForm.categoryId)}
-                      className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+                      className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2 py-0.5 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40"
                     >
                       <Pencil className="w-3 h-3" /> Edit
                     </button>
@@ -1193,7 +1250,7 @@ export function ProductsBomModule() {
                 <select
                   value={editProdForm.categoryId}
                   onChange={(e) => setEditProdForm({ ...editProdForm, categoryId: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs"
                 >
                   {categories.map((c) => (
                     <option key={c.id} value={c.id}>{c.name}{c.show_in_pos === false ? ' (Hidden in POS)' : ''}</option>
@@ -1201,11 +1258,11 @@ export function ProductsBomModule() {
                 </select>
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Tax Configuration</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Tax Configuration</label>
                 <select
                   value={editProdForm.taxConfigId}
                   onChange={(e) => setEditProdForm({ ...editProdForm, taxConfigId: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs"
                 >
                   {taxConfigs.map((t) => (
                     <option key={t.id} value={t.id}>{t.name} ({t.rate_percent}%)</option>
@@ -1215,50 +1272,50 @@ export function ProductsBomModule() {
             </div>
 
             {catEditor && catEditor.target === 'editModal' && (
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-2.5">
+              <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 p-3 space-y-2.5">
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-slate-800">
+                  <span className="text-xs font-semibold text-slate-800 dark:text-slate-100">
                     {catEditor.mode === 'add' ? 'Add New Category' : 'Edit Selected Category'}
                   </span>
                   <button
                     type="button"
                     onClick={() => setCatEditor(null)}
-                    className="text-xs text-slate-500 hover:text-slate-800"
+                    className="text-xs text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-100"
                   >
                     Cancel
                   </button>
                 </div>
                 <div className="flex flex-wrap sm:flex-nowrap items-end gap-2">
                   <div className="flex-1 min-w-[160px]">
-                    <label className="block text-[11px] font-medium text-slate-600 mb-1">Category Name</label>
+                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">Category Name</label>
                     <input
                       placeholder="Category Name (e.g. Grilled Platters)"
                       value={catEditor.name}
                       onChange={(e) => setCatEditor({ ...catEditor, name: e.target.value })}
-                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs"
+                      className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs"
                     />
                   </div>
                   <div className="w-20">
-                    <label className="block text-[11px] font-medium text-slate-600 mb-1">Sort Order</label>
+                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">Sort Order</label>
                     <input
                       type="number"
                       placeholder="Sort"
                       title="Sort Order"
                       value={catEditor.sortOrder}
                       onChange={(e) => setCatEditor({ ...catEditor, sortOrder: e.target.value })}
-                      className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-mono text-right"
+                      className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs font-mono text-right"
                     />
                   </div>
                   <button
                     type="button"
                     disabled={savingCat || !catEditor.name.trim()}
                     onClick={saveCategory}
-                    className="rounded-lg bg-slate-900 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-40 whitespace-nowrap"
+                    className="rounded-lg bg-slate-900 dark:bg-slate-100 px-3.5 py-1.5 text-xs font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white disabled:opacity-40 whitespace-nowrap"
                   >
                     {savingCat ? 'Saving...' : catEditor.mode === 'add' ? 'Create Category' : 'Save Category'}
                   </button>
                 </div>
-                <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer">
+                <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-200 cursor-pointer">
                   <input
                     type="checkbox"
                     checked={catEditor.showInPos}
@@ -1271,66 +1328,66 @@ export function ProductsBomModule() {
 
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Selling Price (PHP)</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Selling Price (PHP)</label>
                 <input
                   type="number"
                   step="0.01"
                   required
                   value={editProdForm.basePrice}
                   onChange={(e) => setEditProdForm({ ...editProdForm, basePrice: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Packaging Cost</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Packaging Cost</label>
                 <input
                   type="number"
                   step="0.01"
                   value={editProdForm.packagingCost}
                   onChange={(e) => setEditProdForm({ ...editProdForm, packagingCost: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Direct Labor</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Direct Labor</label>
                 <input
                   type="number"
                   step="0.01"
                   value={editProdForm.directLaborCost}
                   onChange={(e) => setEditProdForm({ ...editProdForm, directLaborCost: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Target Food Cost %</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Target Food Cost %</label>
                 <input
                   type="number"
                   step="0.1"
                   value={editProdForm.targetFoodCostPct}
                   onChange={(e) => setEditProdForm({ ...editProdForm, targetFoodCostPct: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Description</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Description</label>
                 <input
                   placeholder="Short menu description"
                   value={editProdForm.description}
                   onChange={(e) => setEditProdForm({ ...editProdForm, description: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs"
                 />
               </div>
               <div>
                 <div className="flex items-center justify-between mb-1">
-                  <label className="block text-xs font-medium text-slate-600">Expiry Date</label>
+                  <label className="block text-xs font-medium text-slate-600 dark:text-slate-300">Expiry Date</label>
                   {editProdForm.expiryDate && (
                     <button
                       type="button"
                       onClick={() => setEditProdForm({ ...editProdForm, expiryDate: '' })}
-                      className="text-[11px] text-slate-500 hover:text-slate-800 underline"
+                      className="text-[11px] text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-100 underline"
                     >
                       Clear
                     </button>
@@ -1340,13 +1397,13 @@ export function ProductsBomModule() {
                   type="date"
                   value={editProdForm.expiryDate}
                   onChange={(e) => setEditProdForm({ ...editProdForm, expiryDate: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono"
                 />
               </div>
             </div>
 
-            <div className="flex items-center gap-4 rounded-lg border border-slate-200 bg-slate-50 p-3.5">
-              <div className="w-16 h-16 rounded-lg overflow-hidden bg-white border border-slate-200 flex items-center justify-center shrink-0">
+            <div className="flex items-center gap-4 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 p-3.5">
+              <div className="w-16 h-16 rounded-lg overflow-hidden bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 flex items-center justify-center shrink-0">
                 {editProdForm.imageUrl ? (
                   <img
                     src={editProdForm.imageUrl}
@@ -1355,17 +1412,17 @@ export function ProductsBomModule() {
                     className="w-full h-full object-cover"
                   />
                 ) : (
-                  <Utensils className="w-6 h-6 text-slate-300" />
+                  <Utensils className="w-6 h-6 text-slate-400 dark:text-slate-500" />
                 )}
               </div>
               <div className="flex-1 min-w-0 space-y-1.5">
-                <p className="text-xs font-medium text-slate-700">Product Photo</p>
+                <p className="text-xs font-medium text-slate-700 dark:text-slate-200">Product Photo</p>
                 <div className="flex flex-wrap items-center gap-2">
                   <input
                     ref={editPhotoInputRef}
                     type="file"
                     accept="image/*"
-                    className="hidden"
+                    className="hidden bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100"
                     onChange={(e) => {
                       handleProductPhotoUpload(e.target.files?.[0], 'edit');
                       e.target.value = '';
@@ -1374,7 +1431,7 @@ export function ProductsBomModule() {
                   <button
                     type="button"
                     onClick={() => editPhotoInputRef.current?.click()}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
                   >
                     <Upload className="w-3.5 h-3.5" /> {editProdForm.imageUrl ? 'Change Photo' : 'Upload Photo'}
                   </button>
@@ -1382,7 +1439,7 @@ export function ProductsBomModule() {
                     <button
                       type="button"
                       onClick={() => setEditProdForm((f) => ({ ...f, imageUrl: '' }))}
-                      className="inline-flex items-center gap-1 rounded-lg border border-red-200 bg-white px-2.5 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50"
+                      className="inline-flex items-center gap-1 rounded-lg border border-red-200 dark:border-red-800/80 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/70"
                     >
                       <Trash2 className="w-3.5 h-3.5" /> Remove
                     </button>
@@ -1391,7 +1448,7 @@ export function ProductsBomModule() {
               </div>
             </div>
 
-            <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer">
+            <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-200 cursor-pointer">
               <input
                 type="checkbox"
                 checked={editProdForm.isAvailable}
@@ -1401,9 +1458,9 @@ export function ProductsBomModule() {
             </label>
 
             {/* Variants / Sizes */}
-            <div className="border-t border-slate-100 pt-3 space-y-2">
+            <div className="border-t border-slate-100 dark:border-slate-800/80 pt-3 space-y-2">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-slate-700">Sizes &amp; Variants</span>
+                <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">Sizes &amp; Variants</span>
                 <button
                   type="button"
                   onClick={() =>
@@ -1412,16 +1469,16 @@ export function ProductsBomModule() {
                       variants: [...f.variants, { name: '', priceDelta: '0', portionMultiplier: '1' }],
                     }))
                   }
-                  className="text-xs font-medium text-slate-900 hover:underline"
+                  className="text-xs font-medium text-slate-900 dark:text-slate-50 hover:underline"
                 >
                   + Add Variant
                 </button>
               </div>
               {editProdForm.variants.length === 0 ? (
-                <p className="text-[11px] text-slate-400">No variants configured (uses standard single size).</p>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">No variants configured (uses standard single size).</p>
               ) : (
                 <div className="space-y-1.5">
-                  <div className="grid grid-cols-12 gap-2 text-[11px] font-medium text-slate-500">
+                  <div className="grid grid-cols-12 gap-2 text-[11px] font-medium text-slate-500 dark:text-slate-400">
                     <span className="col-span-5">Variant / Size Name</span>
                     <span className="col-span-3 text-right">+Price (PHP)</span>
                     <span className="col-span-3 text-right">Portion Multiplier</span>
@@ -1439,7 +1496,7 @@ export function ProductsBomModule() {
                             variants: f.variants.map((x, i) => (i === idx ? { ...x, name: e.target.value } : x)),
                           }))
                         }
-                        className="col-span-5 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs"
+                        className="col-span-5 rounded-lg border border-slate-200 dark:border-slate-800 px-2.5 py-1.5 text-xs"
                       />
                       <input
                         type="number"
@@ -1454,7 +1511,7 @@ export function ProductsBomModule() {
                             variants: f.variants.map((x, i) => (i === idx ? { ...x, priceDelta: e.target.value } : x)),
                           }))
                         }
-                        className="col-span-3 rounded-lg border border-slate-200 px-2 py-1.5 text-xs font-mono text-right"
+                        className="col-span-3 rounded-lg border border-slate-200 dark:border-slate-800 px-2 py-1.5 text-xs font-mono text-right"
                       />
                       <input
                         type="number"
@@ -1469,7 +1526,7 @@ export function ProductsBomModule() {
                             variants: f.variants.map((x, i) => (i === idx ? { ...x, portionMultiplier: e.target.value } : x)),
                           }))
                         }
-                        className="col-span-3 rounded-lg border border-slate-200 px-2 py-1.5 text-xs font-mono text-right"
+                        className="col-span-3 rounded-lg border border-slate-200 dark:border-slate-800 px-2 py-1.5 text-xs font-mono text-right"
                       />
                       <button
                         type="button"
@@ -1479,7 +1536,7 @@ export function ProductsBomModule() {
                             variants: f.variants.filter((_, i) => i !== idx),
                           }))
                         }
-                        className="col-span-1 flex justify-center text-slate-400 hover:text-red-600"
+                        className="col-span-1 flex justify-center text-slate-500 dark:text-slate-400 hover:text-red-600 dark:hover:text-red-300"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
@@ -1490,9 +1547,9 @@ export function ProductsBomModule() {
             </div>
 
             {/* Modifiers / Add-ons */}
-            <div className="border-t border-slate-100 pt-3 space-y-2">
+            <div className="border-t border-slate-100 dark:border-slate-800/80 pt-3 space-y-2">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-slate-700">Add-ons &amp; Modifiers</span>
+                <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">Add-ons &amp; Modifiers</span>
                 <button
                   type="button"
                   onClick={() =>
@@ -1501,16 +1558,16 @@ export function ProductsBomModule() {
                       modifiers: [...f.modifiers, { groupName: 'Add-ons', name: '', priceDelta: '0' }],
                     }))
                   }
-                  className="text-xs font-medium text-slate-900 hover:underline"
+                  className="text-xs font-medium text-slate-900 dark:text-slate-50 hover:underline"
                 >
                   + Add Modifier
                 </button>
               </div>
               {editProdForm.modifiers.length === 0 ? (
-                <p className="text-[11px] text-slate-400">No modifiers configured.</p>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">No modifiers configured.</p>
               ) : (
                 <div className="space-y-1.5">
-                  <div className="grid grid-cols-12 gap-2 text-[11px] font-medium text-slate-500">
+                  <div className="grid grid-cols-12 gap-2 text-[11px] font-medium text-slate-500 dark:text-slate-400">
                     <span className="col-span-4">Group</span>
                     <span className="col-span-5">Modifier Name</span>
                     <span className="col-span-2 text-right">+Price</span>
@@ -1528,7 +1585,7 @@ export function ProductsBomModule() {
                             modifiers: f.modifiers.map((x, i) => (i === idx ? { ...x, groupName: e.target.value } : x)),
                           }))
                         }
-                        className="col-span-4 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs"
+                        className="col-span-4 rounded-lg border border-slate-200 dark:border-slate-800 px-2.5 py-1.5 text-xs"
                       />
                       <input
                         aria-label="Modifier Name"
@@ -1540,7 +1597,7 @@ export function ProductsBomModule() {
                             modifiers: f.modifiers.map((x, i) => (i === idx ? { ...x, name: e.target.value } : x)),
                           }))
                         }
-                        className="col-span-5 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs"
+                        className="col-span-5 rounded-lg border border-slate-200 dark:border-slate-800 px-2.5 py-1.5 text-xs"
                       />
                       <input
                         type="number"
@@ -1554,7 +1611,7 @@ export function ProductsBomModule() {
                             modifiers: f.modifiers.map((x, i) => (i === idx ? { ...x, priceDelta: e.target.value } : x)),
                           }))
                         }
-                        className="col-span-2 rounded-lg border border-slate-200 px-2 py-1.5 text-xs font-mono text-right"
+                        className="col-span-2 rounded-lg border border-slate-200 dark:border-slate-800 px-2 py-1.5 text-xs font-mono text-right"
                       />
                       <button
                         type="button"
@@ -1564,7 +1621,7 @@ export function ProductsBomModule() {
                             modifiers: f.modifiers.filter((_, i) => i !== idx),
                           }))
                         }
-                        className="col-span-1 flex justify-center text-slate-400 hover:text-red-600"
+                        className="col-span-1 flex justify-center text-slate-500 dark:text-slate-400 hover:text-red-600 dark:hover:text-red-300"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
@@ -1574,7 +1631,7 @@ export function ProductsBomModule() {
               )}
             </div>
 
-            <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
+            <div className="flex justify-end gap-2 pt-3 border-t border-slate-100 dark:border-slate-800/80">
               <button
                 type="button"
                 onClick={() => {
@@ -1586,7 +1643,7 @@ export function ProductsBomModule() {
               >
                 Cancel
               </button>
-              <button type="submit" disabled={savingEdit} className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-50">
+              <button type="submit" disabled={savingEdit} className="px-4 py-2 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950 text-xs font-semibold hover:bg-slate-800 dark:hover:bg-white disabled:opacity-50">
                 {savingEdit ? 'Saving...' : 'Save Changes'}
               </button>
             </div>
@@ -1596,13 +1653,13 @@ export function ProductsBomModule() {
 
       {bomModal && selected && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <form onSubmit={submitBomIngredient} className="w-full max-w-md rounded-xl bg-white p-5 space-y-4 border border-slate-200">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+          <form onSubmit={submitBomIngredient} className="w-full max-w-md rounded-xl bg-white dark:bg-slate-900 p-5 space-y-4 border border-slate-200 dark:border-slate-800">
+            <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800/80 pb-3">
               <div>
-                <h3 className="font-display text-base font-semibold text-slate-900">
+                <h3 className="font-display text-base font-semibold text-slate-900 dark:text-slate-50">
                   {bomModal.mode === 'add' ? 'Add Recipe Ingredient' : 'Edit Recipe Ingredient'}
                 </h3>
-                <p className="text-xs text-slate-500">Bill of Materials for {selected.name}</p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">Bill of Materials for {selected.name}</p>
               </div>
               <button
                 type="button"
@@ -1611,22 +1668,22 @@ export function ProductsBomModule() {
                   setIngEditor(null);
                   setBomModal(null);
                 }}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                className="p-1.5 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            {err && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{err}</div>}
+            {err && <div className="p-2.5 rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800/80 text-xs text-red-700 dark:text-red-300 font-medium">{err}</div>}
 
             <div>
               <div className="flex items-center justify-between gap-2 mb-1">
-                <label className="block text-xs font-medium text-slate-600">Ingredient / Raw Material</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300">Ingredient / Raw Material</label>
                 <div className="flex items-center gap-1.5">
                   <button
                     type="button"
                     onClick={openIngAdd}
-                    className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                    className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2 py-0.5 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
                   >
                     <Plus className="w-3 h-3" /> Add
                   </button>
@@ -1634,7 +1691,7 @@ export function ProductsBomModule() {
                     type="button"
                     disabled={!bomForm.inventoryItemId}
                     onClick={() => openIngEdit(bomForm.inventoryItemId)}
-                    className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+                    className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2 py-0.5 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40"
                   >
                     <Pencil className="w-3 h-3" /> Edit
                   </button>
@@ -1642,7 +1699,7 @@ export function ProductsBomModule() {
                     type="button"
                     disabled={!bomForm.inventoryItemId}
                     onClick={() => openIngDelete(bomForm.inventoryItemId)}
-                    className="inline-flex items-center gap-1 rounded border border-red-200 bg-white px-2 py-0.5 text-[11px] font-medium text-red-700 hover:bg-red-50 disabled:opacity-40"
+                    className="inline-flex items-center gap-1 rounded border border-red-200 dark:border-red-800/80 bg-white dark:bg-slate-900 px-2 py-0.5 text-[11px] font-medium text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/70 disabled:opacity-40"
                   >
                     <Trash2 className="w-3 h-3" /> Delete
                   </button>
@@ -1658,7 +1715,7 @@ export function ProductsBomModule() {
                     uomId: nextItem?.base_uom_id || f.uomId,
                   }));
                 }}
-                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs"
               >
                 {inventoryItems.map((it) => (
                   <option key={it.id} value={it.id}>
@@ -1669,9 +1726,9 @@ export function ProductsBomModule() {
             </div>
 
             {ingEditor && (
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-2.5">
+              <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 p-3 space-y-2.5">
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-slate-800">
+                  <span className="text-xs font-semibold text-slate-800 dark:text-slate-100">
                     {ingEditor.mode === 'add'
                       ? 'Add New Ingredient / Raw Material'
                       : ingEditor.mode === 'edit'
@@ -1681,7 +1738,7 @@ export function ProductsBomModule() {
                   <button
                     type="button"
                     onClick={() => setIngEditor(null)}
-                    className="text-xs text-slate-500 hover:text-slate-800"
+                    className="text-xs text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-100"
                   >
                     Cancel
                   </button>
@@ -1689,14 +1746,14 @@ export function ProductsBomModule() {
 
                 {ingEditor.mode === 'delete' ? (
                   <div className="space-y-2">
-                    <p className="text-[11px] text-slate-600">
+                    <p className="text-[11px] text-slate-600 dark:text-slate-300">
                       This permanently removes the raw material from inventory master data if it is not used in recipes or stock history.
                     </p>
                     <div className="flex justify-end gap-2">
                       <button
                         type="button"
                         onClick={() => setIngEditor(null)}
-                        className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-700"
+                        className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs text-slate-700 dark:text-slate-200"
                       >
                         Keep
                       </button>
@@ -1714,31 +1771,31 @@ export function ProductsBomModule() {
                   <>
                     <div className="grid grid-cols-2 gap-2">
                       <div>
-                        <label className="block text-[11px] font-medium text-slate-600 mb-0.5">Name</label>
+                        <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-0.5">Name</label>
                         <input
                           placeholder="e.g. Pork Belly Slab"
                           value={ingEditor.name}
                           onChange={(e) => setIngEditor({ ...ingEditor, name: e.target.value })}
-                          className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs"
+                          className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs"
                         />
                       </div>
                       <div>
-                        <label className="block text-[11px] font-medium text-slate-600 mb-0.5">SKU</label>
+                        <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-0.5">SKU</label>
                         <input
                           placeholder="Auto if blank"
                           value={ingEditor.sku}
                           onChange={(e) => setIngEditor({ ...ingEditor, sku: e.target.value })}
-                          className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-mono"
+                          className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs font-mono"
                         />
                       </div>
                     </div>
                     <div className="grid grid-cols-3 gap-2">
                       <div>
-                        <label className="block text-[11px] font-medium text-slate-600 mb-0.5">Base UOM</label>
+                        <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-0.5">Base UOM</label>
                         <select
                           value={ingEditor.baseUomId}
                           onChange={(e) => setIngEditor({ ...ingEditor, baseUomId: e.target.value })}
-                          className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs"
+                          className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2 py-1.5 text-xs"
                         >
                           {uoms.map((u) => (
                             <option key={u.id} value={u.id}>{u.code}</option>
@@ -1746,22 +1803,22 @@ export function ProductsBomModule() {
                         </select>
                       </div>
                       <div>
-                        <label className="block text-[11px] font-medium text-slate-600 mb-0.5">Unit Cost (PHP)</label>
+                        <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-0.5">Unit Cost (PHP)</label>
                         <input
                           type="number"
                           step="0.01"
                           min="0"
                           value={ingEditor.lastUnitCost}
                           onChange={(e) => setIngEditor({ ...ingEditor, lastUnitCost: e.target.value })}
-                          className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-mono text-right"
+                          className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs font-mono text-right"
                         />
                       </div>
                       <div>
-                        <label className="block text-[11px] font-medium text-slate-600 mb-0.5">Type</label>
+                        <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-0.5">Type</label>
                         <select
                           value={ingEditor.itemType}
                           onChange={(e) => setIngEditor({ ...ingEditor, itemType: e.target.value })}
-                          className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs"
+                          className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2 py-1.5 text-xs"
                         >
                           <option value="RAW_MATERIAL">Raw Material</option>
                           <option value="PACKAGING">Packaging</option>
@@ -1774,7 +1831,7 @@ export function ProductsBomModule() {
                         type="button"
                         disabled={savingIng || !ingEditor.name.trim()}
                         onClick={saveIngEditor}
-                        className="rounded-lg bg-slate-900 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-40"
+                        className="rounded-lg bg-slate-900 dark:bg-slate-100 px-3.5 py-1.5 text-xs font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white disabled:opacity-40"
                       >
                         {savingIng ? 'Saving...' : ingEditor.mode === 'add' ? 'Create Ingredient' : 'Save Ingredient'}
                       </button>
@@ -1786,7 +1843,7 @@ export function ProductsBomModule() {
 
             <div className="grid grid-cols-3 gap-3">
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Quantity</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Quantity</label>
                 <input
                   type="number"
                   step="0.01"
@@ -1794,15 +1851,15 @@ export function ProductsBomModule() {
                   required
                   value={bomForm.quantity}
                   onChange={(e) => setBomForm({ ...bomForm, quantity: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono text-right"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono text-right"
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Unit (UOM)</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Unit (UOM)</label>
                 <select
                   value={bomForm.uomId}
                   onChange={(e) => setBomForm({ ...bomForm, uomId: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-2.5 py-2 text-xs"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-2.5 py-2 text-xs"
                 >
                   {getCompatibleUoms(bomForm.inventoryItemId).map((u) => (
                     <option key={u.id} value={u.id}>
@@ -1812,19 +1869,19 @@ export function ProductsBomModule() {
                 </select>
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">Waste %</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Waste %</label>
                 <input
                   type="number"
                   step="0.1"
                   min="0"
                   value={bomForm.wasteFactorPct}
                   onChange={(e) => setBomForm({ ...bomForm, wasteFactorPct: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono text-right"
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs font-mono text-right"
                 />
               </div>
             </div>
 
-            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800/80">
               <button
                 type="button"
                 onClick={() => {
@@ -1839,7 +1896,7 @@ export function ProductsBomModule() {
               <button
                 type="submit"
                 disabled={savingBom}
-                className="px-4 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-50"
+                className="px-4 py-2 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950 text-xs font-semibold hover:bg-slate-800 dark:hover:bg-white disabled:opacity-50"
               >
                 {savingBom ? 'Saving...' : bomModal.mode === 'add' ? 'Add to BOM' : 'Save Ingredient'}
               </button>
@@ -1849,11 +1906,11 @@ export function ProductsBomModule() {
       )}
       {showCategoriesModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-lg max-h-[90vh] overflow-y-auto rounded-xl bg-white p-5 space-y-4 border border-slate-200">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+          <div className="w-full max-w-lg max-h-[90vh] overflow-y-auto rounded-xl bg-white dark:bg-slate-900 p-5 space-y-4 border border-slate-200 dark:border-slate-800">
+            <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800/80 pb-3">
               <div>
-                <h3 className="font-display text-base font-semibold text-slate-900">Menu Categories</h3>
-                <p className="text-xs text-slate-500">Create or edit categories and control POS menu visibility</p>
+                <h3 className="font-display text-base font-semibold text-slate-900 dark:text-slate-50">Menu Categories</h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400">Create or edit categories and control POS menu visibility</p>
               </div>
               <button
                 type="button"
@@ -1862,68 +1919,68 @@ export function ProductsBomModule() {
                   setCatEditor(null);
                   setShowCategoriesModal(false);
                 }}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                className="p-1.5 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            {err && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">{err}</div>}
+            {err && <div className="p-2.5 rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800/80 text-xs text-red-700 dark:text-red-300 font-medium">{err}</div>}
 
             <div className="flex justify-end">
               <button
                 type="button"
                 onClick={() => openCatAdd('categoriesModal')}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800"
+                className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 dark:bg-slate-100 px-3 py-1.5 text-xs font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white"
               >
                 <Plus className="w-3.5 h-3.5" /> Add Category
               </button>
             </div>
 
             {catEditor && catEditor.target === 'categoriesModal' && (
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3.5 space-y-2.5">
+              <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 p-3.5 space-y-2.5">
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-slate-800">
+                  <span className="text-xs font-semibold text-slate-800 dark:text-slate-100">
                     {catEditor.mode === 'add' ? 'Create Category' : 'Edit Category'}
                   </span>
                   <button
                     type="button"
                     onClick={() => setCatEditor(null)}
-                    className="text-xs text-slate-500 hover:text-slate-800"
+                    className="text-xs text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-100"
                   >
                     Cancel
                   </button>
                 </div>
                 <div className="flex flex-wrap sm:flex-nowrap items-end gap-2">
                   <div className="flex-1 min-w-[160px]">
-                    <label className="block text-[11px] font-medium text-slate-600 mb-1">Category Name *</label>
+                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">Category Name *</label>
                     <input
                       placeholder="e.g. Grilled Platters"
                       value={catEditor.name}
                       onChange={(e) => setCatEditor({ ...catEditor, name: e.target.value })}
-                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs"
+                      className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs"
                     />
                   </div>
                   <div className="w-20">
-                    <label className="block text-[11px] font-medium text-slate-600 mb-1">Sort Order</label>
+                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">Sort Order</label>
                     <input
                       type="number"
                       placeholder="Order"
                       value={catEditor.sortOrder}
                       onChange={(e) => setCatEditor({ ...catEditor, sortOrder: e.target.value })}
-                      className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-mono text-right"
+                      className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs font-mono text-right"
                     />
                   </div>
                   <button
                     type="button"
                     disabled={savingCat || !catEditor.name.trim()}
                     onClick={saveCategory}
-                    className="rounded-lg bg-slate-900 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-40 whitespace-nowrap"
+                    className="rounded-lg bg-slate-900 dark:bg-slate-100 px-3.5 py-1.5 text-xs font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white disabled:opacity-40 whitespace-nowrap"
                   >
                     {savingCat ? 'Saving...' : catEditor.mode === 'add' ? 'Create' : 'Save'}
                   </button>
                 </div>
-                <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer">
+                <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-200 cursor-pointer">
                   <input
                     type="checkbox"
                     checked={catEditor.showInPos}
@@ -1934,9 +1991,9 @@ export function ProductsBomModule() {
               </div>
             )}
 
-            <div className="rounded-lg border border-slate-200 overflow-hidden">
+            <div className="rounded-lg border border-slate-200 dark:border-slate-800 overflow-hidden">
               <table className="w-full text-left text-xs">
-                <thead className="border-b border-slate-200 bg-slate-50 text-slate-500">
+                <thead className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 text-slate-500 dark:text-slate-400">
                   <tr>
                     <th className="p-2.5 font-medium">Category Name</th>
                     <th className="p-2.5 font-medium text-right">Order</th>
@@ -1944,13 +2001,13 @@ export function ProductsBomModule() {
                     <th className="p-2.5 font-medium text-right">Action</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-100">
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                   {categories.map((c) => (
-                    <tr key={c.id} className="hover:bg-slate-50">
-                      <td className="p-2.5 font-semibold text-slate-900">{c.name}</td>
-                      <td className="p-2.5 text-right font-mono text-slate-600">{c.sort_order}</td>
+                    <tr key={c.id} className="hover:bg-slate-50 dark:hover:bg-slate-800">
+                      <td className="p-2.5 font-semibold text-slate-900 dark:text-slate-50">{c.name}</td>
+                      <td className="p-2.5 text-right font-mono text-slate-600 dark:text-slate-300">{c.sort_order}</td>
                       <td className="p-2.5">
-                        <span className={`font-semibold ${c.show_in_pos !== false ? 'text-emerald-700' : 'text-slate-500'}`}>
+                        <span className={`font-semibold ${c.show_in_pos !== false ? 'text-emerald-700 dark:text-emerald-300' : 'text-slate-500 dark:text-slate-400'}`}>
                           {c.show_in_pos !== false ? 'Visible in POS' : 'Hidden in POS'}
                         </span>
                       </td>
@@ -1958,7 +2015,7 @@ export function ProductsBomModule() {
                         <button
                           type="button"
                           onClick={() => openCatEdit('categoriesModal', c.id)}
-                          className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100"
+                          className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
                         >
                           <Pencil className="w-3 h-3" /> Edit
                         </button>
@@ -1977,7 +2034,7 @@ export function ProductsBomModule() {
                   setCatEditor(null);
                   setShowCategoriesModal(false);
                 }}
-                className="px-4 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                className="px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
               >
                 Close
               </button>

@@ -5,6 +5,7 @@ import {
   doc,
   getDoc,
   getDocs,
+  onSnapshot,
   query,
   serverTimestamp,
   setDoc,
@@ -14,7 +15,44 @@ import {
   writeBatch,
 } from 'firebase/firestore';
 import { auth, db, handleFirestoreError, OperationType } from './firebase.ts';
+import { isTerminalModeDevice } from './terminalAuth.ts';
 import { AuthUser, PERMISSIONS, RoleCode } from '../types/erp.ts';
+import { findScheduleCandidateConflicts, formatOverlapDuration, ShiftWindowLike } from './shiftConflicts.ts';
+import { buildThresholdNotification, evaluateIngredientThreshold } from './inventoryAlerts.ts';
+import { buildWeeklyFoodCostSeries } from './financeCharts.ts';
+import { buildPredictiveProcurementPlan, SupplierQuoteOption } from './predictiveProcurement.ts';
+import {
+  ALL_HUDDLE_CHANNELS,
+  canBroadcastDailyHuddle,
+  DailyHuddleItem,
+  HuddleChannel,
+  HuddlePriority,
+  HuddleShiftWindow,
+  sortDailyHuddles,
+} from './dailyHuddle.ts';
+import {
+  getMaintenanceAlertInfo,
+  getTodayDateIso,
+  MaintenanceCategory,
+  MaintenanceStatus,
+  summarizeTruckMaintenance,
+} from './fleetMaintenance.ts';
+import { analyzeMenuEngineering } from './menuEngineering.ts';
+import {
+  getWasteReasonLabel,
+  RecipeWasteOption,
+  summarizeWasteLogs,
+  WasteEntryMode,
+  WasteLogRecord,
+  WasteReasonCategory,
+} from './wasteManagement.ts';
+import {
+  calculateLoyaltyTier,
+  formatPhoneNumber,
+  normalizePhoneNumber,
+  SPEND_PER_POINT_PHP,
+  WELCOME_POINTS_BONUS,
+} from './loyaltyKiosk.ts';
 
 const ACTIVE_USER_SESSION_KEY = 'maximus_bbq_active_erp_user_id';
 const SIGNED_OUT_SESSION_KEY = 'maximus_bbq_erp_signed_out';
@@ -123,6 +161,51 @@ export const DEFAULT_EXPENSE_CATEGORIES = [
   { id: 'cat_misc', code: 'MISC', name: 'Miscellaneous Operating', description: 'Ice, small tools, and cleaning consumables', sortOrder: 9, isActive: true },
 ];
 
+export const DEFAULT_SHIFT_TEMPLATES = [
+  {
+    id: 'tpl_opening',
+    code: 'OPEN',
+    name: 'Opening Shift',
+    startTime: '07:00',
+    endTime: '15:00',
+    breakMinutes: 60,
+    daysOfWeek: ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'],
+    locationIds: ['loc_truck_1', 'loc_truck_2', 'loc_commissary'],
+    defaultRole: 'Lead Cashier / Prep Cook',
+    headcountNeeded: 2,
+    notes: 'Truck power-up, grill pre-heat, morning commissary stock check, and POS float count.',
+    isActive: true,
+  },
+  {
+    id: 'tpl_midday',
+    code: 'MID',
+    name: 'Mid-Day Shift',
+    startTime: '11:00',
+    endTime: '19:00',
+    breakMinutes: 60,
+    daysOfWeek: ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'],
+    locationIds: ['loc_truck_1', 'loc_truck_2'],
+    defaultRole: 'Line Cook / Service Crew',
+    headcountNeeded: 2,
+    notes: 'Peak lunch & early dinner service coverage across active food truck sites.',
+    isActive: true,
+  },
+  {
+    id: 'tpl_closing',
+    code: 'CLOSE',
+    name: 'Closing Shift',
+    startTime: '15:00',
+    endTime: '23:00',
+    breakMinutes: 60,
+    daysOfWeek: ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'],
+    locationIds: ['loc_truck_1', 'loc_truck_2'],
+    defaultRole: 'Griller / Closer',
+    headcountNeeded: 2,
+    notes: 'Dinner rush, grill sanitization, cold-chain batch sealing, and daily Z-reading sign-off.',
+    isActive: true,
+  },
+];
+
 interface WorkspaceSnapshot {
   uid: string;
   meta: any;
@@ -150,8 +233,13 @@ interface WorkspaceSnapshot {
   fleetLogs: any[];
   attendanceLogs: any[];
   payrollRuns: any[];
+  shiftTemplates: any[];
+  shiftSchedules: any[];
   customers: any[];
   notifications: any[];
+  dailyHuddles: any[];
+  wasteLogs: any[];
+  terminalDevices: any[];
   auditLogs: any[];
 }
 
@@ -514,10 +602,11 @@ async function seedWorkspaceFirestore(firebaseUser: User): Promise<void> {
   }
 
   const fleetSeeds = [
-    { id: 'ta_1', logType: 'ASSIGNMENT', truckId: 'trk_1', siteName: 'BGC High Street South', assignedDate: todayStr, shiftNotes: 'Lunch & Dinner Peak Service', liters: null, totalCost: null, odometerKm: null, title: null, description: null, serviceDate: null, nextDueDate: null },
-    { id: 'ta_2', logType: 'ASSIGNMENT', truckId: 'trk_2', siteName: 'Ayala Triangle Gardens', assignedDate: todayStr, shiftNotes: 'Evening Street Market', liters: null, totalCost: null, odometerKm: null, title: null, description: null, serviceDate: null, nextDueDate: null },
-    { id: 'fuel_1', logType: 'FUEL', truckId: 'trk_1', siteName: null, assignedDate: daysFromNow(-2), shiftNotes: null, liters: 42.5, totalCost: 2450, odometerKm: 42850, title: null, description: null, serviceDate: null, nextDueDate: null },
-    { id: 'mnt_1', logType: 'MAINTENANCE', truckId: 'trk_2', siteName: null, assignedDate: null, shiftNotes: null, liters: null, totalCost: 1800, odometerKm: null, title: 'Generator Oil & Filter Service', description: 'Scheduled 500-hr generator preventive maintenance', serviceDate: daysFromNow(-3).slice(0, 10), nextDueDate: daysFromNow(27).slice(0, 10) },
+    { id: 'ta_1', logType: 'ASSIGNMENT', truckId: 'trk_1', siteName: 'BGC High Street South', assignedDate: todayStr, shiftNotes: 'Lunch & Dinner Peak Service', liters: null, totalCost: null, odometerKm: null, title: null, description: null, serviceDate: null, nextDueDate: null, maintenanceCategory: null, serviceProvider: null, maintenanceStatus: null, alertLeadDays: null },
+    { id: 'ta_2', logType: 'ASSIGNMENT', truckId: 'trk_2', siteName: 'Ayala Triangle Gardens', assignedDate: todayStr, shiftNotes: 'Evening Street Market', liters: null, totalCost: null, odometerKm: null, title: null, description: null, serviceDate: null, nextDueDate: null, maintenanceCategory: null, serviceProvider: null, maintenanceStatus: null, alertLeadDays: null },
+    { id: 'fuel_1', logType: 'FUEL', truckId: 'trk_1', siteName: null, assignedDate: daysFromNow(-2), shiftNotes: null, liters: 42.5, totalCost: 2450, odometerKm: 42850, title: null, description: null, serviceDate: null, nextDueDate: null, maintenanceCategory: null, serviceProvider: null, maintenanceStatus: null, alertLeadDays: null },
+    { id: 'mnt_1', logType: 'MAINTENANCE', truckId: 'trk_2', siteName: null, assignedDate: null, shiftNotes: null, liters: null, totalCost: 1800, odometerKm: 31200, title: 'Generator Oil & Filter Service', description: 'Scheduled 500-hr generator preventive maintenance', serviceDate: daysFromNow(-3).slice(0, 10), nextDueDate: daysFromNow(27).slice(0, 10), maintenanceCategory: 'GENERATOR_LPG', serviceProvider: 'Honda Power Service BGC', maintenanceStatus: 'OPEN', alertLeadDays: 7 },
+    { id: 'mnt_2', logType: 'MAINTENANCE', truckId: 'trk_1', siteName: null, assignedDate: null, shiftNotes: null, liters: null, totalCost: 3450, odometerKm: 42100, title: 'Engine Oil & Brake Inspection', description: 'Synthetic oil change, front brake pad measure & coolant flush', serviceDate: daysFromNow(-42).slice(0, 10), nextDueDate: daysFromNow(3).slice(0, 10), maintenanceCategory: 'ENGINE_OIL', serviceProvider: 'Petron Car Care BGC', maintenanceStatus: 'OPEN', alertLeadDays: 7 },
   ];
   for (const fl of fleetSeeds) {
     const docId = toDocId(fl.id, uid);
@@ -536,6 +625,10 @@ async function seedWorkspaceFirestore(firebaseUser: User): Promise<void> {
       description: fl.description,
       serviceDate: fl.serviceDate,
       nextDueDate: fl.nextDueDate,
+      ...(fl.maintenanceCategory ? { maintenanceCategory: fl.maintenanceCategory } : {}),
+      ...(fl.serviceProvider ? { serviceProvider: fl.serviceProvider } : {}),
+      ...(fl.maintenanceStatus ? { maintenanceStatus: fl.maintenanceStatus } : {}),
+      ...(fl.alertLeadDays !== null ? { alertLeadDays: fl.alertLeadDays } : {}),
       createdAt: serverTimestamp(),
     });
   }
@@ -563,7 +656,11 @@ async function seedWorkspaceFirestore(firebaseUser: User): Promise<void> {
   const googleDisplayName = (firebaseUser.displayName?.trim() || googleEmail.split('@')[0]?.trim() || 'Workspace Owner').slice(0, 150);
   const rawGooglePhoto = firebaseUser.photoURL ? String(firebaseUser.photoURL).trim() : '';
   const safeGooglePhoto = rawGooglePhoto && rawGooglePhoto.length <= 250000 ? rawGooglePhoto : null;
-  if (googleEmail && !erpUserSeeds.some((u) => u.email.toLowerCase() === googleEmail)) {
+  const isPasswordTerminalAuth =
+    isTerminalModeDevice() &&
+    firebaseUser.providerData?.some((p) => p.providerId === 'password') &&
+    !firebaseUser.providerData?.some((p) => p.providerId === 'google.com');
+  if (googleEmail && !isPasswordTerminalAuth && !erpUserSeeds.some((u) => u.email.toLowerCase() === googleEmail)) {
     erpUserSeeds.unshift({
       id: 'usr_google_owner',
       email: googleEmail,
@@ -1123,6 +1220,52 @@ async function seedWorkspaceFirestore(firebaseUser: User): Promise<void> {
     });
   }
 
+  // 15. Shift Templates
+  for (const tpl of DEFAULT_SHIFT_TEMPLATES) {
+    const docId = toDocId(tpl.id, uid);
+    batch.set(doc(db, 'shift_templates', docId), {
+      id: docId,
+      ownerUid: uid,
+      code: tpl.code,
+      name: tpl.name,
+      startTime: tpl.startTime,
+      endTime: tpl.endTime,
+      breakMinutes: tpl.breakMinutes,
+      daysOfWeek: tpl.daysOfWeek,
+      locationIds: tpl.locationIds.map((l) => toDocId(l, uid)),
+      defaultRole: tpl.defaultRole,
+      headcountNeeded: tpl.headcountNeeded,
+      notes: tpl.notes,
+      isActive: tpl.isActive,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  // 16. Initial Daily Huddle Briefing
+  const huddleDocId = toDocId('hdl_1', uid);
+  batch.set(doc(db, 'daily_huddles', huddleDocId), {
+    id: huddleDocId,
+    ownerUid: uid,
+    title: 'Welcome Shift Brief — Brioche Bun & Sisig Prep Check',
+    message:
+      'Truck 01 is running low on Brioche Buns (95 pcs remaining). Offer Crispy Pork Sisig Tacos as the featured item during lunch rush and confirm buzzer numbers on all POS tickets.',
+    priority: 'URGENT',
+    targetChannels: ['POS', 'KDS', 'MOBILE'],
+    locationId: null,
+    locationName: null,
+    shiftWindow: 'ALL_DAY',
+    authorId: 'usr_ops',
+    authorName: 'Elena Reyes (Operations)',
+    authorRole: 'Operations Manager',
+    acknowledgedBy: [],
+    isPinned: true,
+    isActive: true,
+    expiresAt: daysFromNow(1),
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  });
+
   try {
     await batch.commit();
   } catch (err) {
@@ -1188,6 +1331,52 @@ async function loadSnapshot(force = false): Promise<WorkspaceSnapshot> {
       queryCollection('audit_logs', uid),
     ]);
 
+    const [shiftTemplatesRaw, shiftSchedules, dailyHuddles, wasteLogs, terminalDevices] = await Promise.all([
+      queryCollection('shift_templates', uid),
+      queryCollection('shift_schedules', uid),
+      queryCollection('daily_huddles', uid),
+      queryCollection('waste_logs', uid),
+      queryCollection('terminal_devices', uid),
+    ]);
+
+    let activeShiftTemplates = shiftTemplatesRaw;
+    if (activeShiftTemplates.length === 0 && meta?.seeded) {
+      const seedBatch = writeBatch(db);
+      const seededItems: any[] = [];
+      const nowIso = new Date().toISOString();
+      for (const tpl of DEFAULT_SHIFT_TEMPLATES) {
+        const docId = toDocId(tpl.id, uid);
+        const mappedLocIds = tpl.locationIds
+          .map((l) => toDocId(l, uid))
+          .filter((lid) => locations.some((loc) => loc.id === lid));
+        const payload = {
+          id: docId,
+          ownerUid: uid,
+          code: tpl.code,
+          name: tpl.name,
+          startTime: tpl.startTime,
+          endTime: tpl.endTime,
+          breakMinutes: tpl.breakMinutes,
+          daysOfWeek: tpl.daysOfWeek,
+          locationIds: mappedLocIds,
+          defaultRole: tpl.defaultRole,
+          headcountNeeded: tpl.headcountNeeded,
+          notes: tpl.notes,
+          isActive: tpl.isActive,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        };
+        seedBatch.set(doc(db, 'shift_templates', docId), payload);
+        seededItems.push({ ...payload, createdAt: nowIso, updatedAt: nowIso });
+      }
+      try {
+        await seedBatch.commit();
+        activeShiftTemplates = seededItems;
+      } catch (seedErr) {
+        console.warn('[ShiftTemplates] Auto-seed fallback skipped:', seedErr);
+      }
+    }
+
     const activeExpCats = expenseCategories.length > 0
       ? expenseCategories
       : DEFAULT_EXPENSE_CATEGORIES.map((c) => ({
@@ -1224,8 +1413,13 @@ async function loadSnapshot(force = false): Promise<WorkspaceSnapshot> {
       fleetLogs,
       attendanceLogs,
       payrollRuns,
+      shiftTemplates: activeShiftTemplates,
+      shiftSchedules,
       customers,
       notifications,
+      dailyHuddles,
+      wasteLogs,
+      terminalDevices,
       auditLogs,
     };
 
@@ -1320,6 +1514,11 @@ function resolveCurrentErpUser(snap: WorkspaceSnapshot): AuthUser {
     if (match) return toAuthUser(match, snap);
   }
 
+  // On shared Terminal-mode devices, staff must explicitly sign in via Shift PIN or Work Email & Password.
+  if (isTerminalModeDevice()) {
+    throw new Error('SIGNED_OUT');
+  }
+
   const fbEmail = (auth.currentUser?.email || '').toLowerCase();
   const byEmail = activeUsers.find((u) => String(u.email || '').toLowerCase() === fbEmail);
   const chosen =
@@ -1345,6 +1544,169 @@ function assertAnyPerm(user: AuthUser, ...perms: string[]) {
 function assertOwnerOrSuperAdmin(user: AuthUser) {
   if (user.roleCode === 'SUPER_ADMIN' || user.roleCode === 'BUSINESS_OWNER') return;
   throw new Error('Restricted: Company Owner or Super Admin access only');
+}
+
+function assertDeviceManagerAccess(user: AuthUser) {
+  if (
+    user.roleCode === 'SUPER_ADMIN' ||
+    user.roleCode === 'BUSINESS_OWNER' ||
+    user.roleCode === 'OPERATIONS_MANAGER' ||
+    user.roleCode === 'FOOD_TRUCK_MANAGER'
+  ) {
+    return;
+  }
+  throw new Error('Restricted: Manager, Owner, or Super Admin access required for Device Pairing');
+}
+
+function normalizePrinterFields(input: any, existing?: any) {
+  const clear =
+    Boolean(input?.clearPrinter) ||
+    (input?.printerIp === null && input?.printerBtDeviceId == null && input?.printerConnectionType == null) ||
+    (input?.printerIp === '' && !input?.printerBtDeviceId && input?.printerConnectionType !== 'BLUETOOTH');
+
+  const hasIncomingPrinterSpec =
+    input?.printerConnectionType !== undefined ||
+    input?.printerIp !== undefined ||
+    input?.printerBtDeviceId !== undefined;
+
+  if (!hasIncomingPrinterSpec && !clear) {
+    return {
+      printerConnectionType: existing?.printerConnectionType ?? (existing?.printerIp ? 'NETWORK' : existing?.printerBtDeviceId ? 'BLUETOOTH' : null),
+      printerName: existing?.printerName ?? null,
+      printerIp: existing?.printerIp ?? null,
+      printerPort: existing?.printerPort ?? null,
+      printerBtDeviceId: existing?.printerBtDeviceId ?? null,
+      printerBtServiceUuid: existing?.printerBtServiceUuid ?? null,
+      printerBtCharacteristicUuid: existing?.printerBtCharacteristicUuid ?? null,
+      printerPaperWidthMm: existing?.printerPaperWidthMm ?? null,
+      printerAutoPrint: Boolean(existing?.printerAutoPrint),
+    };
+  }
+  if (clear) {
+    return {
+      printerConnectionType: null,
+      printerName: null,
+      printerIp: null,
+      printerPort: null,
+      printerBtDeviceId: null,
+      printerBtServiceUuid: null,
+      printerBtCharacteristicUuid: null,
+      printerPaperWidthMm: null,
+      printerAutoPrint: false,
+    };
+  }
+
+  const rawWidth = Number(input?.printerPaperWidthMm ?? existing?.printerPaperWidthMm ?? 80);
+  const paperWidthMm = rawWidth === 58 ? 58 : 80;
+  const autoPrint =
+    input?.printerAutoPrint !== undefined ? Boolean(input.printerAutoPrint) : Boolean(existing?.printerAutoPrint);
+
+  const requestedType = String(
+    input?.printerConnectionType ?? (input?.printerBtDeviceId ? 'BLUETOOTH' : 'NETWORK'),
+  ).toUpperCase();
+
+  if (requestedType === 'BLUETOOTH') {
+    const cleanBtId = String(input?.printerBtDeviceId ?? existing?.printerBtDeviceId ?? '')
+      .trim()
+      .slice(0, 160);
+    if (!cleanBtId) {
+      throw new Error('Bluetooth printer Device ID or MAC address is required');
+    }
+    const cleanServiceUuid = input?.printerBtServiceUuid
+      ? String(input.printerBtServiceUuid).trim().slice(0, 128)
+      : null;
+    const cleanCharUuid = input?.printerBtCharacteristicUuid
+      ? String(input.printerBtCharacteristicUuid).trim().slice(0, 128)
+      : null;
+    const cleanName = String(input?.printerName || existing?.printerName || 'Bluetooth Thermal Printer')
+      .trim()
+      .slice(0, 120);
+
+    return {
+      printerConnectionType: 'BLUETOOTH' as const,
+      printerName: cleanName || 'Bluetooth Thermal Printer',
+      printerIp: null,
+      printerPort: null,
+      printerBtDeviceId: cleanBtId,
+      printerBtServiceUuid: cleanServiceUuid,
+      printerBtCharacteristicUuid: cleanCharUuid,
+      printerPaperWidthMm: paperWidthMm,
+      printerAutoPrint: autoPrint,
+    };
+  }
+
+  const cleanIp = String(input?.printerIp || '').trim();
+  const m = cleanIp.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) {
+    throw new Error('Printer IP must be a valid private LAN IPv4 address (e.g. 192.168.1.88)');
+  }
+  const octets = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])];
+  if (octets.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
+    throw new Error('Printer IP contains an invalid octet');
+  }
+  const [a, b] = octets;
+  const isPrivate = a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+  if (!isPrivate) {
+    throw new Error('Printer IP must be on a private LAN subnet (10.x, 172.16-31.x, or 192.168.x)');
+  }
+  const rawPort = Number(input?.printerPort ?? existing?.printerPort ?? 9100);
+  if (![9100, 9101, 9102].includes(rawPort)) {
+    throw new Error('Printer TCP port must be 9100, 9101, or 9102');
+  }
+  const cleanName = String(input?.printerName || existing?.printerName || `Thermal Printer (${cleanIp})`)
+    .trim()
+    .slice(0, 120);
+
+  return {
+    printerConnectionType: 'NETWORK' as const,
+    printerName: cleanName || `Thermal Printer (${cleanIp})`,
+    printerIp: cleanIp,
+    printerPort: rawPort,
+    printerBtDeviceId: null,
+    printerBtServiceUuid: null,
+    printerBtCharacteristicUuid: null,
+    printerPaperWidthMm: paperWidthMm,
+    printerAutoPrint: autoPrint,
+  };
+}
+
+function mapTerminalDevice(d: any, uid: string, locMap: Map<string, any>) {
+  const loc = d.locationId ? locMap.get(d.locationId) : null;
+  const connType =
+    d.printerConnectionType === 'BLUETOOTH'
+      ? 'BLUETOOTH'
+      : d.printerConnectionType === 'NETWORK'
+        ? 'NETWORK'
+        : d.printerBtDeviceId
+          ? 'BLUETOOTH'
+          : d.printerIp
+            ? 'NETWORK'
+            : null;
+  return {
+    id: toLogicalId(d.id, uid),
+    hardware_uuid: String(d.hardwareUuid || ''),
+    device_name: String(d.deviceName || 'POS Terminal'),
+    location_id: d.locationId ? toLogicalId(d.locationId, uid) : null,
+    location_name: loc?.name || null,
+    station_email: d.stationEmail || null,
+    status: d.status === 'REVOKED' ? 'REVOKED' : 'AUTHORIZED',
+    paired_by_user_id: String(d.pairedByUserId || ''),
+    paired_by_name: String(d.pairedByName || ''),
+    paired_at: String(d.pairedAt || tsToIso(d.createdAt)),
+    last_seen_at: String(d.lastSeenAt || tsToIso(d.updatedAt || d.createdAt)),
+    user_agent_summary: d.userAgentSummary || null,
+    printer_connection_type: connType,
+    printer_name: d.printerName || null,
+    printer_ip: d.printerIp || null,
+    printer_port: d.printerPort ? Number(d.printerPort) : null,
+    printer_bt_device_id: d.printerBtDeviceId || null,
+    printer_bt_service_uuid: d.printerBtServiceUuid || null,
+    printer_bt_characteristic_uuid: d.printerBtCharacteristicUuid || null,
+    printer_paper_width_mm: d.printerPaperWidthMm === 58 ? 58 : d.printerPaperWidthMm === 80 ? 80 : null,
+    printer_auto_print: Boolean(d.printerAutoPrint),
+    created_at: tsToIso(d.createdAt),
+    updated_at: tsToIso(d.updatedAt || d.createdAt),
+  };
 }
 
 // =====================================================
@@ -1389,6 +1751,64 @@ async function addAuditLog(
   }
 }
 
+function toDailyHuddleItem(raw: any, uid: string): DailyHuddleItem {
+  const priorityRaw = String(raw?.priority || 'NORMAL').toUpperCase();
+  const priority: HuddlePriority =
+    priorityRaw === 'CRITICAL' ? 'CRITICAL' : priorityRaw === 'URGENT' ? 'URGENT' : 'NORMAL';
+  const shiftRaw = String(raw?.shiftWindow || 'ALL_DAY').toUpperCase();
+  const shiftWindow: HuddleShiftWindow =
+    shiftRaw === 'OPENING' || shiftRaw === 'MID_DAY' || shiftRaw === 'CLOSING' ? shiftRaw : 'ALL_DAY';
+  const rawChannels = Array.isArray(raw?.targetChannels) ? raw.targetChannels : ALL_HUDDLE_CHANNELS;
+  const targetChannels = rawChannels.filter((c: unknown): c is HuddleChannel =>
+    c === 'POS' || c === 'KDS' || c === 'MOBILE',
+  );
+
+  return {
+    id: toLogicalId(String(raw?.id || ''), uid),
+    title: String(raw?.title || ''),
+    message: String(raw?.message || ''),
+    priority,
+    targetChannels: targetChannels.length > 0 ? targetChannels : [...ALL_HUDDLE_CHANNELS],
+    locationId: raw?.locationId ? toLogicalId(String(raw.locationId), uid) : null,
+    locationName: raw?.locationName ? String(raw.locationName) : null,
+    shiftWindow,
+    authorId: String(raw?.authorId || ''),
+    authorName: String(raw?.authorName || 'Manager'),
+    authorRole: String(raw?.authorRole || 'Manager'),
+    acknowledgedBy: Array.isArray(raw?.acknowledgedBy) ? raw.acknowledgedBy.map((x: unknown) => String(x)) : [],
+    isPinned: Boolean(raw?.isPinned),
+    isActive: raw?.isActive !== false,
+    expiresAt: raw?.expiresAt ? String(raw.expiresAt) : null,
+    createdAt: tsToIso(raw?.createdAt),
+    updatedAt: tsToIso(raw?.updatedAt || raw?.createdAt),
+  };
+}
+
+export function subscribeDailyHuddles(onUpdate: (items: DailyHuddleItem[]) => void): () => void {
+  const fbUser = auth.currentUser;
+  if (!fbUser) {
+    onUpdate([]);
+    return () => {};
+  }
+  const uid = fbUser.uid;
+  const q = query(collection(db, 'daily_huddles'), where('ownerUid', '==', uid));
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const mapped = snapshot.docs.map((d) => toDailyHuddleItem(d.data(), uid));
+      if (cachedSnapshot && cachedSnapshot.uid === uid) {
+        cachedSnapshot.dailyHuddles = snapshot.docs.map((d) => d.data());
+      }
+      onUpdate(sortDailyHuddles(mapped));
+    },
+    (err) => {
+      if (auth.currentUser) {
+        handleFirestoreError(err, OperationType.GET, 'daily_huddles');
+      }
+    },
+  );
+}
+
 async function addNotificationIfMissing(
   snap: WorkspaceSnapshot,
   type: string,
@@ -1396,16 +1816,17 @@ async function addNotificationIfMissing(
   title: string,
   message: string,
   locationId?: string | null,
-) {
+  options?: { onlyIfNeverNotified?: boolean },
+): Promise<boolean> {
   const cleanLocId = locationId || null;
   const exists = snap.notifications.some(
     (n) =>
       n.type === type &&
       n.title === title &&
-      !n.isRead &&
-      (cleanLocId ? n.locationId === cleanLocId : true),
+      (options?.onlyIfNeverNotified ? true : !n.isRead) &&
+      (cleanLocId ? n.locationId === cleanLocId : !n.locationId || n.locationId === null),
   );
-  if (exists) return;
+  if (exists) return false;
   const id = toDocId(crypto.randomUUID(), snap.uid);
   const path = `notifications/${id}`;
   const docObj = {
@@ -1423,9 +1844,149 @@ async function addNotificationIfMissing(
   try {
     await setDoc(doc(db, 'notifications', id), docObj);
     snap.notifications.push({ ...docObj, createdAt: new Date().toISOString() });
+    return true;
   } catch (err) {
     handleFirestoreError(err, OperationType.CREATE, path);
+    return false;
   }
+}
+
+async function resolveMatchingNotifications(
+  snap: WorkspaceSnapshot,
+  types: string[],
+  itemName: string,
+  locationId?: string | null,
+): Promise<number> {
+  const cleanLocId = locationId || null;
+  const targets = snap.notifications.filter((n) => {
+    if (n.isRead) return false;
+    if (!types.includes(n.type)) return false;
+    const titleStr = String(n.title || '');
+    const matchesItem = titleStr.includes(`: ${itemName}`);
+    if (!matchesItem) return false;
+    return cleanLocId ? n.locationId === cleanLocId : !n.locationId;
+  });
+  let resolved = 0;
+  for (const n of targets) {
+    try {
+      await updateDoc(doc(db, 'notifications', n.id), { isRead: true, updatedAt: serverTimestamp() });
+      n.isRead = true;
+      resolved++;
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `notifications/${n.id}`);
+    }
+  }
+  return resolved;
+}
+
+async function syncItemThresholdAlertsFirestore(
+  snap: WorkspaceSnapshot,
+  item: any,
+  locDocId: string | null,
+  onHandQty: number,
+  options?: { onlyIfNeverNotified?: boolean },
+): Promise<{ status: 'BELOW_SAFETY' | 'BELOW_REORDER' | 'NOMINAL'; createdCount: number; resolvedCount: number }> {
+  const evalResult = evaluateIngredientThreshold({
+    onHandQty,
+    safetyStock: Number(item.minStockLevel || 0),
+    reorderPoint: Number(item.reorderPoint || 0),
+  });
+
+  if (evalResult.status === 'NOMINAL') {
+    const resolvedCount = await resolveMatchingNotifications(
+      snap,
+      ['SAFETY_STOCK', 'LOW_STOCK'],
+      item.name,
+      locDocId,
+    );
+    return { status: 'NOMINAL', createdCount: 0, resolvedCount };
+  }
+
+  let resolvedCount = 0;
+  if (evalResult.status === 'BELOW_REORDER') {
+    resolvedCount = await resolveMatchingNotifications(snap, ['SAFETY_STOCK'], item.name, locDocId);
+  }
+
+  const locName = locDocId
+    ? snap.locations.find((l) => l.id === locDocId)?.name || 'Location'
+    : 'All Locations';
+  const payload = buildThresholdNotification({
+    itemName: item.name,
+    sku: item.sku,
+    itemType: item.itemType,
+    uomCode: item.uomCode,
+    locationName: locName,
+    evalResult,
+  });
+
+  let createdCount = 0;
+  if (payload) {
+    const created = await addNotificationIfMissing(
+      snap,
+      payload.type,
+      payload.severity,
+      payload.title,
+      payload.message,
+      locDocId,
+      options,
+    );
+    if (created) createdCount = 1;
+  }
+
+  return { status: evalResult.status, createdCount, resolvedCount };
+}
+
+async function syncFleetMaintenanceAlertsFirestore(snap: WorkspaceSnapshot): Promise<{ createdCount: number; resolvedCount: number }> {
+  const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+  const trkMap = new Map(snap.foodTrucks.map((t) => [t.id, t]));
+  const todayIso = getTodayDateIso();
+  let createdCount = 0;
+  let resolvedCount = 0;
+
+  const maintLogs = snap.fleetLogs.filter((fl) => fl.logType === 'MAINTENANCE');
+  for (const fl of maintLogs) {
+    const trk = trkMap.get(fl.truckId);
+    const loc = trk ? locMap.get(trk.locationId) : null;
+    if (loc && loc.isActive === false) continue;
+
+    const titleText = String(fl.title || 'Scheduled Checkup').trim();
+    const truckLabel = loc?.name || trk?.plateNumber || 'Food Truck';
+    const alertInfo = getMaintenanceAlertInfo(
+      {
+        next_due_date: fl.nextDueDate || null,
+        maintenance_status: fl.maintenanceStatus === 'COMPLETED' ? 'COMPLETED' : 'OPEN',
+        alert_lead_days: Number.isFinite(Number(fl.alertLeadDays)) ? Number(fl.alertLeadDays) : 7,
+      },
+      todayIso,
+    );
+
+    if (alertInfo.state === 'OVERDUE' || alertInfo.state === 'DUE_SOON') {
+      const notifTitle =
+        alertInfo.state === 'OVERDUE'
+          ? `Overdue Truck Checkup: ${titleText}`
+          : `Upcoming Truck Checkup: ${titleText}`;
+      const notifMsg = `${truckLabel}${trk?.plateNumber ? ` (${trk.plateNumber})` : ''} — due ${String(fl.nextDueDate).slice(0, 10)} (${alertInfo.countdownText}).`;
+      const created = await addNotificationIfMissing(
+        snap,
+        'FLEET_MAINTENANCE',
+        alertInfo.state === 'OVERDUE' ? 'CRITICAL' : 'WARNING',
+        notifTitle.slice(0, 160),
+        notifMsg.slice(0, 500),
+        trk?.locationId || null,
+        { onlyIfNeverNotified: false },
+      );
+      if (created) createdCount++;
+    } else if (titleText) {
+      resolvedCount += await resolveMatchingNotifications(
+        snap,
+        ['FLEET_MAINTENANCE'],
+        titleText,
+        trk?.locationId || null,
+      );
+    }
+  }
+
+  return { createdCount, resolvedCount };
 }
 
 function getProductCostingList(snap: WorkspaceSnapshot) {
@@ -1630,6 +2191,11 @@ async function receiveStockFirestore(
   item.weightedAvgCost = round4(newWac);
   snap.inventoryTxns.push({ ...txnObj, createdAt: nowIso });
 
+  const postQty = snap.stockBatches
+    .filter((b) => b.inventoryItemId === itemDocId && b.locationId === locDocId)
+    .reduce((s, b) => s + Number(b.remainingQty || 0), 0);
+  await syncItemThresholdAlertsFirestore(snap, item, locDocId, postQty, { onlyIfNeverNotified: false });
+
   return { batchId, totalCost };
 }
 
@@ -1746,17 +2312,7 @@ async function deductStockFirestore(
     .filter((b) => b.inventoryItemId === itemDocId && b.locationId === locDocId)
     .reduce((s, b) => s + Number(b.remainingQty || 0), 0);
 
-  if (postQty <= Number(item.reorderPoint || 0)) {
-    const locName = snap.locations.find((l) => l.id === locDocId)?.name || 'Location';
-    await addNotificationIfMissing(
-      snap,
-      'LOW_STOCK',
-      'WARNING',
-      `Low Stock: ${item.name}`,
-      `${locName} has ${round2(postQty)} ${item.uomCode || ''} remaining (at or below reorder point of ${item.reorderPoint}).`.replace(/\s+/g, ' '),
-      locDocId,
-    );
-  }
+  await syncItemThresholdAlertsFirestore(snap, item, locDocId, postQty, { onlyIfNeverNotified: false });
 
   return { totalCogs: round2(totalCogs), consumedBatches };
 }
@@ -2464,6 +3020,41 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     } as T;
   }
 
+  if (pathname === '/terminal/device-check' && method === 'POST') {
+    const hardwareUuid = String(body?.hardwareUuid || '').trim();
+    const userAgentSummary = body?.userAgentSummary ? String(body.userAgentSummary).trim().slice(0, 160) : null;
+    if (!/^[a-zA-Z0-9_-]{8,128}$/.test(hardwareUuid)) {
+      return { registered: false, status: 'UNREGISTERED' } as T;
+    }
+    const existing = snap.terminalDevices.find((d) => String(d.hardwareUuid || '').trim() === hardwareUuid);
+    if (!existing) {
+      return { registered: false, status: 'UNREGISTERED' } as T;
+    }
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    if (existing.status === 'AUTHORIZED') {
+      const nowIso = new Date().toISOString();
+      const lastSeenMs = existing.lastSeenAt ? new Date(existing.lastSeenAt).getTime() : 0;
+      if (!Number.isFinite(lastSeenMs) || Date.now() - lastSeenMs > 60_000) {
+        try {
+          await updateDoc(doc(db, 'terminal_devices', existing.id), {
+            lastSeenAt: nowIso,
+            ...(userAgentSummary ? { userAgentSummary } : {}),
+            updatedAt: serverTimestamp(),
+          });
+          existing.lastSeenAt = nowIso;
+          if (userAgentSummary) existing.userAgentSummary = userAgentSummary;
+        } catch {
+          // non-fatal heartbeat update
+        }
+      }
+    }
+    return {
+      registered: true,
+      status: existing.status === 'REVOKED' ? 'REVOKED' : 'AUTHORIZED',
+      device: mapTerminalDevice(existing, uid, locMap),
+    } as T;
+  }
+
   const user = resolveCurrentErpUser(snap);
 
   if (pathname === '/auth/me' && method === 'GET') {
@@ -2515,8 +3106,8 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         }
       }
 
-      if (n.type === 'LOW_STOCK') {
-        const match = String(n.title || '').match(/^Low Stock:\s*(.+)$/i);
+      if (n.type === 'LOW_STOCK' || n.type === 'SAFETY_STOCK') {
+        const match = String(n.title || '').match(/^(?:Low Stock|Safety Stock Breach):\s*(.+?)(?:\s*\([^)]+\))?$/i);
         const itemName = match?.[1]?.trim().toLowerCase();
         const item = itemName
           ? snap.inventoryItems.find((it) => String(it.name || '').trim().toLowerCase() === itemName)
@@ -2531,7 +3122,12 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
             const locQty = snap.stockBatches
               .filter((b) => b.inventoryItemId === item.id && b.locationId === l.id)
               .reduce((s, b) => s + Number(b.remainingQty || 0), 0);
-            return locQty <= Number(item.reorderPoint || 0);
+            const ev = evaluateIngredientThreshold({
+              onHandQty: locQty,
+              safetyStock: Number(item.minStockLevel || 0),
+              reorderPoint: Number(item.reorderPoint || 0),
+            });
+            return ev.status !== 'NOMINAL';
           });
           if (lowLocs.length === 1) return lowLocs[0].id;
         }
@@ -2576,6 +3172,238 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `notifications/${docId}`);
     }
+    return { ok: true } as T;
+  }
+
+  // 1B. DAILY HUDDLE OPERATIONAL BRIEFINGS (MANAGER BROADCAST -> POS / KDS / MOBILE)
+  if (pathname === '/huddles' && method === 'GET') {
+    const rows = sortDailyHuddles(snap.dailyHuddles.map((h) => toDailyHuddleItem(h, uid)));
+    return rows as T;
+  }
+
+  if (pathname === '/huddles' && method === 'POST') {
+    if (!canBroadcastDailyHuddle(user)) {
+      throw new Error('Only managers or administrators can broadcast Daily Huddle briefings');
+    }
+    const cleanTitle = String(body.title || '').trim().slice(0, 140);
+    const cleanMessage = String(body.message || '').trim().slice(0, 800);
+    if (!cleanTitle) throw new Error('Briefing title is required');
+    if (!cleanMessage) throw new Error('Briefing message is required');
+
+    const rawPriority = String(body.priority || 'NORMAL').toUpperCase();
+    const priority: HuddlePriority =
+      rawPriority === 'CRITICAL' ? 'CRITICAL' : rawPriority === 'URGENT' ? 'URGENT' : 'NORMAL';
+
+    const rawShift = String(body.shiftWindow || 'ALL_DAY').toUpperCase();
+    const shiftWindow: HuddleShiftWindow =
+      rawShift === 'OPENING' || rawShift === 'MID_DAY' || rawShift === 'CLOSING' ? rawShift : 'ALL_DAY';
+
+    const reqChannels: unknown[] = Array.isArray(body.targetChannels) ? body.targetChannels : ALL_HUDDLE_CHANNELS;
+    const validChannels: HuddleChannel[] = Array.from(
+      new Set<HuddleChannel>(
+        reqChannels
+          .map((c: unknown) => String(c || '').toUpperCase())
+          .filter((c: string): c is HuddleChannel => c === 'POS' || c === 'KDS' || c === 'MOBILE'),
+      ),
+    ).slice(0, 3);
+    const targetChannels: HuddleChannel[] = validChannels.length > 0 ? validChannels : [...ALL_HUDDLE_CHANNELS];
+
+    const rawLocId = String(body.locationId || '').trim();
+    const targetLocDocId = rawLocId && rawLocId !== 'ALL' ? toDocId(rawLocId, uid) : null;
+    const targetLoc = targetLocDocId ? snap.locations.find((l) => l.id === targetLocDocId) : null;
+    const locationName = targetLoc ? String(targetLoc.name).slice(0, 140) : null;
+
+    const ttlHoursRaw = Number(body.ttlHours ?? 18);
+    const expiresAt =
+      Number.isFinite(ttlHoursRaw) && ttlHoursRaw > 0
+        ? new Date(Date.now() + Math.min(168, Math.max(1, ttlHoursRaw)) * 3600000).toISOString()
+        : null;
+
+    const logicalId = crypto.randomUUID();
+    const docId = toDocId(logicalId, uid);
+    const safeAuthorId = String(user.id || 'usr_manager').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128) || 'usr_manager';
+
+    const docObj = {
+      id: docId,
+      ownerUid: uid,
+      title: cleanTitle,
+      message: cleanMessage,
+      priority,
+      targetChannels,
+      locationId: targetLoc ? targetLoc.id : null,
+      locationName,
+      shiftWindow,
+      authorId: safeAuthorId,
+      authorName: String(user.fullName || 'Manager').trim().slice(0, 150) || 'Manager',
+      authorRole: String(user.roleName || user.roleCode || 'Manager').trim().slice(0, 80) || 'Manager',
+      acknowledgedBy: [safeAuthorId],
+      isPinned: body.isPinned !== false,
+      isActive: true,
+      expiresAt,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    };
+
+    try {
+      await setDoc(doc(db, 'daily_huddles', docId), docObj);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `daily_huddles/${docId}`);
+    }
+
+    if (priority === 'CRITICAL') {
+      await addNotificationIfMissing(
+        snap,
+        'DAILY_HUDDLE',
+        'CRITICAL',
+        `Daily Huddle: ${cleanTitle}`,
+        cleanMessage.slice(0, 480),
+        targetLoc ? targetLoc.id : null,
+        { onlyIfNeverNotified: true },
+      );
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'BROADCAST_DAILY_HUDDLE', 'DailyHuddle', logicalId, {
+      title: cleanTitle,
+      priority,
+      channels: targetChannels.join(','),
+      location: locationName || 'All Locations',
+    });
+    invalidateWorkspaceCache();
+    return toDailyHuddleItem(
+      { ...docObj, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+      uid,
+    ) as T;
+  }
+
+  if (pathname.startsWith('/huddles/') && pathname.endsWith('/acknowledge') && method === 'POST') {
+    const logicalId = pathname.split('/')[2];
+    const docId = toDocId(logicalId, uid);
+    const existing = snap.dailyHuddles.find((h) => h.id === docId);
+    if (!existing) throw new Error('Daily Huddle briefing not found');
+    const safeActorId = String(user.id || 'usr_staff').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128) || 'usr_staff';
+    const currentAck = Array.isArray(existing.acknowledgedBy) ? existing.acknowledgedBy.map((x: unknown) => String(x)) : [];
+    if (!currentAck.includes(safeActorId)) {
+      const nextAck = [...currentAck, safeActorId].slice(0, 100);
+      try {
+        await updateDoc(doc(db, 'daily_huddles', docId), {
+          acknowledgedBy: nextAck,
+          updatedAt: serverTimestamp(),
+        });
+        existing.acknowledgedBy = nextAck;
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `daily_huddles/${docId}`);
+      }
+    }
+    invalidateWorkspaceCache();
+    return { ok: true, acknowledgedBy: existing.acknowledgedBy || [safeActorId] } as T;
+  }
+
+  if (pathname.startsWith('/huddles/') && method === 'PATCH') {
+    if (!canBroadcastDailyHuddle(user)) {
+      throw new Error('Only managers or administrators can update Daily Huddle briefings');
+    }
+    const logicalId = pathname.split('/')[2];
+    const docId = toDocId(logicalId, uid);
+    const existing = snap.dailyHuddles.find((h) => h.id === docId);
+    if (!existing) throw new Error('Daily Huddle briefing not found');
+
+    const cleanTitle =
+      body.title !== undefined ? String(body.title || '').trim().slice(0, 140) : String(existing.title || '');
+    const cleanMessage =
+      body.message !== undefined ? String(body.message || '').trim().slice(0, 800) : String(existing.message || '');
+    if (!cleanTitle) throw new Error('Briefing title is required');
+    if (!cleanMessage) throw new Error('Briefing message is required');
+
+    const rawPriority = String(body.priority ?? existing.priority ?? 'NORMAL').toUpperCase();
+    const priority: HuddlePriority =
+      rawPriority === 'CRITICAL' ? 'CRITICAL' : rawPriority === 'URGENT' ? 'URGENT' : 'NORMAL';
+
+    const rawShift = String(body.shiftWindow ?? existing.shiftWindow ?? 'ALL_DAY').toUpperCase();
+    const shiftWindow: HuddleShiftWindow =
+      rawShift === 'OPENING' || rawShift === 'MID_DAY' || rawShift === 'CLOSING' ? rawShift : 'ALL_DAY';
+
+    let targetChannels: HuddleChannel[] = Array.isArray(existing.targetChannels)
+      ? existing.targetChannels
+      : [...ALL_HUDDLE_CHANNELS];
+    if (Array.isArray(body.targetChannels)) {
+      const nextCh: HuddleChannel[] = Array.from(
+        new Set<HuddleChannel>(
+          (body.targetChannels as unknown[])
+            .map((c: unknown) => String(c || '').toUpperCase())
+            .filter((c: string): c is HuddleChannel => c === 'POS' || c === 'KDS' || c === 'MOBILE'),
+        ),
+      ).slice(0, 3);
+      if (nextCh.length > 0) targetChannels = nextCh;
+    }
+
+    let locationId = existing.locationId ?? null;
+    let locationName = existing.locationName ?? null;
+    if (body.locationId !== undefined) {
+      const rawLoc = String(body.locationId || '').trim();
+      if (!rawLoc || rawLoc === 'ALL') {
+        locationId = null;
+        locationName = null;
+      } else {
+        const locDocId = toDocId(rawLoc, uid);
+        const loc = snap.locations.find((l) => l.id === locDocId);
+        locationId = loc ? loc.id : null;
+        locationName = loc ? String(loc.name).slice(0, 140) : null;
+      }
+    }
+
+    const isPinned = body.isPinned !== undefined ? Boolean(body.isPinned) : Boolean(existing.isPinned);
+    const isActive = body.isActive !== undefined ? Boolean(body.isActive) : Boolean(existing.isActive);
+    const expiresAt =
+      body.ttlHours !== undefined
+        ? Number(body.ttlHours) > 0
+          ? new Date(Date.now() + Math.min(168, Math.max(1, Number(body.ttlHours))) * 3600000).toISOString()
+          : null
+        : existing.expiresAt ?? null;
+
+    try {
+      await updateDoc(doc(db, 'daily_huddles', docId), {
+        title: cleanTitle,
+        message: cleanMessage,
+        priority,
+        targetChannels,
+        locationId,
+        locationName,
+        shiftWindow,
+        isPinned,
+        isActive,
+        expiresAt,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `daily_huddles/${docId}`);
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_DAILY_HUDDLE', 'DailyHuddle', logicalId, {
+      title: cleanTitle,
+      isActive,
+      isPinned,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if (pathname.startsWith('/huddles/') && method === 'DELETE') {
+    if (!canBroadcastDailyHuddle(user)) {
+      throw new Error('Only managers or administrators can delete Daily Huddle briefings');
+    }
+    const logicalId = pathname.split('/')[2];
+    const docId = toDocId(logicalId, uid);
+    const existing = snap.dailyHuddles.find((h) => h.id === docId);
+    if (!existing) throw new Error('Daily Huddle briefing not found');
+    try {
+      await deleteDoc(doc(db, 'daily_huddles', docId));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `daily_huddles/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'DELETE_DAILY_HUDDLE', 'DailyHuddle', logicalId, {
+      title: existing.title,
+    });
+    invalidateWorkspaceCache();
     return { ok: true } as T;
   }
 
@@ -2697,8 +3525,130 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         location_name: locMap.get(b.locationId)?.name || '',
       }));
 
+    const toIso = (val: any) => {
+      if (!val) return '';
+      if (typeof val === 'string') return val;
+      if (typeof val?.toDate === 'function') return val.toDate().toISOString();
+      return '';
+    };
+
+    const nowDate = new Date();
+    const fallbackTodayStart = new Date(nowDate);
+    fallbackTodayStart.setUTCHours(0, 0, 0, 0);
+    const todayFrom = qs.get('todayFrom') || fallbackTodayStart.toISOString();
+    const todayTo = qs.get('todayTo') || nowDate.toISOString();
+    const yesterdayFrom = qs.get('yesterdayFrom') || new Date(new Date(todayFrom).getTime() - 86400000).toISOString();
+    const yesterdayTo = qs.get('yesterdayTo') || new Date(new Date(todayFrom).getTime() - 1).toISOString();
+
+    const calcPctChange = (current: number, previous: number) => {
+      if (previous > 0) return round2(((current - previous) / previous) * 100);
+      if (current > 0) return 100;
+      return 0;
+    };
+
+    const todayCompletedSales = snap.sales.filter(
+      (s) => s.status === 'COMPLETED' && s.soldAt >= todayFrom && s.soldAt <= todayTo && (!locFilter || s.locationId === locFilter),
+    );
+    const yesterdayCompletedSales = snap.sales.filter(
+      (s) => s.status === 'COMPLETED' && s.soldAt >= yesterdayFrom && s.soldAt <= yesterdayTo && (!locFilter || s.locationId === locFilter),
+    );
+    const todayRevenue = round2(todayCompletedSales.reduce((s, r) => s + Number(r.totalAmount || 0), 0));
+    const yesterdayRevenue = round2(yesterdayCompletedSales.reduce((s, r) => s + Number(r.totalAmount || 0), 0));
+
+    const pendingKdsSales = snap.sales.filter(
+      (s) => s.status === 'COMPLETED' && s.kdsStatus !== 'COMPLETED' && (!locFilter || s.locationId === locFilter),
+    );
+    const yesterdayPendingKdsCount = snap.sales.filter(
+      (s) =>
+        s.status === 'COMPLETED' &&
+        s.kdsStatus !== 'COMPLETED' &&
+        s.soldAt >= yesterdayFrom &&
+        s.soldAt <= yesterdayTo &&
+        (!locFilter || s.locationId === locFilter),
+    ).length;
+
+    const empMapById = new Map(snap.employees.map((e) => [e.id, e]));
+    const activeEmployeesCount = snap.employees.filter(
+      (e) => e.isActive !== false && (!locFilter || e.locationId === locFilter),
+    ).length;
+
+    const todayDateA = todayFrom.slice(0, 10);
+    const todayDateB = todayTo.slice(0, 10);
+    const yestDateA = yesterdayFrom.slice(0, 10);
+    const yestDateB = yesterdayTo.slice(0, 10);
+
+    const todayAttLogs = snap.attendanceLogs.filter((a) => {
+      const emp = empMapById.get(a.employeeId);
+      const effLoc = a.locationId || emp?.locationId || '';
+      if (locFilter && effLoc !== locFilter) return false;
+      const cin = String(a.clockIn || '');
+      const cinDay = cin.slice(0, 10);
+      return (cin >= todayFrom && cin <= todayTo) || cinDay === todayDateA || cinDay === todayDateB;
+    });
+    const clockedInToday = new Set(todayAttLogs.map((a) => a.employeeId)).size;
+    const onShiftCount = new Set(todayAttLogs.filter((a) => !a.clockOut).map((a) => a.employeeId)).size;
+
+    const yesterdayAttLogs = snap.attendanceLogs.filter((a) => {
+      const emp = empMapById.get(a.employeeId);
+      const effLoc = a.locationId || emp?.locationId || '';
+      if (locFilter && effLoc !== locFilter) return false;
+      const cin = String(a.clockIn || '');
+      const cinDay = cin.slice(0, 10);
+      return (cin >= yesterdayFrom && cin <= yesterdayTo) || cinDay === yestDateA || cinDay === yestDateB;
+    });
+    const clockedInYesterday = new Set(yesterdayAttLogs.map((a) => a.employeeId)).size;
+
+    const todayDeltaByLogicalId = new Map<string, number>();
+    for (const t of snap.inventoryTxns) {
+      if (locFilter && t.locationId !== locFilter) continue;
+      const tDate = String(t.txnDate || toIso(t.createdAt) || '');
+      if (tDate >= todayFrom && tDate <= todayTo) {
+        const lid = toLogicalId(t.inventoryItemId, uid);
+        todayDeltaByLogicalId.set(lid, (todayDeltaByLogicalId.get(lid) || 0) + Number(t.quantityDelta || 0));
+      }
+    }
+    const yesterdayAlertCount = invRows.filter((r) => {
+      const prevQty = Number(r.current_qty || 0) - (todayDeltaByLogicalId.get(r.id) || 0);
+      return prevQty <= Number(r.reorder_point || 0);
+    }).length;
+    const currentAlertCount = lowStockItems.length;
+
     return {
       kpis: { totalSales, grossProfit, netProfit, totalExpenses, txnCount: completedSales.length, avgTicket, inventoryValuation, pendingPOs },
+      summaryCards: {
+        totalRevenueToday: {
+          value: todayRevenue,
+          previousValue: yesterdayRevenue,
+          pctChange: calcPctChange(todayRevenue, yesterdayRevenue),
+          ordersToday: todayCompletedSales.length,
+          comparisonLabel: 'vs yesterday',
+        },
+        pendingOrders: {
+          value: pendingKdsSales.length,
+          previousValue: yesterdayPendingKdsCount,
+          pctChange: calcPctChange(pendingKdsSales.length, yesterdayPendingKdsCount),
+          newCount: pendingKdsSales.filter((s) => s.kdsStatus === 'PENDING').length,
+          preparingCount: pendingKdsSales.filter((s) => s.kdsStatus === 'PREPARING').length,
+          readyCount: pendingKdsSales.filter((s) => s.kdsStatus === 'READY').length,
+          pendingPOs,
+          comparisonLabel: 'vs yesterday',
+        },
+        activeEmployees: {
+          value: activeEmployeesCount,
+          onShiftCount,
+          clockedInToday,
+          previousValue: clockedInYesterday,
+          pctChange: calcPctChange(clockedInToday, clockedInYesterday),
+          comparisonLabel: 'shift vs yesterday',
+        },
+        inventoryReorderAlerts: {
+          value: currentAlertCount,
+          previousValue: yesterdayAlertCount,
+          pctChange: calcPctChange(currentAlertCount, yesterdayAlertCount),
+          criticalOutCount: lowStockItems.filter((r) => Number(r.current_qty || 0) <= 0).length,
+          comparisonLabel: 'vs yesterday',
+        },
+      },
       lowStockItems,
       expiringBatches,
       salesByPayment,
@@ -2878,6 +3828,85 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         is_inclusive: t.isInclusive ? 1 : 0,
         is_active: t.isActive ? 1 : 0,
       })),
+    } as T;
+  }
+
+  if (pathname === '/products/menu-engineering' && method === 'GET') {
+    assertPerm(user, PERMISSIONS.PRODUCT_MANAGE);
+    const rawDays = (qs.get('days') || '30').trim().toLowerCase();
+    const rawLoc = (qs.get('locationId') || 'ALL').trim();
+    const rawCat = (qs.get('categoryId') || 'ALL').trim();
+    const locFilter = rawLoc && rawLoc !== 'ALL' ? toDocId(rawLoc, uid) : '';
+    const catFilter = rawCat && rawCat !== 'ALL' ? rawCat : '';
+
+    let cutoffIso = '';
+    if (rawDays !== 'all') {
+      const daysNum = Math.min(365, Math.max(1, Math.round(Number(rawDays) || 30)));
+      cutoffIso = new Date(Date.now() - daysNum * 24 * 60 * 60 * 1000).toISOString();
+    }
+
+    const salesByProduct = new Map<string, { unitsSold: number; realizedRevenue: number; realizedCogs: number }>();
+    const matchingSales = snap.sales.filter(
+      (s) =>
+        s.status === 'COMPLETED' &&
+        (!locFilter || s.locationId === locFilter) &&
+        (!cutoffIso || String(s.soldAt || '') >= cutoffIso),
+    );
+
+    for (const sale of matchingSales) {
+      for (const line of sale.items || []) {
+        const logicalProdId = toLogicalId(String(line.productId || ''), uid);
+        if (!logicalProdId) continue;
+        const prev = salesByProduct.get(logicalProdId) || { unitsSold: 0, realizedRevenue: 0, realizedCogs: 0 };
+        prev.unitsSold += Number(line.quantity || 0);
+        prev.realizedRevenue += Number(line.lineTotal || 0);
+        prev.realizedCogs += Number(line.cogsAmount || 0);
+        salesByProduct.set(logicalProdId, prev);
+      }
+    }
+
+    const costingProducts = getProductCostingList(snap).filter((p) => {
+      if (!catFilter) return true;
+      return p.category_id === catFilter || toDocId(p.category_id, uid) === toDocId(catFilter, uid);
+    });
+
+    const report = analyzeMenuEngineering(
+      costingProducts.map((p) => {
+        const agg = salesByProduct.get(p.id) || { unitsSold: 0, realizedRevenue: 0, realizedCogs: 0 };
+        return {
+          productId: p.id,
+          sku: p.sku,
+          name: p.name,
+          imageUrl: p.image_url,
+          categoryId: p.category_id,
+          categoryName: p.category_name,
+          isAvailable: p.is_available === 1,
+          sellingPrice: Number(p.base_price || 0),
+          ingredientCost: Number(p.costing.ingredientCost || 0),
+          packagingCost: Number(p.costing.packagingCost || 0),
+          directLaborCost: Number(p.costing.directLaborCost || 0),
+          unitDirectCost: Number(p.costing.directCost || 0),
+          targetFoodCostPct: Number(p.target_food_cost_pct || 35),
+          unitsSold: agg.unitsSold,
+          realizedRevenue: round2(agg.realizedRevenue),
+          realizedCogs: round2(agg.realizedCogs),
+        };
+      }),
+    );
+
+    const categories = [...snap.categories]
+      .sort((a, b) => a.sortOrder - b.sortOrder || String(a.name).localeCompare(String(b.name)))
+      .map((c) => ({ id: toLogicalId(c.id, uid), name: c.name }));
+
+    return {
+      ...report,
+      categories,
+      filters: {
+        days: rawDays,
+        locationId: rawLoc || 'ALL',
+        categoryId: rawCat || 'ALL',
+        ordersAnalyzed: matchingSales.length,
+      },
     } as T;
   }
 
@@ -3159,6 +4188,11 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         const relBatches = snap.stockBatches.filter((b) => b.inventoryItemId === i.id && (!locFilter || b.locationId === locFilter));
         const onHandQty = round2(relBatches.reduce((s, b) => s + Number(b.remainingQty || 0), 0));
         const stockValue = round2(relBatches.reduce((s, b) => s + Number(b.remainingQty || 0) * Number(b.unitCost || 0), 0));
+        const evalRes = evaluateIngredientThreshold({
+          onHandQty,
+          safetyStock: Number(i.minStockLevel || 0),
+          reorderPoint: Number(i.reorderPoint || 0),
+        });
         return {
           id: toLogicalId(i.id, uid),
           sku: i.sku,
@@ -3168,11 +4202,14 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
           uom_code: i.uomCode,
           costing_method: i.costingMethod,
           min_stock_level: i.minStockLevel,
+          safety_stock_level: i.minStockLevel,
           reorder_point: i.reorderPoint,
           last_unit_cost: i.lastUnitCost,
           weighted_avg_cost: i.weightedAvgCost,
           on_hand_qty: onHandQty,
           stock_value: stockValue,
+          threshold_status: evalRes.status,
+          safety_deficit: evalRes.status === 'BELOW_SAFETY' ? evalRes.deficitQty : 0,
         };
       });
 
@@ -3216,7 +4253,483 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         location_name: locMap.get(t.locationId)?.name || '',
       }));
 
-    return { items, batches, movements, uoms: snap.meta?.uoms || [] } as T;
+    const belowSafetyItems = items.filter((i) => i.threshold_status === 'BELOW_SAFETY');
+    const belowReorderItems = items.filter((i) => i.threshold_status === 'BELOW_REORDER');
+    const rawBelowSafetyItems = belowSafetyItems.filter((i) => i.item_type === 'RAW_MATERIAL');
+
+    return {
+      items,
+      batches,
+      movements,
+      uoms: snap.meta?.uoms || [],
+      alertsSummary: {
+        belowSafetyCount: belowSafetyItems.length,
+        belowReorderCount: belowReorderItems.length,
+        rawBelowSafetyCount: rawBelowSafetyItems.length,
+        rawItemsBelowSafety: rawBelowSafetyItems.map((i) => ({
+          id: i.id,
+          sku: i.sku,
+          name: i.name,
+          onHandQty: i.on_hand_qty,
+          safetyStock: i.safety_stock_level,
+          deficitQty: i.safety_deficit,
+          uomCode: i.uom_code,
+        })),
+      },
+    } as T;
+  }
+
+  if (pathname === '/inventory/alerts/scan' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.INVENTORY_VIEW);
+    const rawLoc = String(body?.locationId || '').trim();
+    const locFilterDocId = rawLoc && rawLoc !== 'ALL' ? toDocId(rawLoc, uid) : '';
+    const onlyIfNeverNotified = Boolean(body?.onlyIfNeverNotified);
+    const rawOnly = body?.rawOnly !== false;
+
+    const candidateItems = snap.inventoryItems.filter(
+      (i) => (!rawOnly || i.itemType === 'RAW_MATERIAL') && (Number(i.minStockLevel || 0) > 0 || Number(i.reorderPoint || 0) > 0),
+    );
+    const activeLocs = snap.locations.filter((l) => l.isActive !== false);
+
+    let scannedCount = 0;
+    let belowSafetyCount = 0;
+    let belowReorderCount = 0;
+    let createdCount = 0;
+    let resolvedCount = 0;
+    const alerts: any[] = [];
+
+    for (const item of candidateItems) {
+      if (locFilterDocId) {
+        scannedCount++;
+        const locQty = round2(
+          snap.stockBatches
+            .filter((b) => b.inventoryItemId === item.id && b.locationId === locFilterDocId)
+            .reduce((s, b) => s + Number(b.remainingQty || 0), 0),
+        );
+        const res = await syncItemThresholdAlertsFirestore(snap, item, locFilterDocId, locQty, { onlyIfNeverNotified });
+        createdCount += res.createdCount;
+        resolvedCount += res.resolvedCount;
+        if (res.status === 'BELOW_SAFETY') {
+          belowSafetyCount++;
+          alerts.push({
+            inventoryItemId: toLogicalId(item.id, uid),
+            sku: item.sku,
+            name: item.name,
+            itemType: item.itemType,
+            locationId: toLogicalId(locFilterDocId, uid),
+            locationName: activeLocs.find((l) => l.id === locFilterDocId)?.name || 'Location',
+            onHandQty: locQty,
+            safetyStock: Number(item.minStockLevel || 0),
+            reorderPoint: Number(item.reorderPoint || 0),
+            uomCode: item.uomCode,
+            status: res.status,
+          });
+        } else if (res.status === 'BELOW_REORDER') {
+          belowReorderCount++;
+        }
+      } else {
+        // Check network-wide aggregate AND each location where this raw ingredient has active/historical presence
+        const stockedLocIds = activeLocs
+          .filter(
+            (l) =>
+              snap.stockBatches.some((b) => b.inventoryItemId === item.id && b.locationId === l.id) ||
+              snap.inventoryTxns.some((t) => t.inventoryItemId === item.id && t.locationId === l.id),
+          )
+          .map((l) => l.id);
+
+        if (stockedLocIds.length === 0) {
+          scannedCount++;
+          const res = await syncItemThresholdAlertsFirestore(snap, item, null, 0, { onlyIfNeverNotified });
+          createdCount += res.createdCount;
+          resolvedCount += res.resolvedCount;
+          if (res.status === 'BELOW_SAFETY') {
+            belowSafetyCount++;
+            alerts.push({
+              inventoryItemId: toLogicalId(item.id, uid),
+              sku: item.sku,
+              name: item.name,
+              itemType: item.itemType,
+              locationId: null,
+              locationName: 'All Locations',
+              onHandQty: 0,
+              safetyStock: Number(item.minStockLevel || 0),
+              reorderPoint: Number(item.reorderPoint || 0),
+              uomCode: item.uomCode,
+              status: res.status,
+            });
+          } else if (res.status === 'BELOW_REORDER') {
+            belowReorderCount++;
+          }
+        } else {
+          for (const lid of stockedLocIds) {
+            scannedCount++;
+            const locQty = round2(
+              snap.stockBatches
+                .filter((b) => b.inventoryItemId === item.id && b.locationId === lid)
+                .reduce((s, b) => s + Number(b.remainingQty || 0), 0),
+            );
+            const res = await syncItemThresholdAlertsFirestore(snap, item, lid, locQty, { onlyIfNeverNotified });
+            createdCount += res.createdCount;
+            resolvedCount += res.resolvedCount;
+            if (res.status === 'BELOW_SAFETY') {
+              belowSafetyCount++;
+              alerts.push({
+                inventoryItemId: toLogicalId(item.id, uid),
+                sku: item.sku,
+                name: item.name,
+                itemType: item.itemType,
+                locationId: toLogicalId(lid, uid),
+                locationName: activeLocs.find((l) => l.id === lid)?.name || 'Location',
+                onHandQty: locQty,
+                safetyStock: Number(item.minStockLevel || 0),
+                reorderPoint: Number(item.reorderPoint || 0),
+                uomCode: item.uomCode,
+                status: res.status,
+              });
+            } else if (res.status === 'BELOW_REORDER') {
+              belowReorderCount++;
+            }
+          }
+        }
+      }
+    }
+
+    if (createdCount > 0 || resolvedCount > 0) {
+      invalidateWorkspaceCache();
+    }
+    return {
+      scannedCount,
+      belowSafetyCount,
+      belowReorderCount,
+      createdCount,
+      resolvedCount,
+      alerts,
+    } as T;
+  }
+
+  if (pathname === '/inventory/predictive-procurement' && method === 'GET') {
+    assertPerm(user, PERMISSIONS.INVENTORY_VIEW);
+    const rawLoc = qs.get('locationId') || '';
+    const locFilterDocId = rawLoc && rawLoc !== 'ALL' ? toDocId(rawLoc, uid) : '';
+    const lookbackDays = Math.min(180, Math.max(30, Math.round(Number(qs.get('lookbackDays') || 90) || 90)));
+    const coverageDays = Math.min(45, Math.max(3, Math.round(Number(qs.get('coverageDays') || 14) || 14)));
+
+    const items = snap.inventoryItems.map((i) => ({
+      id: toLogicalId(i.id, uid),
+      sku: String(i.sku || ''),
+      name: String(i.name || ''),
+      itemType: String(i.itemType || 'RAW_MATERIAL'),
+      uomCode: String(i.uomCode || 'pcs'),
+      safetyStock: Number(i.minStockLevel || 0),
+      reorderPoint: Number(i.reorderPoint || 0),
+      lastUnitCost: Number(i.lastUnitCost || 0),
+    }));
+
+    const onHandByItem = new Map<string, number>();
+    for (const b of snap.stockBatches) {
+      if (locFilterDocId && b.locationId !== locFilterDocId) continue;
+      const qty = Number(b.remainingQty || 0);
+      if (qty <= 0) continue;
+      const lid = toLogicalId(b.inventoryItemId, uid);
+      onHandByItem.set(lid, (onHandByItem.get(lid) || 0) + qty);
+    }
+
+    const openStatuses = new Set([
+      'DRAFT',
+      'PENDING_APPROVAL',
+      'PENDING_MANAGER_SIGNATURE',
+      'APPROVED',
+      'PARTIAL',
+      'PARTIALLY_RECEIVED',
+    ]);
+    const openPoByItem = new Map<string, number>();
+    for (const po of snap.purchaseOrders) {
+      if (!openStatuses.has(String(po.status || '').toUpperCase())) continue;
+      if (locFilterDocId && po.locationId !== locFilterDocId) continue;
+      for (const pi of po.items || []) {
+        const pendingQty = Math.max(0, Number(pi.orderedQty || 0) - Number(pi.receivedQty || 0));
+        if (pendingQty <= 0) continue;
+        const lid = toLogicalId(pi.inventoryItemId, uid);
+        openPoByItem.set(lid, (openPoByItem.get(lid) || 0) + pendingQty);
+      }
+    }
+
+    const txns = snap.inventoryTxns.map((t) => ({
+      inventoryItemId: toLogicalId(t.inventoryItemId, uid),
+      locationId: toLogicalId(t.locationId, uid),
+      txnType: String(t.txnType || ''),
+      quantityDelta: Number(t.quantityDelta || 0),
+      referenceType: t.referenceType || null,
+      referenceId: t.referenceId ? toLogicalId(String(t.referenceId), uid) : null,
+      txnDate: String(t.txnDate || tsToIso(t.createdAt)),
+    }));
+
+    const prodMap = new Map(snap.products.map((p) => [p.id, p]));
+    const itemDocMap = new Map(snap.inventoryItems.map((i) => [i.id, i]));
+    const salesBomUsages: Array<{
+      saleId: string;
+      locationId: string;
+      inventoryItemId: string;
+      quantity: number;
+      soldAt: string;
+    }> = [];
+
+    for (const s of snap.sales) {
+      if (s.status !== 'COMPLETED') continue;
+      if (locFilterDocId && s.locationId !== locFilterDocId) continue;
+      const logicalSaleId = toLogicalId(s.id, uid);
+      const logicalLocId = toLogicalId(s.locationId, uid);
+      const soldAt = String(s.soldAt || tsToIso(s.createdAt));
+
+      for (const ci of s.items || []) {
+        const prod = prodMap.get(ci.productId) || prodMap.get(toDocId(String(ci.productId || ''), uid));
+        if (!prod) continue;
+        const variant = ci.variantId ? (prod.variants || []).find((v: any) => v.id === ci.variantId) : null;
+        const mult = Number(variant?.portionMultiplier || 1);
+        const yieldQty = Number(prod.recipeYieldQty || 1);
+
+        for (const ing of prod.ingredients || []) {
+          const invItem = itemDocMap.get(ing.inventoryItemId) || itemDocMap.get(toDocId(String(ing.inventoryItemId || ''), uid));
+          if (!invItem) continue;
+          try {
+            const rawQty =
+              ((Number(ing.quantity) * (1 + Number(ing.wasteFactorPct || 0) / 100)) / yieldQty) *
+              mult *
+              Number(ci.quantity || 0);
+            const baseQty = convertQty(rawQty, ing.uomId, invItem.baseUomId, snap);
+            if (baseQty > 0) {
+              salesBomUsages.push({
+                saleId: logicalSaleId,
+                locationId: logicalLocId,
+                inventoryItemId: toLogicalId(invItem.id, uid),
+                quantity: baseQty,
+                soldAt,
+              });
+            }
+          } catch {
+            // ignore conversion errors
+          }
+        }
+
+        const modIds = new Set((ci.modifiers || []).map((m: any) => m.id));
+        for (const m of (prod.modifiers || []).filter((x: any) => modIds.has(x.id))) {
+          if (!m.inventoryItemId || !(Number(m.deductQty) > 0) || !m.uomId) continue;
+          const invItem = itemDocMap.get(m.inventoryItemId) || itemDocMap.get(toDocId(String(m.inventoryItemId || ''), uid));
+          if (!invItem) continue;
+          try {
+            const baseQty = convertQty(Number(m.deductQty) * Number(ci.quantity || 0), m.uomId, invItem.baseUomId, snap);
+            if (baseQty > 0) {
+              salesBomUsages.push({
+                saleId: logicalSaleId,
+                locationId: logicalLocId,
+                inventoryItemId: toLogicalId(invItem.id, uid),
+                quantity: baseQty,
+                soldAt,
+              });
+            }
+          } catch {
+            // ignore conversion errors
+          }
+        }
+      }
+    }
+
+    const activeSuppliers = snap.suppliers
+      .filter((s) => s.isActive !== false)
+      .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    const supByDocId = new Map(activeSuppliers.map((s) => [s.id, s]));
+
+    const seedPricePairs = [
+      ['sup_1', 'ing_pork', 0.34, 1],
+      ['sup_1', 'ing_beef', 0.58, 1],
+      ['sup_3', 'ing_pork', 0.36, 2],
+      ['sup_2', 'ing_bun', 14.0, 1],
+      ['sup_2', 'ing_tortilla', 8.5, 1],
+      ['sup_3', 'ing_potato', 0.14, 1],
+      ['sup_3', 'ing_mango', 0.16, 2],
+    ] as const;
+
+    const supplierQuotesByItem = new Map<string, SupplierQuoteOption[]>();
+    for (const [sId, iId, price, lead] of seedPricePairs) {
+      const sup = supByDocId.get(toDocId(sId, uid));
+      const invItem = itemDocMap.get(toDocId(iId, uid));
+      if (!sup || !invItem) continue;
+      const logicalItemId = toLogicalId(invItem.id, uid);
+      const list = supplierQuotesByItem.get(logicalItemId) || [];
+      list.push({
+        supplierId: toLogicalId(sup.id, uid),
+        supplierName: sup.name,
+        unitPrice: price,
+        leadTimeDays: lead,
+      });
+      supplierQuotesByItem.set(logicalItemId, list);
+    }
+
+    return buildPredictiveProcurementPlan({
+      items,
+      onHandByItem,
+      openPoByItem,
+      txns,
+      salesBomUsages,
+      supplierQuotesByItem,
+      suppliers: activeSuppliers.map((s) => ({
+        id: toLogicalId(s.id, uid),
+        name: String(s.name || ''),
+        code: String(s.code || ''),
+      })),
+      locationId: locFilterDocId ? toLogicalId(locFilterDocId, uid) : 'ALL',
+      lookbackDays,
+      coverageDays,
+    }) as T;
+  }
+
+  if (pathname === '/inventory/predictive-procurement/auto-po' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.PO_CREATE);
+    const { locationId, status, notes, coverageDays, items } = body || {};
+    const rawLocId = String(locationId || '').trim();
+    if (!rawLocId || rawLocId === 'ALL') {
+      throw new Error('Select a specific delivery location (e.g., Commissary or Food Truck) before creating auto-restock POs');
+    }
+    const locDocId = toDocId(rawLocId, uid);
+    const targetLoc = snap.locations.find((l) => l.id === locDocId && l.isActive !== false);
+    if (!targetLoc) throw new Error('Selected delivery location was not found');
+
+    const requestedStatus = String(status || 'DRAFT').toUpperCase();
+    if (requestedStatus !== 'DRAFT' && requestedStatus !== 'PENDING_APPROVAL') {
+      throw new Error('Predictive auto-restock POs can only be created as DRAFT or PENDING_APPROVAL');
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new Error('Select at least one ingredient to generate purchase order(s)');
+    }
+    if (items.length > 120) {
+      throw new Error('Too many line items in a single auto-restock batch');
+    }
+
+    const activeSupByDocId = new Map(snap.suppliers.filter((s) => s.isActive !== false).map((s) => [s.id, s]));
+    const itemByDocId = new Map(snap.inventoryItems.map((i) => [i.id, i]));
+    const groupedBySup = new Map<
+      string,
+      {
+        supplierDocId: string;
+        supplierName: string;
+        leadTimeDays: number;
+        lines: Array<{ inventoryItemId: string; orderedQty: number; unitCost: number }>;
+      }
+    >();
+
+    for (const rawLine of items) {
+      const invDocId = toDocId(String(rawLine?.inventoryItemId || '').trim(), uid);
+      const supDocId = toDocId(String(rawLine?.supplierId || '').trim(), uid);
+      const orderedQty = round2(Number(rawLine?.orderedQty || 0));
+      const unitCost = round4(Number(rawLine?.unitCost ?? 0));
+      const leadTimeDays = Math.max(1, Math.min(30, Math.round(Number(rawLine?.leadTimeDays || 2))));
+
+      const invItem = itemByDocId.get(invDocId);
+      if (!invItem) throw new Error('One or more selected inventory items could not be found');
+      const sup = activeSupByDocId.get(supDocId);
+      if (!sup) throw new Error(`Please assign an active supplier for "${invItem.name}"`);
+      if (!Number.isFinite(orderedQty) || orderedQty <= 0) {
+        throw new Error(`Restock quantity for "${invItem.name}" must be greater than zero`);
+      }
+      if (!Number.isFinite(unitCost) || unitCost < 0) {
+        throw new Error(`Unit cost for "${invItem.name}" cannot be negative`);
+      }
+
+      const existingGroup = groupedBySup.get(supDocId);
+      if (existingGroup) {
+        const existingLine = existingGroup.lines.find((l) => l.inventoryItemId === invDocId);
+        if (existingLine) {
+          existingLine.orderedQty = round2(existingLine.orderedQty + orderedQty);
+          existingLine.unitCost = unitCost;
+        } else {
+          existingGroup.lines.push({ inventoryItemId: invDocId, orderedQty, unitCost });
+        }
+        existingGroup.leadTimeDays = Math.max(existingGroup.leadTimeDays, leadTimeDays);
+      } else {
+        groupedBySup.set(supDocId, {
+          supplierDocId: supDocId,
+          supplierName: sup.name,
+          leadTimeDays,
+          lines: [{ inventoryItemId: invDocId, orderedQty, unitCost }],
+        });
+      }
+    }
+
+    const createdPos: Array<{
+      id: string;
+      poNumber: string;
+      supplierId: string;
+      supplierName: string;
+      status: string;
+      totalAmount: number;
+      lineCount: number;
+    }> = [];
+
+    let seqIdx = 0;
+    const covDays = Math.min(45, Math.max(3, Math.round(Number(coverageDays || 14) || 14)));
+    const noteBase = String(notes || `Predictive 90d restock (${covDays}d target coverage)`).trim();
+
+    for (const group of groupedBySup.values()) {
+      for (let offset = 0; offset < group.lines.length; offset += 60) {
+        const chunk = group.lines.slice(offset, offset + 60);
+        seqIdx += 1;
+        const logicalId = crypto.randomUUID();
+        const poDocId = toDocId(logicalId, uid);
+        const poNumber = `PO-${Date.now().toString().slice(-5)}${String(seqIdx).padStart(2, '0')}`;
+        const totalAmount = round2(chunk.reduce((s, l) => s + l.orderedQty * l.unitCost, 0));
+        const expectedIso = new Date(Date.now() + group.leadTimeDays * 86400000).toISOString().slice(0, 10);
+
+        try {
+          await setDoc(doc(db, 'purchase_orders', poDocId), {
+            id: poDocId,
+            ownerUid: uid,
+            poNumber,
+            supplierId: group.supplierDocId,
+            locationId: locDocId,
+            status: requestedStatus,
+            totalAmount,
+            approvedBy: null,
+            notes: noteBase.slice(0, 500),
+            items: chunk.map((l) => ({
+              id: crypto.randomUUID(),
+              inventoryItemId: l.inventoryItemId,
+              orderedQty: l.orderedQty,
+              receivedQty: 0,
+              unitCost: l.unitCost,
+            })),
+            orderedAt: new Date().toISOString(),
+            expectedAt: expectedIso,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        } catch (err) {
+          handleFirestoreError(err, OperationType.CREATE, `purchase_orders/${poDocId}`);
+        }
+
+        await addAuditLog(uid, user.id, user.fullName, 'AUTO_CREATE_PREDICTIVE_PO', 'PurchaseOrder', logicalId, {
+          poNumber,
+          supplier: group.supplierName,
+          location: targetLoc.name,
+          totalAmount,
+          status: requestedStatus,
+          lineCount: chunk.length,
+        });
+
+        createdPos.push({
+          id: logicalId,
+          poNumber,
+          supplierId: toLogicalId(group.supplierDocId, uid),
+          supplierName: group.supplierName,
+          status: requestedStatus,
+          totalAmount,
+          lineCount: chunk.length,
+        });
+      }
+    }
+
+    invalidateWorkspaceCache();
+    return { createdPos } as T;
   }
 
   if (pathname === '/inventory/items' && method === 'POST') {
@@ -3236,31 +4749,48 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     const cost = Number(lastUnitCost || 0);
     if (!Number.isFinite(cost) || cost < 0) throw new Error('Unit cost cannot be negative');
 
+    const safety = Math.max(0, Number(minStockLevel || 0));
+    const reorder = Math.max(0, Number(reorderPoint || 0));
     const uom = (snap.meta?.uoms || []).find((u: any) => u.id === baseUomId);
     const logicalId = crypto.randomUUID();
     const docId = toDocId(logicalId, uid);
+    const createdItem = {
+      id: docId,
+      ownerUid: uid,
+      sku: cleanSku,
+      name: cleanName,
+      itemType: itemType || 'RAW_MATERIAL',
+      baseUomId,
+      uomCode: uom?.code || 'pcs',
+      costingMethod: costingMethod || 'FIFO',
+      minStockLevel: safety,
+      reorderPoint: reorder,
+      lastUnitCost: cost,
+      weightedAvgCost: cost,
+    };
 
     try {
       await setDoc(doc(db, 'inventory_items', docId), {
-        id: docId,
-        ownerUid: uid,
-        sku: cleanSku,
-        name: cleanName,
-        itemType: itemType || 'RAW_MATERIAL',
-        baseUomId,
-        uomCode: uom?.code || 'pcs',
-        costingMethod: costingMethod || 'FIFO',
-        minStockLevel: Number(minStockLevel || 0),
-        reorderPoint: Number(reorderPoint || 0),
-        lastUnitCost: cost,
-        weightedAvgCost: cost,
+        ...createdItem,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, `inventory_items/${docId}`);
     }
-    await addAuditLog(uid, user.id, user.fullName, 'CREATE_INGREDIENT', 'InventoryItem', logicalId, { name: cleanName, sku: cleanSku });
+
+    let alertsCreated = 0;
+    if (safety > 0 || reorder > 0) {
+      const syncRes = await syncItemThresholdAlertsFirestore(snap, createdItem, null, 0, { onlyIfNeverNotified: false });
+      alertsCreated = syncRes.createdCount;
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'CREATE_INGREDIENT', 'InventoryItem', logicalId, {
+      name: cleanName,
+      sku: cleanSku,
+      safetyStock: safety,
+      alertsCreated,
+    });
     invalidateWorkspaceCache();
     return {
       id: logicalId,
@@ -3270,10 +4800,11 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
       base_uom_id: baseUomId,
       uom_code: uom?.code || 'pcs',
       costing_method: costingMethod || 'FIFO',
-      min_stock_level: Number(minStockLevel || 0),
-      reorder_point: Number(reorderPoint || 0),
+      min_stock_level: safety,
+      reorder_point: reorder,
       last_unit_cost: cost,
       weighted_avg_cost: cost,
+      alerts_created: alertsCreated,
     } as T;
   }
 
@@ -3313,17 +4844,20 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     const hasBatches = snap.stockBatches.some((b) => b.inventoryItemId === docId && Number(b.remainingQty) > 0);
     const nextWeightedAvg = hasBatches ? Number(existing.weightedAvgCost) : cost;
     const uom = (snap.meta?.uoms || []).find((u: any) => u.id === baseUomId);
+    const nextSafety = Math.max(0, Number(minStockLevel ?? existing.minStockLevel ?? 0));
+    const nextReorder = Math.max(0, Number(reorderPoint ?? existing.reorderPoint ?? 0));
+    const nextType = itemType || existing.itemType || 'RAW_MATERIAL';
 
     try {
       await updateDoc(doc(db, 'inventory_items', docId), {
         sku: cleanSku,
         name: cleanName,
-        itemType: itemType || existing.itemType || 'RAW_MATERIAL',
+        itemType: nextType,
         baseUomId,
         uomCode: uom?.code || existing.uomCode,
         costingMethod: costingMethod || existing.costingMethod || 'FIFO',
-        minStockLevel: Number(minStockLevel ?? existing.minStockLevel ?? 0),
-        reorderPoint: Number(reorderPoint ?? existing.reorderPoint ?? 0),
+        minStockLevel: nextSafety,
+        reorderPoint: nextReorder,
         lastUnitCost: cost,
         weightedAvgCost: nextWeightedAvg,
         updatedAt: serverTimestamp(),
@@ -3331,20 +4865,64 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `inventory_items/${docId}`);
     }
-    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_INGREDIENT', 'InventoryItem', id, { name: cleanName, sku: cleanSku, cost });
+
+    const updatedItem = {
+      ...existing,
+      sku: cleanSku,
+      name: cleanName,
+      itemType: nextType,
+      baseUomId,
+      uomCode: uom?.code || existing.uomCode,
+      minStockLevel: nextSafety,
+      reorderPoint: nextReorder,
+    };
+
+    const activeLocs = snap.locations.filter((l) => l.isActive !== false);
+    const stockedLocIds = activeLocs
+      .filter(
+        (l) =>
+          snap.stockBatches.some((b) => b.inventoryItemId === docId && b.locationId === l.id) ||
+          snap.inventoryTxns.some((t) => t.inventoryItemId === docId && t.locationId === l.id),
+      )
+      .map((l) => l.id);
+
+    let alertsCreated = 0;
+    if (stockedLocIds.length === 0) {
+      const syncRes = await syncItemThresholdAlertsFirestore(snap, updatedItem, null, 0, { onlyIfNeverNotified: false });
+      alertsCreated += syncRes.createdCount;
+    } else {
+      for (const lid of stockedLocIds) {
+        const locQty = round2(
+          snap.stockBatches
+            .filter((b) => b.inventoryItemId === docId && b.locationId === lid)
+            .reduce((s, b) => s + Number(b.remainingQty || 0), 0),
+        );
+        const syncRes = await syncItemThresholdAlertsFirestore(snap, updatedItem, lid, locQty, { onlyIfNeverNotified: false });
+        alertsCreated += syncRes.createdCount;
+      }
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_INGREDIENT', 'InventoryItem', id, {
+      name: cleanName,
+      sku: cleanSku,
+      cost,
+      safetyStock: nextSafety,
+      alertsCreated,
+    });
     invalidateWorkspaceCache();
     return {
       id,
       sku: cleanSku,
       name: cleanName,
-      item_type: itemType || existing.itemType,
+      item_type: nextType,
       base_uom_id: baseUomId,
       uom_code: uom?.code || existing.uomCode,
       costing_method: costingMethod || existing.costingMethod,
-      min_stock_level: Number(minStockLevel ?? existing.minStockLevel ?? 0),
-      reorder_point: Number(reorderPoint ?? existing.reorderPoint ?? 0),
+      min_stock_level: nextSafety,
+      reorder_point: nextReorder,
       last_unit_cost: cost,
       weighted_avg_cost: nextWeightedAvg,
+      alerts_created: alertsCreated,
     } as T;
   }
 
@@ -3435,26 +5013,270 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     return { trfId: toLogicalId(trfId, uid), trfNo, totalCost: deducted.totalCogs } as T;
   }
 
+  if (pathname === '/inventory/waste' && method === 'GET') {
+    assertPerm(user, PERMISSIONS.INVENTORY_VIEW);
+    const rawLoc = String(qs.get('locationId') || '').trim();
+    const locFilter = rawLoc && rawLoc !== 'ALL' ? toDocId(rawLoc, uid) : '';
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const itemMap = new Map(snap.inventoryItems.map((i) => [i.id, i]));
+    const prodMap = new Map(snap.products.map((p) => [p.id, p]));
+
+    const logs: WasteLogRecord[] = [...snap.wasteLogs]
+      .filter((w) => !locFilter || w.locationId === locFilter)
+      .sort((a, b) => String(b.wastedAt || tsToIso(b.createdAt)).localeCompare(String(a.wastedAt || tsToIso(a.createdAt))))
+      .map((w) => ({
+        id: toLogicalId(w.id, uid),
+        locationId: toLogicalId(w.locationId, uid),
+        locationName: w.locationName || locMap.get(w.locationId)?.name || 'Location',
+        entryMode: (w.entryMode === 'RECIPE_PREP' ? 'RECIPE_PREP' : 'SINGLE_INGREDIENT') as WasteEntryMode,
+        txnType: w.txnType === 'OUT_SPOILAGE' ? 'OUT_SPOILAGE' : 'OUT_WASTE',
+        reasonCategory: (w.reasonCategory || 'OTHER') as WasteReasonCategory,
+        reasonNotes: String(w.reasonNotes || ''),
+        productId: w.productId ? toLogicalId(w.productId, uid) : null,
+        productName: w.productName || (w.productId ? prodMap.get(w.productId)?.name || null : null),
+        servingsWasted: Number(w.servingsWasted || 0),
+        primaryItemId: w.primaryItemId ? toLogicalId(w.primaryItemId, uid) : null,
+        primaryItemName: w.primaryItemName || (w.primaryItemId ? itemMap.get(w.primaryItemId)?.name || null : null),
+        items: (w.items || []).map((li: any) => ({
+          inventoryItemId: toLogicalId(String(li.inventoryItemId || ''), uid),
+          ingredientName: String(li.ingredientName || 'Ingredient'),
+          uomCode: String(li.uomCode || ''),
+          quantity: Number(li.quantity || 0),
+          totalCost: Number(li.totalCost || 0),
+        })),
+        totalQuantityBase: Number(w.totalQuantityBase || 0),
+        totalLossCost: Number(w.totalLossCost || 0),
+        loggedBy: toLogicalId(String(w.loggedBy || ''), uid),
+        loggedByName: String(w.loggedByName || 'Staff'),
+        wastedAt: String(w.wastedAt || tsToIso(w.createdAt)),
+      }));
+
+    const summary = summarizeWasteLogs(logs);
+
+    const costingList = getProductCostingList(snap);
+    const recipes: RecipeWasteOption[] = costingList.map((p) => {
+      const yieldQty = Math.max(0.01, Number(p.recipe?.yield_qty || 1));
+      const ingredients = (p.recipe?.ingredients || [])
+        .map((ri: any) => {
+          const invItem = itemMap.get(toDocId(ri.inventory_item_id, uid)) || itemMap.get(ri.inventory_item_id);
+          if (!invItem) return null;
+          let baseQtyPerServing = 0;
+          try {
+            const rawPerServing = (Number(ri.quantity || 0) * (1 + Number(ri.waste_factor_pct || 0) / 100)) / yieldQty;
+            baseQtyPerServing = round4(convertQty(rawPerServing, ri.uom_id, invItem.baseUomId, snap));
+          } catch {
+            baseQtyPerServing = 0;
+          }
+          const unitCost =
+            invItem.costingMethod === 'WEIGHTED_AVERAGE'
+              ? Number(invItem.weightedAvgCost || 0)
+              : Number(invItem.lastUnitCost || 0);
+          return {
+            inventoryItemId: toLogicalId(invItem.id, uid),
+            ingredientName: invItem.name,
+            uomCode: invItem.uomCode,
+            baseQtyPerServing,
+            unitCost,
+          };
+        })
+        .filter((x: any): x is NonNullable<typeof x> => Boolean(x && x.baseQtyPerServing > 0));
+
+      return {
+        id: p.id,
+        sku: p.sku,
+        name: p.name,
+        categoryName: p.category_name,
+        yieldQty,
+        ingredientCount: ingredients.length,
+        unitDirectCost: Number(p.costing?.directCost || 0),
+        ingredients,
+      };
+    });
+
+    return { logs, summary, recipes } as T;
+  }
+
   if (pathname === '/inventory/waste' && method === 'POST') {
     assertPerm(user, PERMISSIONS.INVENTORY_ADJUST);
-    const { inventoryItemId, locationId, quantity, reason, txnType } = body;
-    const d = await deductStockFirestore(snap, {
-      inventoryItemId,
+    const {
       locationId,
-      quantity: Number(quantity),
-      txnType: txnType === 'OUT_SPOILAGE' ? 'OUT_SPOILAGE' : 'OUT_WASTE',
-      referenceType: 'WASTE_LOG',
-      referenceId: `WST-${Date.now()}`,
-      userId: user.id,
-      notes: reason || 'Spoilage / Kitchen waste',
-    });
-    await addAuditLog(uid, user.id, user.fullName, 'RECORD_WASTE', 'InventoryItem', inventoryItemId, {
-      locationId: toLogicalId(toDocId(locationId, uid), uid),
+      entryMode: rawEntryMode,
+      inventoryItemId,
       quantity,
+      productId,
+      servingsWasted,
+      ingredientOverrides,
+      txnType: rawTxnType,
+      reasonCategory: rawReasonCat,
       reason,
+    } = body || {};
+
+    const locDocId = toDocId(String(locationId || ''), uid);
+    const locObj = snap.locations.find((l) => l.id === locDocId);
+    if (!locObj) throw new Error('Valid branch or food truck location is required');
+
+    const entryMode: WasteEntryMode = rawEntryMode === 'RECIPE_PREP' ? 'RECIPE_PREP' : 'SINGLE_INGREDIENT';
+    const txnType = rawTxnType === 'OUT_SPOILAGE' ? 'OUT_SPOILAGE' : 'OUT_WASTE';
+    const allowedReasons = new Set<WasteReasonCategory>([
+      'PREP_TRIM',
+      'BURNT_OVERCOOKED',
+      'EXPIRED_SPOILED',
+      'CONTAMINATION',
+      'DROPPED_SPILL',
+      'QUALITY_REJECT',
+      'OTHER',
+    ]);
+    const reasonCategory: WasteReasonCategory = allowedReasons.has(rawReasonCat)
+      ? rawReasonCat
+      : txnType === 'OUT_SPOILAGE'
+      ? 'EXPIRED_SPOILED'
+      : 'PREP_TRIM';
+    const reasonNotes = String(reason || '').trim().slice(0, 400);
+
+    const linkedProd = productId
+      ? snap.products.find((p) => p.id === toDocId(String(productId), uid) || p.id === productId) || null
+      : null;
+    if (entryMode === 'RECIPE_PREP' && !linkedProd) {
+      throw new Error('Select a valid menu recipe to record recipe prep waste');
+    }
+
+    const deductionsPlan: Array<{ invItem: any; qty: number }> = [];
+    let servingsNum = 0;
+    let primaryItemDoc: any = null;
+
+    if (entryMode === 'RECIPE_PREP' && linkedProd) {
+      servingsNum = Number(servingsWasted);
+      if (!Number.isFinite(servingsNum) || servingsNum <= 0) {
+        throw new Error('Servings / portions wasted must be greater than zero');
+      }
+      const overrideList = Array.isArray(ingredientOverrides) ? ingredientOverrides : [];
+      if (overrideList.length > 0) {
+        for (const ov of overrideList.slice(0, 40)) {
+          const ovQty = round4(Number(ov?.quantity || 0));
+          if (!Number.isFinite(ovQty) || ovQty <= 0) continue;
+          const invItem = snap.inventoryItems.find(
+            (i) => i.id === toDocId(String(ov.inventoryItemId || ''), uid) || i.id === ov.inventoryItemId,
+          );
+          if (invItem) deductionsPlan.push({ invItem, qty: ovQty });
+        }
+      } else {
+        const yieldQty = Math.max(0.01, Number(linkedProd.recipeYieldQty || 1));
+        for (const ri of linkedProd.ingredients || []) {
+          const invItem = snap.inventoryItems.find(
+            (i) => i.id === ri.inventoryItemId || i.id === toDocId(String(ri.inventoryItemId || ''), uid),
+          );
+          if (!invItem) continue;
+          const rawQty = ((Number(ri.quantity || 0) * (1 + Number(ri.wasteFactorPct || 0) / 100)) / yieldQty) * servingsNum;
+          const baseQty = round4(convertQty(rawQty, ri.uomId, invItem.baseUomId, snap));
+          if (baseQty > 0) {
+            deductionsPlan.push({ invItem, qty: baseQty });
+          }
+        }
+      }
+      if (deductionsPlan.length === 0) {
+        throw new Error(`Recipe "${linkedProd.name}" has no BOM ingredients with positive waste quantity`);
+      }
+    } else {
+      const itemDocId = toDocId(String(inventoryItemId || ''), uid);
+      primaryItemDoc = snap.inventoryItems.find((i) => i.id === itemDocId) || null;
+      if (!primaryItemDoc) throw new Error('Select a valid ingredient to record waste');
+      const qtyNum = round4(Number(quantity));
+      if (!Number.isFinite(qtyNum) || qtyNum <= 0) {
+        throw new Error('Waste quantity must be greater than zero');
+      }
+      deductionsPlan.push({ invItem: primaryItemDoc, qty: qtyNum });
+    }
+
+    const logicalWasteId = crypto.randomUUID();
+    const wasteDocId = toDocId(logicalWasteId, uid);
+    const nowIso = new Date().toISOString();
+    const noteSummary = `${linkedProd ? `[${linkedProd.name}] ` : ''}${getWasteReasonLabel(reasonCategory)}${reasonNotes ? ` — ${reasonNotes}` : ''}`.slice(0, 500);
+
+    let totalCogs = 0;
+    let totalQuantityBase = 0;
+    const recordedLines: Array<{
+      inventoryItemId: string;
+      ingredientName: string;
+      uomCode: string;
+      quantity: number;
+      totalCost: number;
+    }> = [];
+
+    for (const plan of deductionsPlan) {
+      const res = await deductStockFirestore(snap, {
+        inventoryItemId: plan.invItem.id,
+        locationId: locDocId,
+        quantity: plan.qty,
+        txnType,
+        referenceType: linkedProd ? 'RECIPE_WASTE' : 'WASTE_LOG',
+        referenceId: wasteDocId,
+        userId: user.id,
+        notes: noteSummary,
+      });
+      totalCogs = round2(totalCogs + Number(res.totalCogs || 0));
+      totalQuantityBase = round4(totalQuantityBase + plan.qty);
+      recordedLines.push({
+        inventoryItemId: toLogicalId(plan.invItem.id, uid),
+        ingredientName: String(plan.invItem.name || 'Ingredient').slice(0, 120),
+        uomCode: String(plan.invItem.uomCode || '').slice(0, 20),
+        quantity: plan.qty,
+        totalCost: round2(res.totalCogs || 0),
+      });
+    }
+
+    const safeLoggedBy = String(user.id || 'usr_staff').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128) || 'usr_staff';
+    const wasteDoc = {
+      id: wasteDocId,
+      ownerUid: uid,
+      locationId: locDocId,
+      locationName: String(locObj.name || 'Location').slice(0, 140),
+      entryMode,
+      txnType,
+      reasonCategory,
+      reasonNotes: reasonNotes || null,
+      productId: linkedProd ? linkedProd.id : null,
+      productName: linkedProd ? String(linkedProd.name).slice(0, 160) : null,
+      servingsWasted: servingsNum,
+      primaryItemId: primaryItemDoc ? primaryItemDoc.id : null,
+      primaryItemName: primaryItemDoc ? String(primaryItemDoc.name).slice(0, 160) : null,
+      items: recordedLines.slice(0, 40),
+      totalQuantityBase,
+      totalLossCost: totalCogs,
+      loggedBy: safeLoggedBy,
+      loggedByName: String(user.fullName || 'Kitchen Staff').trim().slice(0, 150) || 'Kitchen Staff',
+      wastedAt: nowIso,
+      createdAt: serverTimestamp(),
+    };
+
+    try {
+      await setDoc(doc(db, 'waste_logs', wasteDocId), wasteDoc);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `waste_logs/${wasteDocId}`);
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'RECORD_WASTE', linkedProd ? 'Product' : 'InventoryItem', linkedProd ? toLogicalId(linkedProd.id, uid) : toLogicalId(primaryItemDoc?.id || '', uid), {
+      wasteId: logicalWasteId,
+      entryMode,
+      txnType,
+      locationId: toLogicalId(locDocId, uid),
+      productName: linkedProd?.name || null,
+      servingsWasted: servingsNum,
+      totalLossCost: totalCogs,
+      reasonCategory,
+      reason: reasonNotes,
     });
     invalidateWorkspaceCache();
-    return d as T;
+    return {
+      totalCogs,
+      itemsDeducted: recordedLines.length,
+      wasteLog: {
+        ...wasteDoc,
+        id: logicalWasteId,
+        locationId: toLogicalId(locDocId, uid),
+        productId: linkedProd ? toLogicalId(linkedProd.id, uid) : null,
+        primaryItemId: primaryItemDoc ? toLogicalId(primaryItemDoc.id, uid) : null,
+      },
+    } as T;
   }
 
   if (pathname === '/inventory/reconcile' && method === 'POST') {
@@ -4586,6 +6408,50 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     } as T;
   }
 
+  if (pathname === '/finance/weekly-food-cost' && method === 'GET') {
+    assertPerm(user, PERMISSIONS.FINANCE_VIEW);
+    const rawLoc = (qs.get('locationId') || '').trim();
+    const locFilter = rawLoc && rawLoc !== 'ALL' ? toDocId(rawLoc, uid) : '';
+    const weeks = Math.min(26, Math.max(2, Math.round(Number(qs.get('weeks') || 8) || 8)));
+
+    const filteredSales = snap.sales
+      .filter((s) => s.status === 'COMPLETED' && (!locFilter || s.locationId === locFilter))
+      .map((s) => ({
+        locationId: toLogicalId(s.locationId, uid),
+        soldAt: s.soldAt,
+        subtotal: Number(s.subtotal || 0),
+        taxAmount: Number(s.taxAmount || 0),
+        totalAmount: Number(s.totalAmount || 0),
+        totalCogs: Number(s.totalCogs || 0),
+      }));
+
+    const filteredWaste = snap.inventoryTxns
+      .filter(
+        (t) =>
+          ['OUT_WASTE', 'OUT_SPOILAGE'].includes(t.txnType) &&
+          (!locFilter || t.locationId === locFilter),
+      )
+      .map((t) => ({
+        locationId: toLogicalId(t.locationId, uid),
+        txnDate: t.txnDate || tsToIso(t.createdAt),
+        totalCost: Number(t.totalCost || 0),
+      }));
+
+    const activeProducts = snap.products.filter((p) => Number(p.targetFoodCostPct || 0) > 0);
+    const avgTarget =
+      activeProducts.length > 0
+        ? activeProducts.reduce((sum, p) => sum + Number(p.targetFoodCostPct || 35), 0) / activeProducts.length
+        : 35;
+
+    return buildWeeklyFoodCostSeries({
+      sales: filteredSales,
+      wasteTxns: filteredWaste,
+      targetFoodCostPct: avgTarget,
+      locationId: rawLoc && rawLoc !== 'ALL' ? rawLoc : 'ALL',
+      weeks,
+    }) as T;
+  }
+
   if (pathname === '/finance/expenses' && method === 'POST') {
     assertPerm(user, PERMISSIONS.FINANCE_VIEW);
     const { locationId, accountId, category, amount, description, expenseDate, paidFromPettyCash, isRecurring } = body || {};
@@ -5314,12 +7180,67 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
       }
     }
 
+    const wasteLogsInLoc = snap.wasteLogs.filter((w) => !locFilter || w.locationId === locFilter);
+    const wasteByProd = new Map<
+      string,
+      { events: number; servings: number; cost: number; ingredients: Map<string, { name: string; uom: string; qty: number; cost: number }> }
+    >();
+    const linkedRecipesByItem = new Map<string, Set<string>>();
+
+    for (const w of wasteLogsInLoc) {
+      if (w.productId) {
+        const lid = toLogicalId(String(w.productId), uid);
+        const rec = wasteByProd.get(lid) || { events: 0, servings: 0, cost: 0, ingredients: new Map() };
+        rec.events += 1;
+        rec.servings = round2(rec.servings + Number(w.servingsWasted || 0));
+        rec.cost = round2(rec.cost + Number(w.totalLossCost || 0));
+        for (const li of w.items || []) {
+          const itemLid = toLogicalId(String(li.inventoryItemId || ''), uid);
+          const ingPrev = rec.ingredients.get(itemLid) || {
+            name: String(li.ingredientName || 'Ingredient'),
+            uom: String(li.uomCode || ''),
+            qty: 0,
+            cost: 0,
+          };
+          ingPrev.qty = round2(ingPrev.qty + Number(li.quantity || 0));
+          ingPrev.cost = round2(ingPrev.cost + Number(li.totalCost || 0));
+          rec.ingredients.set(itemLid, ingPrev);
+
+          const itemDocKey = toDocId(itemLid, uid);
+          const recipeSet = linkedRecipesByItem.get(itemDocKey) || new Set<string>();
+          if (w.productName) recipeSet.add(String(w.productName));
+          linkedRecipesByItem.set(itemDocKey, recipeSet);
+        }
+        wasteByProd.set(lid, rec);
+      }
+    }
+
     const avtReport = snap.inventoryItems.map((item) => {
       const outTxns = snap.inventoryTxns.filter(
         (t) =>
           t.inventoryItemId === item.id &&
           (!locFilter || t.locationId === locFilter) &&
           ['OUT_SALE', 'OUT_WASTE', 'OUT_SPOILAGE', 'OUT_ADJUSTMENT'].includes(t.txnType),
+      );
+      const saleOutQty = round2(
+        outTxns
+          .filter((t) => t.txnType === 'OUT_SALE')
+          .reduce((s, t) => s + Math.abs(Number(t.quantityDelta || 0)), 0),
+      );
+      const wasteQty = round2(
+        outTxns
+          .filter((t) => t.txnType === 'OUT_WASTE')
+          .reduce((s, t) => s + Math.abs(Number(t.quantityDelta || 0)), 0),
+      );
+      const spoilageQty = round2(
+        outTxns
+          .filter((t) => t.txnType === 'OUT_SPOILAGE')
+          .reduce((s, t) => s + Math.abs(Number(t.quantityDelta || 0)), 0),
+      );
+      const adjustmentQty = round2(
+        outTxns
+          .filter((t) => t.txnType === 'OUT_ADJUSTMENT')
+          .reduce((s, t) => s + Math.abs(Number(t.quantityDelta || 0)), 0),
       );
       const actualOut = round2(outTxns.reduce((s, t) => s + Math.abs(Number(t.quantityDelta || 0)), 0));
       const wasteCost = round2(
@@ -5334,19 +7255,103 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
       );
       const theo = round2(theoMap.get(item.id) || 0);
       const varianceQty = round2(actualOut - theo);
+      const variancePct = theo > 0 ? round2((varianceQty / theo) * 100) : actualOut > 0 ? 100 : 0;
+      const linkedRecipes = Array.from(linkedRecipesByItem.get(item.id) || []);
       return {
         id: toLogicalId(item.id, uid),
         name: item.name,
         uom: item.uomCode,
         theoreticalQty: theo,
         actualQty: actualOut,
+        saleOutQty,
+        wasteQty,
+        spoilageQty,
+        adjustmentQty,
         varianceQty,
+        variancePct,
         varianceCost: round2(varianceQty * Number(item.lastUnitCost || 0)),
         wasteCost,
+        linkedRecipes,
       };
     });
 
-    return { menuEngineering, avtReport } as T;
+    const recipeUsageReport = products
+      .map((p) => {
+        const st = soldStats.get(p.id) || { units_sold: 0, revenue: 0, actual_cogs: 0 };
+        const w = wasteByProd.get(p.id);
+        const theoreticalIngCost = round2(st.units_sold * Number(p.costing.ingredientCost || 0));
+        const actualSaleCogs = round2(st.actual_cogs);
+        const linkedWasteCost = round2(w?.cost || 0);
+        const totalActualCost = round2(actualSaleCogs + linkedWasteCost);
+        const varianceCost = round2(totalActualCost - theoreticalIngCost);
+        const variancePct =
+          theoreticalIngCost > 0
+            ? round2((varianceCost / theoreticalIngCost) * 100)
+            : totalActualCost > 0
+            ? 100
+            : 0;
+        const theoreticalFoodCostPct = p.costing.foodCostPct;
+        const actualFoodCostPct =
+          st.revenue > 0 ? round2((totalActualCost / st.revenue) * 100) : 0;
+
+        return {
+          id: p.id,
+          sku: p.sku,
+          name: p.name,
+          categoryName: p.category_name,
+          unitsSold: st.units_sold,
+          salesRevenue: round2(st.revenue),
+          theoreticalIngredientCost: theoreticalIngCost,
+          actualSaleCogs,
+          linkedWasteEvents: w?.events || 0,
+          linkedWasteServings: w?.servings || 0,
+          linkedWasteCost,
+          totalActualCost,
+          varianceCost,
+          variancePct,
+          theoreticalFoodCostPct,
+          actualFoodCostPct,
+          targetFoodCostPct: p.target_food_cost_pct,
+          wasteIngredients: w ? Array.from(w.ingredients.values()) : [],
+        };
+      })
+      .sort(
+        (a, b) =>
+          b.linkedWasteCost - a.linkedWasteCost ||
+          Math.abs(b.varianceCost) - Math.abs(a.varianceCost) ||
+          b.unitsSold - a.unitsSold,
+      );
+
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const recentWasteLogs = [...wasteLogsInLoc]
+      .sort((a, b) => String(b.wastedAt || tsToIso(b.createdAt)).localeCompare(String(a.wastedAt || tsToIso(a.createdAt))))
+      .slice(0, 20)
+      .map((w) => ({
+        id: toLogicalId(w.id, uid),
+        locationName: w.locationName || locMap.get(w.locationId)?.name || 'Location',
+        entryMode: w.entryMode,
+        txnType: w.txnType,
+        reasonCategory: w.reasonCategory,
+        reasonNotes: w.reasonNotes || '',
+        productId: w.productId ? toLogicalId(w.productId, uid) : null,
+        productName: w.productName || null,
+        servingsWasted: Number(w.servingsWasted || 0),
+        primaryItemName: w.primaryItemName || null,
+        totalLossCost: Number(w.totalLossCost || 0),
+        loggedByName: w.loggedByName || 'Staff',
+        wastedAt: String(w.wastedAt || tsToIso(w.createdAt)),
+      }));
+
+    const wasteSummary = {
+      totalTheoreticalIngredientCost: round2(recipeUsageReport.reduce((s, r) => s + r.theoreticalIngredientCost, 0)),
+      totalActualCostWithWaste: round2(recipeUsageReport.reduce((s, r) => s + r.totalActualCost, 0)),
+      totalNetVarianceCost: round2(avtReport.reduce((s, r) => s + r.varianceCost, 0)),
+      totalRecordedWasteCost: round2(avtReport.reduce((s, r) => s + r.wasteCost, 0)),
+      recipeLinkedWasteCost: round2(recipeUsageReport.reduce((s, r) => s + r.linkedWasteCost, 0)),
+      recipeLinkedWasteEvents: recipeUsageReport.reduce((s, r) => s + r.linkedWasteEvents, 0),
+    };
+
+    return { menuEngineering, avtReport, recipeUsageReport, recentWasteLogs, wasteSummary } as T;
   }
 
   // 8. FLEET
@@ -5462,25 +7467,62 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
 
     const maintenanceLogs = snap.fleetLogs
       .filter((fl) => fl.logType === 'MAINTENANCE')
-      .sort((a, b) => String(b.serviceDate || '').localeCompare(String(a.serviceDate || '')))
-      .slice(0, 20)
+      .sort(
+        (a, b) =>
+          String(b.serviceDate || '').localeCompare(String(a.serviceDate || '')) ||
+          tsToIso(b.createdAt).localeCompare(tsToIso(a.createdAt)),
+      )
+      .slice(0, 100)
       .map((fl) => {
         const trk = trkMap.get(fl.truckId);
+        const validCategories: MaintenanceCategory[] = [
+          'ENGINE_OIL',
+          'TIRES_BRAKES',
+          'GENERATOR_LPG',
+          'KITCHEN_EQUIP',
+          'LTO_EMISSIONS',
+          'GENERAL',
+        ];
+        const cat = validCategories.includes(fl.maintenanceCategory)
+          ? (fl.maintenanceCategory as MaintenanceCategory)
+          : 'GENERAL';
+        const status: MaintenanceStatus = fl.maintenanceStatus === 'COMPLETED' ? 'COMPLETED' : 'OPEN';
         return {
           id: toLogicalId(fl.id, uid),
           truck_id: toLogicalId(fl.truckId, uid),
           location_id: trk?.locationId ? toLogicalId(trk.locationId, uid) : null,
-          title: fl.title,
-          description: fl.description,
-          cost: fl.totalCost,
-          service_date: fl.serviceDate,
-          next_due_date: fl.nextDueDate,
+          title: fl.title || 'Scheduled Service',
+          description: fl.description || null,
+          cost: round2(Number(fl.totalCost || 0)),
+          odometer_km: fl.odometerKm !== null && fl.odometerKm !== undefined ? Number(fl.odometerKm) : null,
+          service_date: fl.serviceDate || tsToIso(fl.createdAt).slice(0, 10),
+          next_due_date: fl.nextDueDate || null,
+          maintenance_category: cat,
+          service_provider: fl.serviceProvider || null,
+          maintenance_status: status,
+          alert_lead_days: Number.isFinite(Number(fl.alertLeadDays)) ? Number(fl.alertLeadDays) : 7,
+          expense_id: fl.expenseId ? toLogicalId(fl.expenseId, uid) : null,
           plate_number: trk?.plateNumber || '',
           truck_name: (trk && locMap.get(trk.locationId)?.name) || '',
         };
       });
 
-    return { trucks, locations, assignments, fuelLogs, maintenanceLogs } as T;
+    await syncFleetMaintenanceAlertsFirestore(snap);
+
+    const trucksWithMaintenance = trucks.map((t) => {
+      const mSummary = summarizeTruckMaintenance(t.id, maintenanceLogs);
+      return {
+        ...t,
+        maintenance_cost_total: mSummary.totalCost,
+        maintenance_count: mSummary.serviceCount,
+        last_service_date: mSummary.lastServiceDate,
+        next_due_date: mSummary.nextDueDate,
+        overdue_alerts: mSummary.overdueCount,
+        due_soon_alerts: mSummary.dueSoonCount,
+      };
+    });
+
+    return { trucks: trucksWithMaintenance, locations, assignments, fuelLogs, maintenanceLogs } as T;
   }
 
   if (pathname === '/fleet/trucks' && method === 'POST') {
@@ -5878,6 +7920,310 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     return { ok: true } as T;
   }
 
+  if (pathname === '/fleet/maintenance' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.FLEET_MANAGE);
+    const {
+      truckId,
+      title,
+      description,
+      serviceDate,
+      nextDueDate,
+      cost,
+      odometerKm,
+      maintenanceCategory,
+      serviceProvider,
+      alertLeadDays,
+      postExpense,
+      setTruckStatus,
+    } = body || {};
+
+    const trkDocId = toDocId(String(truckId || ''), uid);
+    const trk = snap.foodTrucks.find((t) => t.id === trkDocId);
+    if (!trk) throw new Error('Food truck not found');
+
+    const cleanTitle = String(title || '').trim().slice(0, 160);
+    if (!cleanTitle) throw new Error('Service title is required');
+
+    const cleanServiceDate = String(serviceDate || new Date().toISOString().slice(0, 10)).trim().slice(0, 40);
+    if (!/^\d{4}-\d{2}-\d{2}/.test(cleanServiceDate)) throw new Error('Valid service date is required');
+
+    const cleanNextDueDate = nextDueDate ? String(nextDueDate).trim().slice(0, 40) : null;
+    if (cleanNextDueDate && !/^\d{4}-\d{2}-\d{2}/.test(cleanNextDueDate)) {
+      throw new Error('Next checkup date must be in YYYY-MM-DD format');
+    }
+
+    const numericCost = round2(Math.max(0, Number(cost || 0)));
+    const numericOdo =
+      odometerKm !== undefined && odometerKm !== null && odometerKm !== ''
+        ? Math.max(0, Number(odometerKm))
+        : null;
+    const validCategories: MaintenanceCategory[] = [
+      'ENGINE_OIL',
+      'TIRES_BRAKES',
+      'GENERATOR_LPG',
+      'KITCHEN_EQUIP',
+      'LTO_EMISSIONS',
+      'GENERAL',
+    ];
+    const cleanCategory: MaintenanceCategory = validCategories.includes(maintenanceCategory)
+      ? maintenanceCategory
+      : 'GENERAL';
+    const cleanProvider = serviceProvider ? String(serviceProvider).trim().slice(0, 140) || null : null;
+    const cleanDesc = description ? String(description).trim().slice(0, 400) || null : null;
+    const cleanLeadDays = Math.min(90, Math.max(0, Math.round(Number(alertLeadDays ?? 7))));
+    const shouldPostExpense = numericCost > 0 && postExpense !== false;
+    const maintStatus: MaintenanceStatus = cleanNextDueDate ? 'OPEN' : 'COMPLETED';
+
+    const logId = toDocId(crypto.randomUUID(), uid);
+    const expId = shouldPostExpense ? toDocId(crypto.randomUUID(), uid) : null;
+    const expenseDateIso = cleanServiceDate.length === 10 ? `${cleanServiceDate}T08:00:00.000Z` : cleanServiceDate;
+
+    const batch = writeBatch(db);
+    if (shouldPostExpense && expId) {
+      batch.set(doc(db, 'expenses', expId), {
+        id: expId,
+        ownerUid: uid,
+        locationId: trk.locationId,
+        accountId: toDocId('acc_6400', uid),
+        category: 'MAINTENANCE',
+        amount: numericCost,
+        description: `Fleet Maintenance: ${cleanTitle}${cleanProvider ? ` (${cleanProvider})` : ''}`.slice(0, 400),
+        isRecurring: false,
+        paidFromPettyCash: false,
+        expenseDate: expenseDateIso,
+        createdAt: serverTimestamp(),
+      });
+    }
+
+    const newLogDoc = {
+      id: logId,
+      ownerUid: uid,
+      logType: 'MAINTENANCE',
+      truckId: trkDocId,
+      siteName: null,
+      assignedDate: null,
+      shiftNotes: null,
+      liters: null,
+      totalCost: numericCost,
+      odometerKm: numericOdo,
+      title: cleanTitle,
+      description: cleanDesc,
+      serviceDate: cleanServiceDate,
+      nextDueDate: cleanNextDueDate,
+      maintenanceCategory: cleanCategory,
+      serviceProvider: cleanProvider,
+      maintenanceStatus: maintStatus,
+      alertLeadDays: cleanLeadDays,
+      expenseId: expId,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    };
+    batch.set(doc(db, 'fleet_logs', logId), newLogDoc);
+
+    const truckPatch: Record<string, any> = {};
+    if (numericOdo !== null && numericOdo > Number(trk.odometerKm || 0)) {
+      truckPatch.odometerKm = numericOdo;
+    }
+    if (setTruckStatus === 'ACTIVE' || setTruckStatus === 'MAINTENANCE') {
+      truckPatch.status = setTruckStatus;
+    }
+    if (Object.keys(truckPatch).length > 0) {
+      truckPatch.updatedAt = serverTimestamp();
+      batch.update(doc(db, 'food_trucks', trkDocId), truckPatch);
+    }
+
+    try {
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, 'fleet_maintenance');
+    }
+
+    snap.fleetLogs.push({ ...newLogDoc, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+    await syncFleetMaintenanceAlertsFirestore(snap);
+    await addAuditLog(uid, user.id, user.fullName, 'LOG_FLEET_MAINTENANCE', 'FleetLog', toLogicalId(logId, uid), {
+      truckId: toLogicalId(trkDocId, uid),
+      title: cleanTitle,
+      serviceDate: cleanServiceDate,
+      nextDueDate: cleanNextDueDate,
+      cost: numericCost,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true, id: toLogicalId(logId, uid) } as T;
+  }
+
+  if (pathname.startsWith('/fleet/maintenance/') && method === 'PATCH') {
+    assertPerm(user, PERMISSIONS.FLEET_MANAGE);
+    const rawId = pathname.slice('/fleet/maintenance/'.length);
+    const logDocId = toDocId(rawId, uid);
+    const existing = snap.fleetLogs.find((fl) => (fl.id === logDocId || fl.id === rawId) && fl.logType === 'MAINTENANCE');
+    if (!existing) throw new Error('Maintenance log not found');
+
+    const {
+      truckId,
+      title,
+      description,
+      serviceDate,
+      nextDueDate,
+      cost,
+      odometerKm,
+      maintenanceCategory,
+      serviceProvider,
+      maintenanceStatus,
+      alertLeadDays,
+    } = body || {};
+
+    const nextTruckDocId = truckId ? toDocId(String(truckId), uid) : existing.truckId;
+    const nextTruck = snap.foodTrucks.find((t) => t.id === nextTruckDocId);
+    if (!nextTruck) throw new Error('Food truck not found');
+
+    const cleanTitle = title !== undefined ? String(title || '').trim().slice(0, 160) : String(existing.title || '');
+    if (!cleanTitle) throw new Error('Service title is required');
+
+    const cleanServiceDate =
+      serviceDate !== undefined ? String(serviceDate || '').trim().slice(0, 40) : String(existing.serviceDate || '');
+    const cleanNextDueDate =
+      nextDueDate !== undefined ? (nextDueDate ? String(nextDueDate).trim().slice(0, 40) : null) : existing.nextDueDate || null;
+    const numericCost = cost !== undefined ? round2(Math.max(0, Number(cost || 0))) : round2(Number(existing.totalCost || 0));
+    const numericOdo =
+      odometerKm !== undefined
+        ? odometerKm !== null && odometerKm !== ''
+          ? Math.max(0, Number(odometerKm))
+          : null
+        : existing.odometerKm ?? null;
+    const validCategories: MaintenanceCategory[] = [
+      'ENGINE_OIL',
+      'TIRES_BRAKES',
+      'GENERATOR_LPG',
+      'KITCHEN_EQUIP',
+      'LTO_EMISSIONS',
+      'GENERAL',
+    ];
+    const cleanCategory: MaintenanceCategory =
+      maintenanceCategory !== undefined
+        ? validCategories.includes(maintenanceCategory)
+          ? maintenanceCategory
+          : 'GENERAL'
+        : existing.maintenanceCategory || 'GENERAL';
+    const cleanProvider =
+      serviceProvider !== undefined
+        ? serviceProvider
+          ? String(serviceProvider).trim().slice(0, 140) || null
+          : null
+        : existing.serviceProvider ?? null;
+    const cleanDesc =
+      description !== undefined
+        ? description
+          ? String(description).trim().slice(0, 400) || null
+          : null
+        : existing.description ?? null;
+    const cleanStatus: MaintenanceStatus =
+      maintenanceStatus === 'COMPLETED' || maintenanceStatus === 'OPEN'
+        ? maintenanceStatus
+        : existing.maintenanceStatus === 'COMPLETED'
+          ? 'COMPLETED'
+          : 'OPEN';
+    const cleanLeadDays =
+      alertLeadDays !== undefined
+        ? Math.min(90, Math.max(0, Math.round(Number(alertLeadDays ?? 7))))
+        : Number.isFinite(Number(existing.alertLeadDays))
+          ? Number(existing.alertLeadDays)
+          : 7;
+
+    const batch = writeBatch(db);
+    let linkedExpenseId: string | null = existing.expenseId || null;
+    const existingExpense = linkedExpenseId ? snap.expenses.find((e) => e.id === linkedExpenseId) : null;
+    if (existingExpense) {
+      if (numericCost > 0) {
+        const expDateIso = cleanServiceDate.length === 10 ? `${cleanServiceDate}T08:00:00.000Z` : cleanServiceDate;
+        batch.update(doc(db, 'expenses', existingExpense.id), {
+          locationId: nextTruck.locationId,
+          amount: numericCost,
+          description: `Fleet Maintenance: ${cleanTitle}${cleanProvider ? ` (${cleanProvider})` : ''}`.slice(0, 400),
+          expenseDate: expDateIso,
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        batch.delete(doc(db, 'expenses', existingExpense.id));
+        linkedExpenseId = null;
+      }
+    }
+
+    const patchPayload = {
+      truckId: nextTruckDocId,
+      title: cleanTitle,
+      description: cleanDesc,
+      serviceDate: cleanServiceDate,
+      nextDueDate: cleanNextDueDate,
+      totalCost: numericCost,
+      odometerKm: numericOdo,
+      maintenanceCategory: cleanCategory,
+      serviceProvider: cleanProvider,
+      maintenanceStatus: cleanStatus,
+      alertLeadDays: cleanLeadDays,
+      expenseId: linkedExpenseId,
+      updatedAt: serverTimestamp(),
+    };
+    batch.update(doc(db, 'fleet_logs', existing.id), patchPayload);
+
+    if (numericOdo !== null && numericOdo > Number(nextTruck.odometerKm || 0)) {
+      batch.update(doc(db, 'food_trucks', nextTruckDocId), {
+        odometerKm: numericOdo,
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    try {
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `fleet_logs/${existing.id}`);
+    }
+
+    Object.assign(existing, patchPayload);
+    if (cleanStatus === 'COMPLETED' && cleanTitle) {
+      await resolveMatchingNotifications(snap, ['FLEET_MAINTENANCE'], cleanTitle, nextTruck.locationId);
+    } else {
+      await syncFleetMaintenanceAlertsFirestore(snap);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_FLEET_MAINTENANCE', 'FleetLog', toLogicalId(existing.id, uid), {
+      title: cleanTitle,
+      status: cleanStatus,
+      cost: numericCost,
+      nextDueDate: cleanNextDueDate,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if (pathname.startsWith('/fleet/maintenance/') && method === 'DELETE') {
+    assertPerm(user, PERMISSIONS.FLEET_MANAGE);
+    const rawId = pathname.slice('/fleet/maintenance/'.length);
+    const logDocId = toDocId(rawId, uid);
+    const existing = snap.fleetLogs.find((fl) => (fl.id === logDocId || fl.id === rawId) && fl.logType === 'MAINTENANCE');
+    if (!existing) throw new Error('Maintenance log not found');
+
+    const trk = snap.foodTrucks.find((t) => t.id === existing.truckId);
+    const batch = writeBatch(db);
+    batch.delete(doc(db, 'fleet_logs', existing.id));
+    if (existing.expenseId && snap.expenses.some((e) => e.id === existing.expenseId)) {
+      batch.delete(doc(db, 'expenses', existing.expenseId));
+    }
+
+    try {
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `fleet_logs/${existing.id}`);
+    }
+
+    if (existing.title) {
+      await resolveMatchingNotifications(snap, ['FLEET_MAINTENANCE'], existing.title, trk?.locationId || null);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'DELETE_FLEET_MAINTENANCE', 'FleetLog', toLogicalId(existing.id, uid), {
+      title: existing.title,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
   // 9. HR, ATTENDANCE KIOSK & PAYROLL
   if (pathname === '/hr' && method === 'GET') {
     assertPerm(user, PERMISSIONS.HR_MANAGE);
@@ -5890,6 +8236,8 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         id: toLogicalId(e.id, uid),
         employee_code: e.employeeCode,
         full_name: e.fullName,
+        phone: e.phone || '',
+        address: e.address || '',
         department: e.department,
         position: e.position,
         location_id: e.locationId ? toLogicalId(e.locationId, uid) : null,
@@ -5953,7 +8301,72 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         }),
       }));
 
-    return { employees, attendance, payrollRules: snap.meta?.payrollRule || null, payrollRuns } as T;
+    const shiftTemplates = [...snap.shiftTemplates]
+      .sort((a, b) => {
+        if (Boolean(b.isActive) !== Boolean(a.isActive)) return Number(Boolean(b.isActive)) - Number(Boolean(a.isActive));
+        const tCmp = String(a.startTime || '').localeCompare(String(b.startTime || ''));
+        return tCmp !== 0 ? tCmp : String(a.name || '').localeCompare(String(b.name || ''));
+      })
+      .map((t) => ({
+        id: toLogicalId(t.id, uid),
+        code: t.code,
+        name: t.name,
+        start_time: t.startTime,
+        end_time: t.endTime,
+        break_minutes: Number(t.breakMinutes ?? 60),
+        days_of_week: Array.isArray(t.daysOfWeek) ? t.daysOfWeek : [],
+        location_ids: Array.isArray(t.locationIds) ? t.locationIds.map((lid: string) => toLogicalId(lid, uid)) : [],
+        default_role: t.defaultRole || null,
+        headcount_needed: Number(t.headcountNeeded ?? 2),
+        notes: t.notes || null,
+        is_active: t.isActive !== false ? 1 : 0,
+        created_at: tsToIso(t.createdAt),
+        updated_at: tsToIso(t.updatedAt),
+      }));
+
+    const shiftSchedules = [...snap.shiftSchedules]
+      .sort((a, b) => {
+        const dCmp = String(a.shiftDate || '').localeCompare(String(b.shiftDate || ''));
+        if (dCmp !== 0) return dCmp;
+        const tCmp = String(a.startTime || '').localeCompare(String(b.startTime || ''));
+        if (tCmp !== 0) return tCmp;
+        const locA = locMap.get(a.locationId)?.name || '';
+        const locB = locMap.get(b.locationId)?.name || '';
+        return locA.localeCompare(locB);
+      })
+      .slice(0, 300)
+      .map((s) => {
+        const loc = locMap.get(s.locationId);
+        const emp = s.employeeId ? empMap.get(s.employeeId) : null;
+        return {
+          id: toLogicalId(s.id, uid),
+          template_id: s.templateId ? toLogicalId(s.templateId, uid) : null,
+          template_name: s.templateName,
+          location_id: toLogicalId(s.locationId, uid),
+          location_name: loc?.name || 'Location',
+          location_code: loc?.code || '',
+          employee_id: s.employeeId ? toLogicalId(s.employeeId, uid) : null,
+          employee_name: emp?.fullName || null,
+          employee_code: emp?.employeeCode || null,
+          employee_position: emp?.position || null,
+          shift_date: s.shiftDate,
+          start_time: s.startTime,
+          end_time: s.endTime,
+          break_minutes: Number(s.breakMinutes ?? 60),
+          status: s.status || 'SCHEDULED',
+          notes: s.notes || null,
+          created_at: tsToIso(s.createdAt),
+        };
+      });
+
+    return {
+      employees,
+      attendance,
+      payrollRules: snap.meta?.payrollRule || null,
+      payrollRuns,
+      shiftTemplates,
+      shiftSchedules,
+    } as T;
   }
 
   if (pathname === '/hr/payroll-rules' && method === 'PUT') {
@@ -6067,6 +8480,646 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     return { runId: toLogicalId(runId, uid), totalGross: round2(totalGross), totalNet: round2(totalNet) } as T;
   }
 
+  // 9b. SHIFT TEMPLATES & MULTI-LOCATION RECURRING SHIFT SCHEDULES
+  const VALID_WEEKDAYS = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
+  const VALID_SHIFT_STATUSES = ['SCHEDULED', 'CONFIRMED', 'COMPLETED', 'CANCELLED'];
+  const normalizeTplDays = (raw: any): string[] => {
+    if (!Array.isArray(raw)) return ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
+    const cleaned = raw.map((d) => String(d).trim().toUpperCase()).filter((d) => VALID_WEEKDAYS.includes(d));
+    return Array.from(new Set(cleaned)).slice(0, 7);
+  };
+  const normalizeTplTime = (raw: any, fallback: string) => {
+    const val = String(raw || '').trim();
+    return /^\d{2}:\d{2}$/.test(val) ? val : fallback;
+  };
+
+  if (pathname === '/hr/shift-templates' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.HR_MANAGE);
+    const {
+      code,
+      name,
+      startTime,
+      endTime,
+      breakMinutes = 60,
+      daysOfWeek,
+      locationIds = [],
+      defaultRole = null,
+      headcountNeeded = 2,
+      notes = null,
+      isActive = true,
+    } = body || {};
+
+    const cleanName = String(name || '').trim().slice(0, 120);
+    const cleanCode = String(code || '').trim().toUpperCase().slice(0, 32);
+    if (!cleanName) throw new Error('Shift template name is required');
+    if (!cleanCode) throw new Error('Shift template code is required');
+    if (snap.shiftTemplates.some((t) => String(t.code).toLowerCase() === cleanCode.toLowerCase())) {
+      throw new Error(`Shift template code "${cleanCode}" already exists`);
+    }
+
+    const cleanStart = normalizeTplTime(startTime, '07:00');
+    const cleanEnd = normalizeTplTime(endTime, '15:00');
+    const cleanBreak = Math.max(0, Math.min(480, Math.round(Number(breakMinutes ?? 60))));
+    const cleanHeadcount = Math.max(1, Math.min(100, Math.round(Number(headcountNeeded ?? 2))));
+    const cleanDays = normalizeTplDays(daysOfWeek);
+    const cleanLocs = Array.isArray(locationIds)
+      ? Array.from(new Set(locationIds.map((l) => String(l).trim()).filter(Boolean)))
+          .slice(0, 25)
+          .map((l) => toDocId(l, uid))
+      : [];
+    const cleanRole = defaultRole ? String(defaultRole).trim().slice(0, 120) : null;
+    const cleanNotes = notes ? String(notes).trim().slice(0, 400) : null;
+
+    const logicalId = crypto.randomUUID();
+    const docId = toDocId(logicalId, uid);
+    try {
+      await setDoc(doc(db, 'shift_templates', docId), {
+        id: docId,
+        ownerUid: uid,
+        code: cleanCode,
+        name: cleanName,
+        startTime: cleanStart,
+        endTime: cleanEnd,
+        breakMinutes: cleanBreak,
+        daysOfWeek: cleanDays,
+        locationIds: cleanLocs,
+        defaultRole: cleanRole,
+        headcountNeeded: cleanHeadcount,
+        notes: cleanNotes,
+        isActive: isActive !== false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `shift_templates/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'CREATE_SHIFT_TEMPLATE', 'ShiftTemplate', logicalId, {
+      code: cleanCode,
+      name: cleanName,
+      locationsCount: cleanLocs.length,
+    });
+    invalidateWorkspaceCache();
+    return { id: logicalId } as T;
+  }
+
+  if (pathname.startsWith('/hr/shift-templates/') && method === 'PUT') {
+    assertPerm(user, PERMISSIONS.HR_MANAGE);
+    const tplId = pathname.split('/')[3];
+    const docId = toDocId(tplId, uid);
+    const existing = snap.shiftTemplates.find((t) => t.id === docId);
+    if (!existing) throw new Error('Shift template not found');
+
+    const {
+      code,
+      name,
+      startTime,
+      endTime,
+      breakMinutes,
+      daysOfWeek,
+      locationIds,
+      defaultRole,
+      headcountNeeded,
+      notes,
+      isActive,
+    } = body || {};
+
+    const cleanName = String(name ?? existing.name).trim().slice(0, 120);
+    const cleanCode = String(code ?? existing.code).trim().toUpperCase().slice(0, 32);
+    if (!cleanName) throw new Error('Shift template name is required');
+    if (!cleanCode) throw new Error('Shift template code is required');
+    if (snap.shiftTemplates.some((t) => String(t.code).toLowerCase() === cleanCode.toLowerCase() && t.id !== docId)) {
+      throw new Error(`Shift template code "${cleanCode}" is already used by another template`);
+    }
+
+    const cleanStart = startTime !== undefined ? normalizeTplTime(startTime, existing.startTime) : existing.startTime;
+    const cleanEnd = endTime !== undefined ? normalizeTplTime(endTime, existing.endTime) : existing.endTime;
+    const cleanBreak = breakMinutes !== undefined
+      ? Math.max(0, Math.min(480, Math.round(Number(breakMinutes))))
+      : Number(existing.breakMinutes ?? 60);
+    const cleanHeadcount = headcountNeeded !== undefined
+      ? Math.max(1, Math.min(100, Math.round(Number(headcountNeeded))))
+      : Number(existing.headcountNeeded ?? 2);
+    const cleanDays = daysOfWeek !== undefined ? normalizeTplDays(daysOfWeek) : (existing.daysOfWeek || []);
+    const cleanLocs = locationIds !== undefined
+      ? (Array.isArray(locationIds)
+          ? Array.from(new Set(locationIds.map((l) => String(l).trim()).filter(Boolean)))
+              .slice(0, 25)
+              .map((l) => toDocId(l, uid))
+          : [])
+      : (existing.locationIds || []);
+    const cleanRole = defaultRole !== undefined ? (defaultRole ? String(defaultRole).trim().slice(0, 120) : null) : (existing.defaultRole ?? null);
+    const cleanNotes = notes !== undefined ? (notes ? String(notes).trim().slice(0, 400) : null) : (existing.notes ?? null);
+    const nextActive = isActive === undefined ? Boolean(existing.isActive) : Boolean(isActive);
+
+    try {
+      await updateDoc(doc(db, 'shift_templates', docId), {
+        code: cleanCode,
+        name: cleanName,
+        startTime: cleanStart,
+        endTime: cleanEnd,
+        breakMinutes: cleanBreak,
+        daysOfWeek: cleanDays,
+        locationIds: cleanLocs,
+        defaultRole: cleanRole,
+        headcountNeeded: cleanHeadcount,
+        notes: cleanNotes,
+        isActive: nextActive,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `shift_templates/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_SHIFT_TEMPLATE', 'ShiftTemplate', tplId, {
+      code: cleanCode,
+      name: cleanName,
+      isActive: nextActive,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if (pathname.startsWith('/hr/shift-templates/') && method === 'DELETE') {
+    assertPerm(user, PERMISSIONS.HR_MANAGE);
+    const tplId = pathname.split('/')[3];
+    const docId = toDocId(tplId, uid);
+    const existing = snap.shiftTemplates.find((t) => t.id === docId);
+    if (!existing) throw new Error('Shift template not found');
+    try {
+      await deleteDoc(doc(db, 'shift_templates', docId));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `shift_templates/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'DELETE_SHIFT_TEMPLATE', 'ShiftTemplate', tplId, {
+      code: existing.code,
+      name: existing.name,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  const toLogicalShiftWindows = (snapRef: WorkspaceSnapshot, ownerUid: string): ShiftWindowLike[] => {
+    const locMap = new Map(snapRef.locations.map((l) => [l.id, l]));
+    const empMap = new Map(snapRef.employees.map((e) => [e.id, e]));
+    return snapRef.shiftSchedules
+      .filter((s) => s.status !== 'CANCELLED')
+      .map((s) => {
+        const loc = locMap.get(s.locationId);
+        const emp = s.employeeId ? empMap.get(s.employeeId) : null;
+        return {
+          id: toLogicalId(s.id, ownerUid),
+          templateId: s.templateId ? toLogicalId(s.templateId, ownerUid) : null,
+          templateName: s.templateName,
+          locationId: toLogicalId(s.locationId, ownerUid),
+          locationName: loc?.name || toLogicalId(s.locationId, ownerUid),
+          employeeId: s.employeeId ? toLogicalId(s.employeeId, ownerUid) : null,
+          employeeName: emp?.fullName || null,
+          employeeCode: emp?.employeeCode || null,
+          shiftDate: s.shiftDate,
+          startTime: s.startTime,
+          endTime: s.endTime,
+          status: s.status,
+        };
+      });
+  };
+
+  if (pathname === '/hr/shift-schedules' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.HR_MANAGE);
+    const {
+      templateId = null,
+      templateName,
+      locationId,
+      employeeId = null,
+      shiftDate,
+      startTime,
+      endTime,
+      breakMinutes = 60,
+      status = 'SCHEDULED',
+      notes = null,
+      conflictPolicy = 'PROMPT',
+    } = body || {};
+
+    const locDocId = toDocId(String(locationId || '').trim(), uid);
+    const loc = snap.locations.find((l) => l.id === locDocId);
+    if (!loc) throw new Error('Valid location is required');
+
+    const dateStr = String(shiftDate || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) throw new Error('Valid shiftDate (YYYY-MM-DD) is required');
+
+    const tplDocId = templateId ? toDocId(String(templateId).trim(), uid) : null;
+    const tpl = tplDocId ? snap.shiftTemplates.find((t) => t.id === tplDocId) : null;
+    const cleanTplName = String(templateName || tpl?.name || 'Custom Shift').trim().slice(0, 120);
+    const cleanStart = normalizeTplTime(startTime || tpl?.startTime, '07:00');
+    const cleanEnd = normalizeTplTime(endTime || tpl?.endTime, '15:00');
+    const cleanBreak = Math.max(0, Math.min(480, Math.round(Number(breakMinutes ?? tpl?.breakMinutes ?? 60))));
+    const cleanStatus = VALID_SHIFT_STATUSES.includes(String(status).toUpperCase())
+      ? String(status).toUpperCase()
+      : 'SCHEDULED';
+
+    const cleanEmpDocId = employeeId ? toDocId(String(employeeId).trim(), uid) : null;
+    const emp = cleanEmpDocId ? snap.employees.find((e) => e.id === cleanEmpDocId) : null;
+    if (cleanEmpDocId && !emp) throw new Error('Selected employee not found');
+
+    const logicalId = crypto.randomUUID();
+    const docId = toDocId(logicalId, uid);
+    const logicalLocId = toLogicalId(loc.id, uid);
+    const logicalEmpId = emp ? toLogicalId(emp.id, uid) : null;
+
+    const candidate: ShiftWindowLike = {
+      id: logicalId,
+      templateId: tpl ? toLogicalId(tpl.id, uid) : null,
+      templateName: cleanTplName,
+      locationId: logicalLocId,
+      locationName: loc.name,
+      employeeId: logicalEmpId,
+      employeeName: emp?.fullName || null,
+      employeeCode: emp?.employeeCode || null,
+      shiftDate: dateStr,
+      startTime: cleanStart,
+      endTime: cleanEnd,
+      status: cleanStatus,
+    };
+
+    const existingLogical = toLogicalShiftWindows(snap, uid);
+    const conflicts = findScheduleCandidateConflicts([candidate], existingLogical);
+    const policy = String(conflictPolicy || 'PROMPT').toUpperCase();
+
+    if (conflicts.length > 0 && policy === 'PROMPT') {
+      return {
+        saved: false,
+        requiresConfirmation: true,
+        createdCount: 0,
+        conflicts,
+      } as T;
+    }
+
+    const cleanNotes = notes ? String(notes).trim().slice(0, 400) : null;
+    try {
+      await setDoc(doc(db, 'shift_schedules', docId), {
+        id: docId,
+        ownerUid: uid,
+        templateId: tpl?.id || null,
+        templateName: cleanTplName,
+        locationId: loc.id,
+        employeeId: emp?.id || null,
+        shiftDate: dateStr,
+        startTime: cleanStart,
+        endTime: cleanEnd,
+        breakMinutes: cleanBreak,
+        status: cleanStatus,
+        notes: cleanNotes,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `shift_schedules/${docId}`);
+    }
+
+    if (conflicts.length > 0) {
+      const c = conflicts[0];
+      await addNotificationIfMissing(
+        snap,
+        'SHIFT_CONFLICT',
+        'WARNING',
+        `Overlapping Shift Conflict: ${c.employeeName}`,
+        `${c.newTemplateName} (${c.newTimeRange} at ${c.newLocationName}) on ${c.shiftDate} overlaps ${c.existingTemplateName} (${c.existingTimeRange} at ${c.existingLocationName}) by ${formatOverlapDuration(c.overlapMinutes)}.`,
+        loc.id,
+      );
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'CREATE_SHIFT_SCHEDULE', 'ShiftSchedule', logicalId, {
+      templateName: cleanTplName,
+      locationId: logicalLocId,
+      employeeId: logicalEmpId,
+      shiftDate: dateStr,
+      conflictCount: conflicts.length,
+    });
+    invalidateWorkspaceCache();
+    return {
+      saved: true,
+      requiresConfirmation: false,
+      id: logicalId,
+      createdCount: 1,
+      conflicts,
+      createdIds: [logicalId],
+    } as T;
+  }
+
+  if (pathname === '/hr/shift-schedules/generate' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.HR_MANAGE);
+    const {
+      templateId,
+      locationIds,
+      startDate,
+      endDate,
+      daysOfWeek,
+      assignmentMode = 'OPEN_SLOTS',
+      employeeIds = [],
+      headcountPerLocation,
+      notes = null,
+      conflictPolicy = 'PROMPT',
+    } = body || {};
+
+    const tplDocId = toDocId(String(templateId || ''), uid);
+    const tpl = snap.shiftTemplates.find((t) => t.id === tplDocId);
+    if (!tpl) throw new Error('Shift template not found');
+
+    const startStr = String(startDate || '').slice(0, 10);
+    const endStr = String(endDate || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(startStr) || !/^\d{4}-\d{2}-\d{2}$/.test(endStr)) {
+      throw new Error('Valid startDate and endDate (YYYY-MM-DD) are required');
+    }
+    if (startStr > endStr) throw new Error('Start date must be on or before end date');
+
+    const parseUtc = (isoDate: string) => {
+      const [y, m, d] = isoDate.split('-').map(Number);
+      return Date.UTC(y, m - 1, d);
+    };
+    const startMs = parseUtc(startStr);
+    const endMs = parseUtc(endStr);
+    const spanDays = Math.round((endMs - startMs) / 86400000) + 1;
+    if (spanDays > 62) throw new Error('Schedule generation range cannot exceed 62 days at once');
+
+    const tplDays = normalizeTplDays(daysOfWeek !== undefined ? daysOfWeek : (tpl.daysOfWeek || []));
+    if (tplDays.length === 0) throw new Error('Select at least one recurring day of the week');
+
+    const validLocIds = new Set(snap.locations.map((l) => String(l.id)));
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const requestedLocDocIds: string[] = Array.isArray(locationIds) && locationIds.length > 0
+      ? locationIds.map((l: any) => toDocId(String(l).trim(), uid))
+      : Array.isArray(tpl.locationIds) && tpl.locationIds.length > 0
+        ? (tpl.locationIds as any[]).map((l) => String(l))
+        : snap.locations.map((l) => String(l.id));
+    const targetLocs: string[] = Array.from(new Set<string>(requestedLocDocIds)).filter((l) => validLocIds.has(l));
+    if (targetLocs.length === 0) throw new Error('Select at least one valid location for schedule generation');
+
+    const activeEmployees = snap.employees.filter((e) => e.isActive !== false);
+    const empMap = new Map(activeEmployees.map((e) => [e.id, e]));
+    const selectedEmpDocIds = Array.isArray(employeeIds)
+      ? Array.from(new Set(employeeIds.map((e: any) => toDocId(String(e).trim(), uid)).filter(Boolean)))
+      : [];
+    const headcount = Math.max(1, Math.min(20, Math.round(Number(headcountPerLocation ?? tpl.headcountNeeded ?? 1))));
+    const cleanNotes = notes ? String(notes).trim().slice(0, 400) : (tpl.notes || null);
+    const policy = String(conflictPolicy || 'PROMPT').toUpperCase();
+
+    const activeSchedules = snap.shiftSchedules.filter((s) => s.status !== 'CANCELLED');
+    const existingLogical = toLogicalShiftWindows(snap, uid);
+    const logicalTplId = toLogicalId(tplDocId, uid);
+
+    const candidateEntries: Array<{ candidate: ShiftWindowLike; docObj: any }> = [];
+    let skippedCount = 0;
+
+    const pushCandidate = (locDocId: string, dateStr: string, empDocId: string | null) => {
+      const logicalId = crypto.randomUUID();
+      const docId = toDocId(logicalId, uid);
+      const loc = locMap.get(locDocId);
+      const emp = empDocId ? empMap.get(empDocId) : null;
+      const candidate: ShiftWindowLike = {
+        id: logicalId,
+        templateId: logicalTplId,
+        templateName: tpl.name,
+        locationId: toLogicalId(locDocId, uid),
+        locationName: loc?.name || toLogicalId(locDocId, uid),
+        employeeId: emp ? toLogicalId(emp.id, uid) : null,
+        employeeName: emp?.fullName || null,
+        employeeCode: emp?.employeeCode || null,
+        shiftDate: dateStr,
+        startTime: tpl.startTime,
+        endTime: tpl.endTime,
+        status: 'SCHEDULED',
+      };
+      const docObj = {
+        id: docId,
+        ownerUid: uid,
+        templateId: tplDocId,
+        templateName: tpl.name,
+        locationId: locDocId,
+        employeeId: empDocId,
+        shiftDate: dateStr,
+        startTime: tpl.startTime,
+        endTime: tpl.endTime,
+        breakMinutes: Number(tpl.breakMinutes ?? 60),
+        status: 'SCHEDULED',
+        notes: cleanNotes,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+      candidateEntries.push({ candidate, docObj });
+    };
+
+    for (let t = startMs; t <= endMs; t += 86400000) {
+      const dt = new Date(t);
+      const dayCode = VALID_WEEKDAYS[dt.getUTCDay()];
+      if (!tplDays.includes(dayCode)) continue;
+      const dateStr = dt.toISOString().slice(0, 10);
+
+      for (const locDocId of targetLocs) {
+        const existingForSlot = activeSchedules.filter(
+          (s) => s.templateId === tplDocId && s.locationId === locDocId && s.shiftDate === dateStr,
+        );
+
+        if (assignmentMode === 'SELECTED_EMPLOYEES' && selectedEmpDocIds.length > 0) {
+          for (const empDocId of selectedEmpDocIds) {
+            if (existingForSlot.some((s) => s.employeeId === empDocId)) {
+              skippedCount++;
+              continue;
+            }
+            pushCandidate(locDocId, dateStr, empDocId);
+          }
+        } else if (assignmentMode === 'AUTO_BY_LOCATION') {
+          const locEmps = activeEmployees.filter((e) => e.locationId === locDocId).slice(0, headcount);
+          let addedHere = 0;
+          for (const emp of locEmps) {
+            if (existingForSlot.some((s) => s.employeeId === emp.id)) {
+              skippedCount++;
+              continue;
+            }
+            pushCandidate(locDocId, dateStr, emp.id);
+            addedHere++;
+          }
+          const totalAfter = existingForSlot.length + addedHere;
+          const remainingOpen = Math.max(0, headcount - totalAfter);
+          for (let k = 0; k < remainingOpen; k++) {
+            pushCandidate(locDocId, dateStr, null);
+          }
+        } else {
+          const toCreate = Math.max(0, headcount - existingForSlot.length);
+          if (toCreate === 0) {
+            skippedCount++;
+            continue;
+          }
+          for (let k = 0; k < toCreate; k++) {
+            pushCandidate(locDocId, dateStr, null);
+          }
+        }
+      }
+    }
+
+    const detectedConflicts = findScheduleCandidateConflicts(
+      candidateEntries.map((e) => e.candidate),
+      existingLogical,
+    );
+
+    if (detectedConflicts.length > 0 && policy === 'PROMPT') {
+      return {
+        saved: false,
+        requiresConfirmation: true,
+        createdCount: 0,
+        skippedCount,
+        conflicts: detectedConflicts,
+        createdIds: [],
+      } as T;
+    }
+
+    const conflictingCandidateIds = new Set(detectedConflicts.map((c) => c.newScheduleId));
+    const entriesToCreate =
+      policy === 'SKIP_CONFLICTS'
+        ? candidateEntries.filter((e) => !conflictingCandidateIds.has(e.candidate.id))
+        : candidateEntries;
+    const finalSkippedCount =
+      skippedCount + (policy === 'SKIP_CONFLICTS' ? candidateEntries.length - entriesToCreate.length : 0);
+    const savedConflicts = policy === 'SKIP_CONFLICTS' ? [] : detectedConflicts;
+
+    for (let i = 0; i < entriesToCreate.length; i += 400) {
+      const chunk = entriesToCreate.slice(i, i + 400);
+      const b = writeBatch(db);
+      for (const item of chunk) {
+        b.set(doc(db, 'shift_schedules', item.docObj.id), item.docObj);
+      }
+      try {
+        await b.commit();
+      } catch (err) {
+        handleFirestoreError(err, OperationType.WRITE, 'shift_schedules_generate');
+      }
+    }
+
+    if (savedConflicts.length > 0) {
+      await addNotificationIfMissing(
+        snap,
+        'SHIFT_CONFLICT',
+        'WARNING',
+        `${savedConflicts.length} Overlapping Shift Conflict(s) Saved`,
+        `Schedule generation for ${tpl.name} (${startStr} to ${endStr}) contains ${savedConflicts.length} overlapping crew shift(s). Review the HR Shift Roster to reassign.`,
+      );
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'GENERATE_SHIFT_SCHEDULES', 'ShiftTemplate', logicalTplId, {
+      templateName: tpl.name,
+      startDate: startStr,
+      endDate: endStr,
+      locationsCount: targetLocs.length,
+      createdCount: entriesToCreate.length,
+      skippedCount: finalSkippedCount,
+      conflictCount: savedConflicts.length,
+      conflictPolicy: policy,
+    });
+    invalidateWorkspaceCache();
+    return {
+      saved: true,
+      requiresConfirmation: false,
+      createdCount: entriesToCreate.length,
+      skippedCount: finalSkippedCount,
+      conflicts: savedConflicts,
+      createdIds: entriesToCreate.map((e) => e.candidate.id),
+    } as T;
+  }
+
+  if (pathname.startsWith('/hr/shift-schedules/') && method === 'PATCH') {
+    assertPerm(user, PERMISSIONS.HR_MANAGE);
+    const schedId = pathname.split('/')[3];
+    const docId = toDocId(schedId, uid);
+    const existing = snap.shiftSchedules.find((s) => s.id === docId);
+    if (!existing) throw new Error('Shift schedule entry not found');
+
+    const { locationId, employeeId, shiftDate, startTime, endTime, breakMinutes, status, notes } = body || {};
+    const nextStatus = status !== undefined ? String(status).trim().toUpperCase() : existing.status;
+    if (!VALID_SHIFT_STATUSES.includes(nextStatus)) throw new Error('Invalid shift status');
+
+    const nextLoc = locationId !== undefined ? toDocId(String(locationId).trim(), uid) : existing.locationId;
+    const nextEmp = employeeId !== undefined ? (employeeId ? toDocId(String(employeeId).trim(), uid) : null) : (existing.employeeId ?? null);
+    const nextDate = shiftDate !== undefined ? String(shiftDate).slice(0, 10) : existing.shiftDate;
+    const nextStart = startTime !== undefined ? normalizeTplTime(startTime, existing.startTime) : existing.startTime;
+    const nextEnd = endTime !== undefined ? normalizeTplTime(endTime, existing.endTime) : existing.endTime;
+    const nextBreak = breakMinutes !== undefined
+      ? Math.max(0, Math.min(480, Math.round(Number(breakMinutes))))
+      : Number(existing.breakMinutes ?? 60);
+    const nextNotes = notes !== undefined ? (notes ? String(notes).trim().slice(0, 400) : null) : (existing.notes ?? null);
+
+    try {
+      await updateDoc(doc(db, 'shift_schedules', docId), {
+        locationId: nextLoc,
+        employeeId: nextEmp,
+        shiftDate: nextDate,
+        startTime: nextStart,
+        endTime: nextEnd,
+        breakMinutes: nextBreak,
+        status: nextStatus,
+        notes: nextNotes,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `shift_schedules/${docId}`);
+    }
+
+    const locRow = snap.locations.find((l) => l.id === nextLoc);
+    const empRow = nextEmp ? snap.employees.find((e) => e.id === nextEmp) : null;
+    const updatedLogical: ShiftWindowLike = {
+      id: schedId,
+      templateId: existing.templateId ? toLogicalId(existing.templateId, uid) : null,
+      templateName: existing.templateName,
+      locationId: toLogicalId(nextLoc, uid),
+      locationName: locRow?.name || toLogicalId(nextLoc, uid),
+      employeeId: nextEmp ? toLogicalId(nextEmp, uid) : null,
+      employeeName: empRow?.fullName || null,
+      employeeCode: empRow?.employeeCode || null,
+      shiftDate: nextDate,
+      startTime: nextStart,
+      endTime: nextEnd,
+      status: nextStatus,
+    };
+    const otherLogical = toLogicalShiftWindows(snap, uid).filter((w) => w.id !== schedId);
+    const conflicts = findScheduleCandidateConflicts([updatedLogical], otherLogical);
+
+    if (conflicts.length > 0) {
+      const c = conflicts[0];
+      await addNotificationIfMissing(
+        snap,
+        'SHIFT_CONFLICT',
+        'WARNING',
+        `Overlapping Shift Conflict: ${c.employeeName}`,
+        `${c.newTemplateName} (${c.newTimeRange} at ${c.newLocationName}) on ${c.shiftDate} overlaps ${c.existingTemplateName} (${c.existingTimeRange} at ${c.existingLocationName}) by ${formatOverlapDuration(c.overlapMinutes)}.`,
+        nextLoc,
+      );
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'UPDATE_SHIFT_SCHEDULE', 'ShiftSchedule', schedId, {
+      status: nextStatus,
+      employeeId: nextEmp ? toLogicalId(nextEmp, uid) : null,
+      locationId: toLogicalId(nextLoc, uid),
+      conflictCount: conflicts.length,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true, conflicts } as T;
+  }
+
+  if (pathname.startsWith('/hr/shift-schedules/') && method === 'DELETE') {
+    assertPerm(user, PERMISSIONS.HR_MANAGE);
+    const schedId = pathname.split('/')[3];
+    const docId = toDocId(schedId, uid);
+    const existing = snap.shiftSchedules.find((s) => s.id === docId);
+    if (!existing) throw new Error('Shift schedule entry not found');
+    try {
+      await deleteDoc(doc(db, 'shift_schedules', docId));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `shift_schedules/${docId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'DELETE_SHIFT_SCHEDULE', 'ShiftSchedule', schedId, {
+      templateName: existing.templateName,
+      shiftDate: existing.shiftDate,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
   // 10. CRM, REPORTS & GOVERNANCE
   if (pathname === '/crm/customers' && method === 'GET') {
     assertPerm(user, PERMISSIONS.CRM_MANAGE);
@@ -6141,6 +9194,356 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
       registered_at: cleanRegisteredAt,
       location_id: cleanLocId ? toLogicalId(cleanLocId, uid) : null,
     } as T;
+  }
+
+  // 10.1 CUSTOMER LOYALTY KIOSK & TRANSACTION LINKING
+  if (pathname === '/crm/kiosk/lookup' && method === 'GET') {
+    const rawPhone = (qs.get('phone') || '').trim();
+    const normPhone = normalizePhoneNumber(rawPhone);
+    const rawLoc = (qs.get('locationId') || '').trim();
+    const locDoc = rawLoc && rawLoc !== 'ALL' ? toDocId(rawLoc, uid) : '';
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const prodMap = new Map(snap.products.map((p) => [p.id, p]));
+
+    if (!normPhone) {
+      return { found: false, error: 'Please enter a valid phone number', potentialUnlinkedCount: 0 } as T;
+    }
+
+    const cust = snap.customers.find((c) => normalizePhoneNumber(c.phone || '') === normPhone);
+    if (!cust) {
+      const potentialUnlinkedCount = snap.sales.filter(
+        (s) => s.status === 'COMPLETED' && !s.customerId && (!locDoc || s.locationId === locDoc),
+      ).length;
+      return { found: false, phone: normPhone, potentialUnlinkedCount } as T;
+    }
+
+    const custSales = snap.sales.filter(
+      (s) => s.status === 'COMPLETED' && (s.customerId === cust.id || (s.notes && s.notes.includes(normPhone))),
+    );
+
+    const transactions = custSales
+      .map((s) => {
+        const items = (s.items || []).map((it: any) => ({
+          name: it.productName || prodMap.get(it.productId)?.name || 'BBQ Item',
+          quantity: Number(it.quantity || 0),
+          unitPrice: Number(it.unitPrice || 0),
+          lineTotal: Number(it.lineTotal || 0),
+        }));
+        const itemsSummary = items.map((i: any) => `${i.quantity}x ${i.name}`).join(', ');
+        const totalAmount = Number(s.totalAmount || 0);
+        const pointsEarned = Math.floor(totalAmount / SPEND_PER_POINT_PHP);
+        return {
+          id: toLogicalId(s.id, uid),
+          receiptNumber: s.receiptNumber,
+          soldAt: String(s.soldAt || tsToIso(s.createdAt)),
+          locationId: s.locationId ? toLogicalId(s.locationId, uid) : '',
+          locationName: s.locationId ? locMap.get(s.locationId)?.name || 'Food Truck' : 'Food Truck',
+          totalAmount: round2(totalAmount),
+          pointsEarned,
+          itemsCount: items.reduce((sum: number, i: any) => sum + i.quantity, 0),
+          itemsSummary,
+          items,
+          paymentMethod: s.payments?.[0]?.method || 'CASH',
+          isLinkedToCustomer: s.customerId === cust.id,
+          notes: s.notes || null,
+        };
+      })
+      .sort((a: any, b: any) => b.soldAt.localeCompare(a.soldAt));
+
+    const lifetimeSpend = round2(custSales.reduce((sum, s) => sum + Number(s.totalAmount || 0), 0));
+    const tier = calculateLoyaltyTier(Number(cust.loyaltyPoints || 0));
+
+    return {
+      found: true,
+      customer: {
+        id: toLogicalId(cust.id, uid),
+        fullName: cust.fullName,
+        phone: cust.phone || normPhone,
+        email: cust.email || null,
+        loyaltyPoints: Number(cust.loyaltyPoints || 0),
+        tier,
+        preferences: cust.preferences || null,
+        feedbackNotes: cust.feedbackNotes || null,
+        registeredAt: cust.registeredAt || tsToIso(cust.createdAt),
+        locationId: cust.locationId ? toLogicalId(cust.locationId, uid) : null,
+        locationName: cust.locationId ? locMap.get(cust.locationId)?.name || '' : '',
+        totalOrders: custSales.length,
+        lifetimeSpend,
+      },
+      transactions,
+      potentialUnlinkedCount: 0,
+    } as T;
+  }
+
+  if (pathname === '/crm/kiosk/join' && method === 'POST') {
+    const { fullName, phone, email, preferences, locationId, autoLinkRecentSales } = body || {};
+    const cleanName = String(fullName || '').trim();
+    if (!cleanName) throw new Error('Customer full name is required to join');
+
+    const normPhone = normalizePhoneNumber(String(phone || ''));
+    if (!normPhone || normPhone.length !== 11) {
+      throw new Error('Valid 11-digit Philippine mobile phone number (09XXXXXXXXX) is required');
+    }
+
+    const cleanLocId = locationId && String(locationId).trim() && String(locationId).trim() !== 'ALL'
+      ? toDocId(String(locationId).trim(), uid)
+      : null;
+
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const prodMap = new Map(snap.products.map((p) => [p.id, p]));
+    const existing = snap.customers.find((c) => normalizePhoneNumber(c.phone || '') === normPhone);
+
+    const batch = writeBatch(db);
+    let custDocId: string;
+    let logicalCustId: string;
+    let welcomeBonusPoints = 0;
+    let currentPoints = 0;
+    let assignedTier: any = 'STANDARD';
+
+    if (existing) {
+      custDocId = existing.id;
+      logicalCustId = toLogicalId(existing.id, uid);
+      currentPoints = Number(existing.loyaltyPoints || 0);
+      assignedTier = calculateLoyaltyTier(currentPoints);
+      batch.update(doc(db, 'customers', custDocId), {
+        fullName: cleanName || existing.fullName,
+        phone: normPhone,
+        email: email ? String(email).trim().slice(0, 160) : existing.email,
+        preferences: preferences ? String(preferences).trim().slice(0, 300) : existing.preferences,
+        locationId: cleanLocId || existing.locationId,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      logicalCustId = crypto.randomUUID();
+      custDocId = toDocId(logicalCustId, uid);
+      welcomeBonusPoints = WELCOME_POINTS_BONUS;
+      currentPoints = welcomeBonusPoints;
+      assignedTier = calculateLoyaltyTier(currentPoints);
+      const regDate = new Date().toISOString().slice(0, 10);
+
+      batch.set(doc(db, 'customers', custDocId), {
+        id: custDocId,
+        ownerUid: uid,
+        fullName: cleanName,
+        phone: normPhone,
+        email: email ? String(email).trim().slice(0, 160) : null,
+        loyaltyPoints: welcomeBonusPoints,
+        tier: assignedTier,
+        preferences: preferences ? String(preferences).trim().slice(0, 300) : '',
+        feedbackNotes: null,
+        registeredAt: regDate,
+        locationId: cleanLocId,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    // Auto-link recent unlinked sales matching phone or location if requested
+    let linkedSalesCount = 0;
+    let extraPointsAwarded = 0;
+    if (autoLinkRecentSales) {
+      const candidates = snap.sales.filter((s) => {
+        if (s.status !== 'COMPLETED' || s.customerId) return false;
+        const matchesLoc = cleanLocId ? s.locationId === cleanLocId : true;
+        const matchesNotePhone = s.notes && normalizePhoneNumber(s.notes).includes(normPhone);
+        return matchesNotePhone || matchesLoc;
+      }).slice(0, 5);
+
+      for (const sale of candidates) {
+        const pts = Math.floor(Number(sale.totalAmount || 0) / SPEND_PER_POINT_PHP);
+        batch.update(doc(db, 'sales', sale.id), {
+          customerId: custDocId,
+          updatedAt: serverTimestamp(),
+        });
+        linkedSalesCount += 1;
+        extraPointsAwarded += pts;
+      }
+
+      if (extraPointsAwarded > 0) {
+        currentPoints += extraPointsAwarded;
+        assignedTier = calculateLoyaltyTier(currentPoints);
+        batch.update(doc(db, 'customers', custDocId), {
+          loyaltyPoints: currentPoints,
+          tier: assignedTier,
+          updatedAt: serverTimestamp(),
+        });
+      }
+    }
+
+    try {
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `customers/${custDocId}`);
+    }
+
+    await addAuditLog(
+      uid,
+      user?.id || 'kiosk',
+      user?.fullName || 'Customer Loyalty Kiosk',
+      existing ? 'UPDATE_CUSTOMER_KIOSK' : 'JOIN_LOYALTY_KIOSK',
+      'Customer',
+      logicalCustId,
+      {
+        fullName: cleanName,
+        phone: normPhone,
+        welcomeBonusPoints,
+        linkedSalesCount,
+        totalPoints: currentPoints,
+      },
+    );
+
+    invalidateWorkspaceCache();
+
+    // Query refreshed linked sales
+    const linkedSales = snap.sales
+      .filter((s) => s.status === 'COMPLETED' && (s.customerId === custDocId || (s.notes && s.notes.includes(normPhone))))
+      .map((s) => {
+        const items = (s.items || []).map((it: any) => ({
+          name: it.productName || prodMap.get(it.productId)?.name || 'BBQ Item',
+          quantity: Number(it.quantity || 0),
+          unitPrice: Number(it.unitPrice || 0),
+          lineTotal: Number(it.lineTotal || 0),
+        }));
+        return {
+          id: toLogicalId(s.id, uid),
+          receiptNumber: s.receiptNumber,
+          soldAt: String(s.soldAt || tsToIso(s.createdAt)),
+          locationId: s.locationId ? toLogicalId(s.locationId, uid) : '',
+          locationName: s.locationId ? locMap.get(s.locationId)?.name || 'Food Truck' : 'Food Truck',
+          totalAmount: round2(Number(s.totalAmount || 0)),
+          pointsEarned: Math.floor(Number(s.totalAmount || 0) / SPEND_PER_POINT_PHP),
+          itemsCount: items.reduce((sum: number, i: any) => sum + i.quantity, 0),
+          itemsSummary: items.map((i: any) => `${i.quantity}x ${i.name}`).join(', '),
+          items,
+          paymentMethod: s.payments?.[0]?.method || 'CASH',
+          isLinkedToCustomer: true,
+          notes: s.notes || null,
+        };
+      })
+      .sort((a: any, b: any) => b.soldAt.localeCompare(a.soldAt));
+
+    return {
+      ok: true,
+      isNew: !existing,
+      welcomeBonusPoints,
+      linkedSalesCount,
+      customer: {
+        id: logicalCustId,
+        fullName: cleanName,
+        phone: normPhone,
+        email: email || null,
+        loyaltyPoints: currentPoints,
+        tier: assignedTier,
+        preferences: preferences || null,
+        locationId: cleanLocId ? toLogicalId(cleanLocId, uid) : null,
+        locationName: cleanLocId ? locMap.get(cleanLocId)?.name || '' : '',
+        totalOrders: linkedSales.length,
+        lifetimeSpend: round2(linkedSales.reduce((sum: number, s: any) => sum + Number(s.totalAmount || 0), 0)),
+      },
+      transactions: linkedSales,
+    } as T;
+  }
+
+  if (pathname === '/crm/customers/link-sale' && method === 'POST') {
+    assertPerm(user, PERMISSIONS.CRM_MANAGE);
+    const { customerId, phone, saleId, receiptNumber } = body || {};
+
+    let targetCust = customerId
+      ? snap.customers.find((c) => c.id === toDocId(String(customerId).trim(), uid))
+      : null;
+
+    if (!targetCust && phone) {
+      const norm = normalizePhoneNumber(String(phone).trim());
+      targetCust = snap.customers.find((c) => normalizePhoneNumber(c.phone || '') === norm);
+    }
+
+    if (!targetCust) throw new Error('Customer profile not found for transaction linking');
+
+    let targetSale = saleId
+      ? snap.sales.find((s) => s.id === toDocId(String(saleId).trim(), uid))
+      : null;
+
+    if (!targetSale && receiptNumber) {
+      const cleanRec = String(receiptNumber).trim().toUpperCase();
+      targetSale = snap.sales.find((s) => String(s.receiptNumber || '').toUpperCase() === cleanRec);
+    }
+
+    if (!targetSale) throw new Error('Transaction / Receipt not found');
+
+    if (targetSale.customerId === targetCust.id) {
+      return {
+        ok: true,
+        alreadyLinked: true,
+        message: 'Transaction is already linked to this customer',
+        pointsAwarded: 0,
+        newTotalPoints: targetCust.loyaltyPoints,
+      } as T;
+    }
+
+    const pointsAwarded = Math.floor(Number(targetSale.totalAmount || 0) / SPEND_PER_POINT_PHP);
+    const nextPoints = Number(targetCust.loyaltyPoints || 0) + pointsAwarded;
+    const nextTier = calculateLoyaltyTier(nextPoints);
+
+    const batch = writeBatch(db);
+    batch.update(doc(db, 'sales', targetSale.id), {
+      customerId: targetCust.id,
+      updatedAt: serverTimestamp(),
+    });
+
+    batch.update(doc(db, 'customers', targetCust.id), {
+      loyaltyPoints: nextPoints,
+      tier: nextTier,
+      updatedAt: serverTimestamp(),
+    });
+
+    try {
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `sales/${targetSale.id}`);
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'LINK_TRANSACTION_LOYALTY', 'Sale', targetSale.id, {
+      customerId: targetCust.id,
+      customerName: targetCust.fullName,
+      receiptNumber: targetSale.receiptNumber,
+      pointsAwarded,
+      newTotalPoints: nextPoints,
+    });
+
+    invalidateWorkspaceCache();
+
+    return {
+      ok: true,
+      saleId: toLogicalId(targetSale.id, uid),
+      receiptNumber: targetSale.receiptNumber,
+      pointsAwarded,
+      newTotalPoints: nextPoints,
+      newTier: nextTier,
+    } as T;
+  }
+
+  if (pathname === '/crm/unlinked-sales' && method === 'GET') {
+    assertPerm(user, PERMISSIONS.CRM_MANAGE);
+    const rawLoc = (qs.get('locationId') || '').trim();
+    const locDoc = rawLoc && rawLoc !== 'ALL' ? toDocId(rawLoc, uid) : '';
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+
+    const unlinked = snap.sales
+      .filter((s) => s.status === 'COMPLETED' && !s.customerId && (!locDoc || s.locationId === locDoc))
+      .slice(0, 30)
+      .map((s) => ({
+        id: toLogicalId(s.id, uid),
+        receiptNumber: s.receiptNumber,
+        soldAt: String(s.soldAt || tsToIso(s.createdAt)),
+        locationName: s.locationId ? locMap.get(s.locationId)?.name || 'Food Truck' : 'Food Truck',
+        totalAmount: round2(Number(s.totalAmount || 0)),
+        pointsEligible: Math.floor(Number(s.totalAmount || 0) / SPEND_PER_POINT_PHP),
+        itemsCount: (s.items || []).reduce((sum: number, it: any) => sum + Number(it.quantity || 0), 0),
+        notes: s.notes || null,
+      }))
+      .sort((a, b) => b.soldAt.localeCompare(a.soldAt));
+
+    return unlinked as T;
   }
 
   if (pathname.startsWith('/reports/') && method === 'GET') {
@@ -6393,6 +9796,8 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
           id: toLogicalId(u.id, uid),
           email: u.email,
           full_name: u.fullName,
+          phone: u.phone || '',
+          address: u.address || '',
           role_id: u.roleId,
           assigned_location_id: u.assignedLocationId ? toLogicalId(u.assignedLocationId, uid) : null,
           avatar_url: u.avatarUrl || null,
@@ -6414,6 +9819,8 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         id: toLogicalId(e.id, uid),
         employee_code: e.employeeCode,
         full_name: e.fullName,
+        phone: e.phone || '',
+        address: e.address || '',
         department: e.department,
         position: e.position,
         location_id: e.locationId ? toLogicalId(e.locationId, uid) : null,
@@ -6435,7 +9842,7 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
 
   if (pathname === '/settings/users' && method === 'POST') {
     assertOwnerOrSuperAdmin(user);
-    const { email, password, shiftPin, fullName, roleId, assignedLocationId, avatarUrl, isActive } = body || {};
+    const { email, password, shiftPin, fullName, phone, address, roleId, assignedLocationId, avatarUrl, isActive } = body || {};
     const cleanEmail = String(email || '').trim().toLowerCase();
     const cleanName = String(fullName || '').trim();
     if (!cleanEmail) throw new Error('Email is required');
@@ -6460,6 +9867,8 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         ownerUid: uid,
         email: cleanEmail,
         fullName: cleanName,
+        phone: phone ? String(phone).trim().slice(0, 40) : null,
+        address: address ? String(address).trim().slice(0, 300) : null,
         roleId: roleRow.id,
         roleCode: roleRow.code,
         roleName: roleRow.name,
@@ -6487,17 +9896,46 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
   }
 
   if (pathname.startsWith('/settings/users/') && method === 'PUT') {
-    assertOwnerOrSuperAdmin(user);
     const targetId = pathname.split('/')[3];
+    const isOwnerOrSuperAdmin = user.roleCode === 'SUPER_ADMIN' || user.roleCode === 'BUSINESS_OWNER';
+    const isSelfUpdate = targetId === user.id;
+    if (!isOwnerOrSuperAdmin && !isSelfUpdate) {
+      throw new Error('Restricted: Company Owner, Super Admin, or account owner access required');
+    }
+
     const docId = toDocId(targetId, uid);
     const existing = snap.erpUsers.find((u) => u.id === docId);
     if (!existing) throw new Error('User not found');
 
-    const { email, password, shiftPin, clearPin, unlockAccount, fullName, roleId, assignedLocationId, avatarUrl, isActive } = body || {};
+    const { email, password, shiftPin, clearPin, unlockAccount, fullName, phone, address, roleId, assignedLocationId, avatarUrl, isActive } = body || {};
     const cleanEmail = String(email ?? existing.email).trim().toLowerCase();
     const cleanName = String(fullName ?? existing.fullName).trim();
-    const nextRoleId = roleId || existing.roleId;
-    const nextActive = isActive === undefined ? Boolean(existing.isActive) : Boolean(isActive);
+
+    if (!isOwnerOrSuperAdmin) {
+      if (roleId !== undefined && roleId !== existing.roleId) {
+        throw new Error('Permission denied: only Company Owner or Super Admin can change user roles');
+      }
+      if (isActive !== undefined && Boolean(isActive) !== Boolean(existing.isActive)) {
+        throw new Error('Permission denied: only Company Owner or Super Admin can change account active status');
+      }
+      if (assignedLocationId !== undefined) {
+        const requestedLocId = assignedLocationId ? toDocId(String(assignedLocationId), uid) : null;
+        if (requestedLocId !== (existing.assignedLocationId ?? null)) {
+          throw new Error('Permission denied: only Company Owner or Super Admin can change assigned location');
+        }
+      }
+      if (unlockAccount) {
+        throw new Error('Permission denied: only Company Owner or Super Admin can unlock accounts');
+      }
+    }
+
+    const nextRoleId = isOwnerOrSuperAdmin ? (roleId || existing.roleId) : existing.roleId;
+    const nextActive = isOwnerOrSuperAdmin
+      ? (isActive === undefined ? Boolean(existing.isActive) : Boolean(isActive))
+      : Boolean(existing.isActive);
+    const nextAssignedLocationId = isOwnerOrSuperAdmin
+      ? (assignedLocationId !== undefined ? (assignedLocationId ? toDocId(String(assignedLocationId), uid) : null) : existing.assignedLocationId ?? null)
+      : existing.assignedLocationId ?? null;
 
     if (!cleanEmail) throw new Error('Email is required');
     if (!cleanName) throw new Error('Full name is required');
@@ -6507,7 +9945,7 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     const nextRole = (snap.meta?.roles || []).find((r: any) => r.id === nextRoleId);
     if (!nextRole) throw new Error('Selected role does not exist');
 
-    if (targetId === user.id) {
+    if (targetId === user.id && isOwnerOrSuperAdmin) {
       if (!nextActive) throw new Error('You cannot deactivate your own active session account');
       if (nextRole.code !== 'SUPER_ADMIN' && nextRole.code !== 'BUSINESS_OWNER') {
         throw new Error('You cannot remove your own Owner/Super Admin access while signed in');
@@ -6515,13 +9953,18 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     }
 
     const nextAvatar = avatarUrl !== undefined ? (avatarUrl ? String(avatarUrl) : null) : existing.avatarUrl ?? null;
+    const nextPhone = phone !== undefined ? (phone ? String(phone).trim().slice(0, 40) : null) : existing.phone ?? null;
+    const nextAddress = address !== undefined ? (address ? String(address).trim().slice(0, 300) : null) : existing.address ?? null;
+
     const updatePayload: Record<string, unknown> = {
       email: cleanEmail,
       fullName: cleanName,
+      phone: nextPhone,
+      address: nextAddress,
       roleId: nextRole.id,
       roleCode: nextRole.code,
       roleName: nextRole.name,
-      assignedLocationId: assignedLocationId ? toDocId(String(assignedLocationId), uid) : null,
+      assignedLocationId: nextAssignedLocationId,
       avatarUrl: nextAvatar,
       isActive: nextActive,
       updatedAt: serverTimestamp(),
@@ -6565,6 +10008,8 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     const {
       employeeCode,
       fullName,
+      phone,
+      address,
       department,
       position,
       locationId,
@@ -6591,6 +10036,8 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
         ownerUid: uid,
         employeeCode: code,
         fullName: cleanName,
+        phone: phone ? String(phone).trim().slice(0, 40) : null,
+        address: address ? String(address).trim().slice(0, 300) : null,
         department: String(department || 'Operations').trim(),
         position: String(position || 'Crew').trim(),
         locationId: locationId ? toDocId(String(locationId), uid) : null,
@@ -6623,6 +10070,8 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     const {
       employeeCode,
       fullName,
+      phone,
+      address,
       department,
       position,
       locationId,
@@ -6643,6 +10092,8 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
     }
 
     const nextAvatar = avatarUrl !== undefined ? (avatarUrl ? String(avatarUrl) : null) : existing.avatarUrl ?? null;
+    const nextPhone = phone !== undefined ? (phone ? String(phone).trim().slice(0, 40) : null) : existing.phone ?? null;
+    const nextAddress = address !== undefined ? (address ? String(address).trim().slice(0, 300) : null) : existing.address ?? null;
     const nextDescriptor =
       faceDescriptorJson !== undefined
         ? faceDescriptorJson
@@ -6669,6 +10120,8 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
       await updateDoc(doc(db, 'employees', docId), {
         employeeCode: cleanCode,
         fullName: cleanName,
+        phone: nextPhone,
+        address: nextAddress,
         department: String(department ?? existing.department).trim(),
         position: String(position ?? existing.position).trim(),
         locationId: locationId !== undefined ? (locationId ? toDocId(String(locationId), uid) : null) : existing.locationId ?? null,
@@ -6685,6 +10138,267 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
       handleFirestoreError(err, OperationType.UPDATE, `employees/${docId}`);
     }
     await addAuditLog(uid, user.id, user.fullName, 'UPDATE_EMPLOYEE', 'Employee', empId, { code: cleanCode, fullName: cleanName, isActive: nextActive });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  // 12. POS DEVICE PAIRING & REGISTER CONTROL (MANAGERS, OWNER & SUPER_ADMIN + POS STAFF CURRENT TERMINAL PRINTER)
+  if (pathname === '/settings/devices/current' && method === 'GET') {
+    assertAnyPerm(
+      user,
+      PERMISSIONS.POS_SELL,
+      PERMISSIONS.SETTINGS_ADMIN,
+      PERMISSIONS.FLEET_MANAGE,
+    );
+    const hardwareUuid = String(qs.get('hardwareUuid') || '').trim();
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const found = hardwareUuid
+      ? snap.terminalDevices.find((d) => String(d.hardwareUuid || '').trim() === hardwareUuid)
+      : null;
+    const locations = snap.locations
+      .filter((l) => l.isActive)
+      .sort((a, b) => String(a.type).localeCompare(String(b.type)) || String(a.name).localeCompare(String(b.name)))
+      .map((l) => ({ id: toLogicalId(l.id, uid), code: l.code, name: l.name, type: l.type }));
+    return {
+      device: found ? mapTerminalDevice(found, uid, locMap) : null,
+      locations,
+    } as T;
+  }
+
+  if (pathname === '/settings/devices/current-printer' && method === 'POST') {
+    assertAnyPerm(
+      user,
+      PERMISSIONS.POS_SELL,
+      PERMISSIONS.SETTINGS_ADMIN,
+      PERMISSIONS.FLEET_MANAGE,
+    );
+    const hardwareUuid = String(body?.hardwareUuid || '').trim();
+    if (!/^[a-zA-Z0-9_-]{8,128}$/.test(hardwareUuid)) {
+      throw new Error('Valid Terminal hardware UUID is required to map a thermal printer');
+    }
+    const existing = snap.terminalDevices.find((d) => String(d.hardwareUuid || '').trim() === hardwareUuid);
+    if (!existing) {
+      throw new Error('Pair and register this Terminal hardware UUID first before saving a cloud printer mapping.');
+    }
+    if (existing.status === 'REVOKED') {
+      throw new Error('This Terminal device is revoked. Re-authorize it before mapping a printer.');
+    }
+
+    const printerFields = normalizePrinterFields(body, existing);
+    try {
+      await updateDoc(doc(db, 'terminal_devices', existing.id), {
+        printerConnectionType: printerFields.printerConnectionType,
+        printerName: printerFields.printerName,
+        printerIp: printerFields.printerIp,
+        printerPort: printerFields.printerPort,
+        printerBtDeviceId: printerFields.printerBtDeviceId,
+        printerBtServiceUuid: printerFields.printerBtServiceUuid,
+        printerBtCharacteristicUuid: printerFields.printerBtCharacteristicUuid,
+        printerPaperWidthMm: printerFields.printerPaperWidthMm,
+        printerAutoPrint: printerFields.printerAutoPrint,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `terminal_devices/${existing.id}`);
+    }
+
+    const isClearing = !printerFields.printerIp && !printerFields.printerBtDeviceId;
+    await addAuditLog(
+      uid,
+      user.id,
+      user.fullName,
+      isClearing ? 'UNMAP_TERMINAL_PRINTER' : 'MAP_TERMINAL_PRINTER',
+      'TerminalDevice',
+      toLogicalId(existing.id, uid),
+      {
+        deviceName: existing.deviceName,
+        hardwareUuid,
+        connectionType: printerFields.printerConnectionType || 'NONE',
+        printerName: printerFields.printerName,
+        printerEndpoint: printerFields.printerIp
+          ? `${printerFields.printerIp}:${printerFields.printerPort}`
+          : printerFields.printerBtDeviceId
+            ? `BT:${printerFields.printerBtDeviceId}`
+            : 'NONE',
+        paperWidthMm: printerFields.printerPaperWidthMm,
+        autoPrint: printerFields.printerAutoPrint,
+      },
+    );
+    invalidateWorkspaceCache();
+
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const updatedRow = {
+      ...existing,
+      ...printerFields,
+      updatedAt: new Date().toISOString(),
+    };
+    return { ok: true, device: mapTerminalDevice(updatedRow, uid, locMap) } as T;
+  }
+
+  if (pathname === '/settings/devices' && method === 'GET') {
+    assertDeviceManagerAccess(user);
+    const locMap = new Map(snap.locations.map((l) => [l.id, l]));
+    const devices = [...snap.terminalDevices]
+      .sort((a, b) => {
+        const sDiff = (a.status === 'AUTHORIZED' ? 0 : 1) - (b.status === 'AUTHORIZED' ? 0 : 1);
+        if (sDiff !== 0) return sDiff;
+        return String(b.lastSeenAt || b.pairedAt || '').localeCompare(String(a.lastSeenAt || a.pairedAt || ''));
+      })
+      .map((d) => mapTerminalDevice(d, uid, locMap));
+
+    const locations = snap.locations
+      .filter((l) => l.isActive)
+      .sort((a, b) => String(a.type).localeCompare(String(b.type)) || String(a.name).localeCompare(String(b.name)))
+      .map((l) => ({ id: toLogicalId(l.id, uid), code: l.code, name: l.name, type: l.type }));
+
+    return { devices, locations } as T;
+  }
+
+  if (pathname === '/settings/devices' && method === 'POST') {
+    assertDeviceManagerAccess(user);
+    const { hardwareUuid, deviceName, locationId, stationEmail, userAgentSummary } = body || {};
+    const cleanUuid = String(hardwareUuid || '').trim();
+    const cleanName = String(deviceName || '').trim().slice(0, 120);
+    if (!/^[a-zA-Z0-9_-]{8,128}$/.test(cleanUuid)) {
+      throw new Error('Hardware UUID must be 8 to 128 alphanumeric, underscore, or hyphen characters');
+    }
+    if (!cleanName) {
+      throw new Error('Device / Register name is required');
+    }
+    if (snap.terminalDevices.some((d) => String(d.hardwareUuid || '').trim() === cleanUuid)) {
+      throw new Error(`Hardware UUID "${cleanUuid}" is already registered. Edit or re-authorize the existing terminal record.`);
+    }
+
+    const cleanLocId = locationId ? toDocId(String(locationId), uid) : null;
+    const cleanStationEmail = stationEmail ? String(stationEmail).trim().toLowerCase().slice(0, 200) : null;
+    const cleanUa = userAgentSummary ? String(userAgentSummary).trim().slice(0, 160) : null;
+    const printerFields = normalizePrinterFields(body);
+    const nowIso = new Date().toISOString();
+    const logicalId = crypto.randomUUID();
+    const docId = toDocId(logicalId, uid);
+
+    try {
+      await setDoc(doc(db, 'terminal_devices', docId), {
+        id: docId,
+        ownerUid: uid,
+        hardwareUuid: cleanUuid,
+        deviceName: cleanName,
+        locationId: cleanLocId,
+        stationEmail: cleanStationEmail,
+        status: 'AUTHORIZED',
+        pairedByUserId: user.id,
+        pairedByName: user.fullName.slice(0, 150),
+        pairedAt: nowIso,
+        lastSeenAt: nowIso,
+        userAgentSummary: cleanUa,
+        printerConnectionType: printerFields.printerConnectionType,
+        printerName: printerFields.printerName,
+        printerIp: printerFields.printerIp,
+        printerPort: printerFields.printerPort,
+        printerBtDeviceId: printerFields.printerBtDeviceId,
+        printerBtServiceUuid: printerFields.printerBtServiceUuid,
+        printerBtCharacteristicUuid: printerFields.printerBtCharacteristicUuid,
+        printerPaperWidthMm: printerFields.printerPaperWidthMm,
+        printerAutoPrint: printerFields.printerAutoPrint,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `terminal_devices/${docId}`);
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'REGISTER_TERMINAL_DEVICE', 'TerminalDevice', logicalId, {
+      deviceName: cleanName,
+      hardwareUuid: cleanUuid,
+      locationId: cleanLocId ? toLogicalId(cleanLocId, uid) : 'ALL',
+    });
+    invalidateWorkspaceCache();
+    return { id: logicalId } as T;
+  }
+
+  if (pathname.startsWith('/settings/devices/') && method === 'PUT') {
+    assertDeviceManagerAccess(user);
+    const targetId = pathname.split('/')[3];
+    const docId = toDocId(targetId, uid);
+    const existing = snap.terminalDevices.find((d) => d.id === docId);
+    if (!existing) throw new Error('Registered POS device not found');
+
+    const { deviceName, locationId, stationEmail, status, userAgentSummary } = body || {};
+    const cleanName = String(deviceName ?? existing.deviceName).trim().slice(0, 120);
+    if (!cleanName) throw new Error('Device / Register name is required');
+    const nextStatus = status === 'REVOKED' ? 'REVOKED' : status === 'AUTHORIZED' ? 'AUTHORIZED' : existing.status;
+    const nextLocId = locationId !== undefined ? (locationId ? toDocId(String(locationId), uid) : null) : existing.locationId ?? null;
+    const nextStationEmail =
+      stationEmail !== undefined ? (stationEmail ? String(stationEmail).trim().toLowerCase().slice(0, 200) : null) : existing.stationEmail ?? null;
+    const nextUa =
+      userAgentSummary !== undefined
+        ? userAgentSummary
+          ? String(userAgentSummary).trim().slice(0, 160)
+          : null
+        : existing.userAgentSummary ?? null;
+    const printerFields = normalizePrinterFields(body, existing);
+    const nowIso = new Date().toISOString();
+    const reauthorized = existing.status !== 'AUTHORIZED' && nextStatus === 'AUTHORIZED';
+
+    try {
+      await updateDoc(doc(db, 'terminal_devices', docId), {
+        deviceName: cleanName,
+        locationId: nextLocId,
+        stationEmail: nextStationEmail,
+        status: nextStatus,
+        pairedByUserId: reauthorized ? user.id : existing.pairedByUserId,
+        pairedByName: reauthorized ? user.fullName.slice(0, 150) : existing.pairedByName,
+        pairedAt: reauthorized ? nowIso : existing.pairedAt,
+        lastSeenAt: reauthorized ? nowIso : existing.lastSeenAt,
+        userAgentSummary: nextUa,
+        printerConnectionType: printerFields.printerConnectionType,
+        printerName: printerFields.printerName,
+        printerIp: printerFields.printerIp,
+        printerPort: printerFields.printerPort,
+        printerBtDeviceId: printerFields.printerBtDeviceId,
+        printerBtServiceUuid: printerFields.printerBtServiceUuid,
+        printerBtCharacteristicUuid: printerFields.printerBtCharacteristicUuid,
+        printerPaperWidthMm: printerFields.printerPaperWidthMm,
+        printerAutoPrint: printerFields.printerAutoPrint,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `terminal_devices/${docId}`);
+    }
+
+    const action =
+      nextStatus !== existing.status
+        ? nextStatus === 'REVOKED'
+          ? 'REVOKE_TERMINAL_DEVICE'
+          : 'AUTHORIZE_TERMINAL_DEVICE'
+        : 'UPDATE_TERMINAL_DEVICE';
+    await addAuditLog(uid, user.id, user.fullName, action, 'TerminalDevice', targetId, {
+      deviceName: cleanName,
+      hardwareUuid: existing.hardwareUuid,
+      status: nextStatus,
+      printerIp: printerFields.printerIp || null,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if (pathname.startsWith('/settings/devices/') && method === 'DELETE') {
+    assertDeviceManagerAccess(user);
+    const targetId = pathname.split('/')[3];
+    const docId = toDocId(targetId, uid);
+    const existing = snap.terminalDevices.find((d) => d.id === docId);
+    if (!existing) throw new Error('Registered POS device not found');
+
+    try {
+      await deleteDoc(doc(db, 'terminal_devices', docId));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `terminal_devices/${docId}`);
+    }
+
+    await addAuditLog(uid, user.id, user.fullName, 'REMOVE_TERMINAL_DEVICE', 'TerminalDevice', targetId, {
+      deviceName: existing.deviceName,
+      hardwareUuid: existing.hardwareUuid,
+    });
     invalidateWorkspaceCache();
     return { ok: true } as T;
   }

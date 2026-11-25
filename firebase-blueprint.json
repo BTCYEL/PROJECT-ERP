@@ -24,6 +24,8 @@
         "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "email": { "type": "string", "format": "email", "maxLength": 200 },
         "fullName": { "type": "string", "minLength": 1, "maxLength": 150 },
+        "phone": { "type": "string", "maxLength": 40 },
+        "address": { "type": "string", "maxLength": 300 },
         "roleId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "roleCode": { "type": "string", "minLength": 1, "maxLength": 64 },
         "roleName": { "type": "string", "minLength": 1, "maxLength": 120 },
@@ -48,6 +50,8 @@
         "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "employeeCode": { "type": "string", "minLength": 1, "maxLength": 64 },
         "fullName": { "type": "string", "minLength": 1, "maxLength": 150 },
+        "phone": { "type": "string", "maxLength": 40 },
+        "address": { "type": "string", "maxLength": 300 },
         "department": { "type": "string", "minLength": 1, "maxLength": 100 },
         "position": { "type": "string", "minLength": 1, "maxLength": 100 },
         "locationId": { "type": "string", "maxLength": 128 },
@@ -474,7 +478,13 @@
         "description": { "type": "string", "maxLength": 400 },
         "serviceDate": { "type": "string", "maxLength": 40 },
         "nextDueDate": { "type": "string", "maxLength": 40 },
-        "createdAt": { "type": "string", "format": "date-time" }
+        "maintenanceCategory": { "type": "string", "enum": ["ENGINE_OIL", "TIRES_BRAKES", "GENERATOR_LPG", "KITCHEN_EQUIP", "LTO_EMISSIONS", "GENERAL"] },
+        "serviceProvider": { "type": "string", "maxLength": 140 },
+        "maintenanceStatus": { "type": "string", "enum": ["OPEN", "COMPLETED"] },
+        "alertLeadDays": { "type": "integer" },
+        "expenseId": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "ownerUid", "logType", "truckId", "createdAt"]
     },
@@ -519,6 +529,51 @@
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "ownerUid", "periodStart", "periodEnd", "status", "totalGross", "totalDeductions", "totalNet", "items", "createdAt"]
+    },
+    "ShiftTemplate": {
+      "title": "ShiftTemplate",
+      "description": "Reusable shift template for recurring multi-location employee scheduling",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "startTime": { "type": "string", "minLength": 4, "maxLength": 10 },
+        "endTime": { "type": "string", "minLength": 4, "maxLength": 10 },
+        "breakMinutes": { "type": "integer" },
+        "daysOfWeek": { "type": "array", "description": "Recurring weekday codes (MON..SUN)" },
+        "locationIds": { "type": "array", "description": "Target location IDs (empty = all active locations)" },
+        "defaultRole": { "type": "string", "maxLength": 120 },
+        "headcountNeeded": { "type": "integer" },
+        "notes": { "type": "string", "maxLength": 400 },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "code", "name", "startTime", "endTime", "breakMinutes", "daysOfWeek", "locationIds", "headcountNeeded", "isActive", "createdAt", "updatedAt"]
+    },
+    "ShiftSchedule": {
+      "title": "ShiftSchedule",
+      "description": "Scheduled employee shift generated from a shift template for a location and date",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "templateId": { "type": "string", "maxLength": 128 },
+        "templateName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "locationId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "employeeId": { "type": "string", "maxLength": 128 },
+        "shiftDate": { "type": "string", "minLength": 8, "maxLength": 20 },
+        "startTime": { "type": "string", "minLength": 4, "maxLength": 10 },
+        "endTime": { "type": "string", "minLength": 4, "maxLength": 10 },
+        "breakMinutes": { "type": "integer" },
+        "status": { "type": "string", "enum": ["SCHEDULED", "CONFIRMED", "COMPLETED", "CANCELLED"] },
+        "notes": { "type": "string", "maxLength": 400 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "templateName", "locationId", "shiftDate", "startTime", "endTime", "breakMinutes", "status", "createdAt", "updatedAt"]
     },
     "Customer": {
       "title": "Customer",
@@ -598,6 +653,91 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "ownerUid", "seeded", "businessName", "currency", "roles", "uoms", "unitConversions", "pettyCashFunds", "financialPeriods", "payrollRule", "createdAt", "updatedAt"]
+    },
+    "DailyHuddle": {
+      "title": "DailyHuddle",
+      "description": "Manager-broadcast operational briefing pushed live to POS, KDS, and mobile staff interfaces",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 140 },
+        "message": { "type": "string", "minLength": 1, "maxLength": 800 },
+        "priority": { "type": "string", "enum": ["NORMAL", "URGENT", "CRITICAL"] },
+        "targetChannels": { "type": "array", "description": "Target staff interfaces: POS, KDS, MOBILE" },
+        "locationId": { "type": "string", "maxLength": 128 },
+        "locationName": { "type": "string", "maxLength": 140 },
+        "shiftWindow": { "type": "string", "enum": ["ALL_DAY", "OPENING", "MID_DAY", "CLOSING"] },
+        "authorId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "authorName": { "type": "string", "minLength": 1, "maxLength": 150 },
+        "authorRole": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "acknowledgedBy": { "type": "array", "description": "Bounded list of ERP user IDs who acknowledged the briefing" },
+        "isPinned": { "type": "boolean" },
+        "isActive": { "type": "boolean" },
+        "expiresAt": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "title", "message", "priority", "targetChannels", "shiftWindow", "authorId", "authorName", "authorRole", "acknowledgedBy", "isPinned", "isActive", "createdAt", "updatedAt"]
+    },
+    "WasteLog": {
+      "title": "WasteLog",
+      "description": "Immutable kitchen spoilage or prep-waste entry optionally linked to a specific menu recipe",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "locationId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "locationName": { "type": "string", "minLength": 1, "maxLength": 140 },
+        "entryMode": { "type": "string", "enum": ["RECIPE_PREP", "SINGLE_INGREDIENT"] },
+        "txnType": { "type": "string", "enum": ["OUT_WASTE", "OUT_SPOILAGE"] },
+        "reasonCategory": { "type": "string", "enum": ["PREP_TRIM", "BURNT_OVERCOOKED", "EXPIRED_SPOILED", "CONTAMINATION", "DROPPED_SPILL", "QUALITY_REJECT", "OTHER"] },
+        "reasonNotes": { "type": "string", "maxLength": 400 },
+        "productId": { "type": "string", "maxLength": 128 },
+        "productName": { "type": "string", "maxLength": 160 },
+        "servingsWasted": { "type": "number" },
+        "primaryItemId": { "type": "string", "maxLength": 128 },
+        "primaryItemName": { "type": "string", "maxLength": 160 },
+        "items": { "type": "array", "description": "Bounded list of deducted ingredient waste lines" },
+        "totalQuantityBase": { "type": "number" },
+        "totalLossCost": { "type": "number" },
+        "loggedBy": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "loggedByName": { "type": "string", "minLength": 1, "maxLength": 150 },
+        "wastedAt": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "locationId", "locationName", "entryMode", "txnType", "reasonCategory", "reasonNotes", "productId", "productName", "servingsWasted", "primaryItemId", "primaryItemName", "items", "totalQuantityBase", "totalLossCost", "loggedBy", "loggedByName", "wastedAt", "createdAt"]
+    },
+    "TerminalDevice": {
+      "title": "TerminalDevice",
+      "description": "Authorized shared POS register or kitchen tablet paired to the ERP via hardware UUID and TERMINAL_ACCESS_KEY",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "hardwareUuid": { "type": "string", "minLength": 8, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "deviceName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "locationId": { "type": "string", "maxLength": 128 },
+        "stationEmail": { "type": "string", "maxLength": 200 },
+        "status": { "type": "string", "enum": ["AUTHORIZED", "REVOKED"] },
+        "pairedByUserId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "pairedByName": { "type": "string", "minLength": 1, "maxLength": 150 },
+        "pairedAt": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "lastSeenAt": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "userAgentSummary": { "type": "string", "maxLength": 160 },
+        "printerConnectionType": { "type": "string", "enum": ["NETWORK", "BLUETOOTH"] },
+        "printerName": { "type": "string", "maxLength": 120 },
+        "printerIp": { "type": "string", "maxLength": 45 },
+        "printerPort": { "type": "number" },
+        "printerBtDeviceId": { "type": "string", "maxLength": 160 },
+        "printerBtServiceUuid": { "type": "string", "maxLength": 128 },
+        "printerBtCharacteristicUuid": { "type": "string", "maxLength": 128 },
+        "printerPaperWidthMm": { "type": "number" },
+        "printerAutoPrint": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "hardwareUuid", "deviceName", "locationId", "stationEmail", "status", "pairedByUserId", "pairedByName", "pairedAt", "lastSeenAt", "userAgentSummary", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -626,9 +766,14 @@
     "/fleet_logs/{logId}": { "schema": { "$ref": "#/entities/FleetLog" }, "description": "Fleet assignments, fuel, and maintenance" },
     "/attendance_logs/{attId}": { "schema": { "$ref": "#/entities/AttendanceLog" }, "description": "Employee attendance logs" },
     "/payroll_runs/{runId}": { "schema": { "$ref": "#/entities/PayrollRun" }, "description": "Payroll runs" },
+    "/shift_templates/{templateId}": { "schema": { "$ref": "#/entities/ShiftTemplate" }, "description": "Reusable shift templates for recurring multi-location scheduling" },
+    "/shift_schedules/{scheduleId}": { "schema": { "$ref": "#/entities/ShiftSchedule" }, "description": "Scheduled shifts generated from shift templates" },
     "/customers/{customerId}": { "schema": { "$ref": "#/entities/Customer" }, "description": "CRM customers" },
     "/notifications/{notifId}": { "schema": { "$ref": "#/entities/Notification" }, "description": "ERP alerts" },
+    "/daily_huddles/{huddleId}": { "schema": { "$ref": "#/entities/DailyHuddle" }, "description": "Manager operational briefings for POS, KDS, and mobile staff" },
     "/audit_logs/{logId}": { "schema": { "$ref": "#/entities/AuditLog" }, "description": "RBAC & audit trail" },
+    "/waste_logs/{wasteId}": { "schema": { "$ref": "#/entities/WasteLog" }, "description": "Recipe-linked kitchen spoilage and prep waste ledger" },
+    "/terminal_devices/{deviceId}": { "schema": { "$ref": "#/entities/TerminalDevice" }, "description": "Authorized POS tablets and terminals paired via hardware UUID" },
     "/workspace_meta/{metaId}": { "schema": { "$ref": "#/entities/WorkspaceMeta" }, "description": "Workspace configuration" }
   }
 }

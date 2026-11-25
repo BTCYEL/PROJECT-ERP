@@ -480,31 +480,31 @@ export function FaceAttendanceKioskModal({
       aria-label="On-Device Face Attendance Kiosk"
     >
       <div
-        className="w-full max-w-5xl max-h-[92vh] overflow-y-auto rounded-xl bg-white border border-slate-200 shadow-2xl"
+        className="w-full max-w-5xl max-h-[92vh] overflow-y-auto rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-4 border-b border-slate-200 bg-slate-50/70">
+        <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-4 border-b border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/70">
           <div className="flex items-center gap-3">
-            <div className="p-2 rounded-lg bg-slate-900 text-white shrink-0">
+            <div className="p-2 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950 shrink-0">
               <ScanFace className="w-5 h-5" />
             </div>
             <div>
-              <h2 className="font-display text-base font-semibold text-slate-900">
+              <h2 className="font-display text-base font-semibold text-slate-900 dark:text-slate-50">
                 On-Device Face Attendance Kiosk
               </h2>
-              <p className="text-xs text-slate-500">
+              <p className="text-xs text-slate-500 dark:text-slate-400">
                 Real-time local biometric Time In / Time Out with blink/head-turn liveness &amp; photo audit
               </p>
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg border border-slate-200">
+            <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-800">
               <button
                 type="button"
                 onClick={() => setKioskMode('FACE')}
                 className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
-                  kioskMode === 'FACE' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                  kioskMode === 'FACE' ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-50 shadow-xs' : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
                 }`}
               >
                 <ScanFace className="w-3.5 h-3.5" /> Face Scanner
@@ -513,7 +513,7 @@ export function FaceAttendanceKioskModal({
                 type="button"
                 onClick={() => setKioskMode('PIN')}
                 className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
-                  kioskMode === 'PIN' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                  kioskMode === 'PIN' ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-50 shadow-xs' : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
                 }`}
               >
                 <KeyRound className="w-3.5 h-3.5" /> PIN Fallback
@@ -522,7 +522,7 @@ export function FaceAttendanceKioskModal({
             <button
               type="button"
               onClick={onClose}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-100 hover:text-slate-900 transition-colors"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-white transition-colors"
               aria-label="Close attendance kiosk"
             >
               <X className="w-4 h-4" /> Close
@@ -531,14 +531,14 @@ export function FaceAttendanceKioskModal({
         </div>
 
         {/* Configuration Bar */}
-        <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3 border-b border-slate-100 bg-white text-xs">
+        <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3 border-b border-slate-100 dark:border-slate-800/80 bg-white dark:bg-slate-900 text-xs">
           <div className="flex flex-wrap items-center gap-4">
             <label className="flex items-center gap-2">
-              <span className="font-medium text-slate-600">Station / Truck:</span>
+              <span className="font-medium text-slate-600 dark:text-slate-300">Station / Truck:</span>
               <select
                 value={kioskLocationId}
                 onChange={(e) => setKioskLocationId(e.target.value)}
-                className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs bg-white"
+                className="rounded-lg border border-slate-200 dark:border-slate-800 px-2.5 py-1.5 text-xs bg-white dark:bg-slate-900"
               >
                 <option value="">Employee Assigned Location</option>
                 {locations.map((l) => (
@@ -549,12 +549,12 @@ export function FaceAttendanceKioskModal({
               </select>
             </label>
             <label className="flex items-center gap-2">
-              <span className="font-medium text-slate-600">Shift Start (Late &gt;15m):</span>
+              <span className="font-medium text-slate-600 dark:text-slate-300">Shift Start (Late &gt;15m):</span>
               <input
                 type="time"
                 value={shiftStartTime}
                 onChange={(e) => setShiftStartTime(e.target.value)}
-                className="rounded-lg border border-slate-200 px-2.5 py-1 text-xs font-mono"
+                className="rounded-lg border border-slate-200 dark:border-slate-800 px-2.5 py-1 text-xs font-mono"
               />
             </label>
           </div>
@@ -565,9 +565,9 @@ export function FaceAttendanceKioskModal({
                 type="checkbox"
                 checked={requireLiveness}
                 onChange={(e) => setRequireLiveness(e.target.checked)}
-                className="rounded border-slate-300 text-slate-900 focus:ring-slate-900"
+                className="rounded border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-50 focus:ring-slate-900 dark:focus:ring-slate-200"
               />
-              <span className="font-medium text-slate-700">Require blink / head-turn liveness</span>
+              <span className="font-medium text-slate-700 dark:text-slate-200">Require blink / head-turn liveness</span>
             </label>
           )}
         </div>
@@ -578,7 +578,7 @@ export function FaceAttendanceKioskModal({
           <div className="lg:col-span-7 space-y-3">
             {kioskMode === 'FACE' ? (
               <>
-                <div className="relative rounded-xl overflow-hidden bg-slate-950 border border-slate-200 aspect-[4/3] flex items-center justify-center">
+                <div className="relative rounded-xl overflow-hidden bg-slate-950 border border-slate-200 dark:border-slate-800 aspect-[4/3] flex items-center justify-center">
                   <video
                     ref={videoRef}
                     muted
@@ -596,7 +596,7 @@ export function FaceAttendanceKioskModal({
                       <button
                         type="button"
                         onClick={() => setKioskMode('PIN')}
-                        className="px-4 py-2 rounded-lg bg-white text-slate-900 text-xs font-semibold hover:bg-slate-100"
+                        className="px-4 py-2 rounded-lg bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-50 text-xs font-semibold hover:bg-slate-100 dark:hover:bg-slate-800"
                       >
                         Switch to PIN Fallback
                       </button>
@@ -604,8 +604,8 @@ export function FaceAttendanceKioskModal({
                   )}
                 </div>
 
-                <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2.5 rounded-lg bg-slate-50 border border-slate-200 text-xs">
-                  <div className="flex items-center gap-2 text-slate-700 font-medium">
+                <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-800 text-xs">
+                  <div className="flex items-center gap-2 text-slate-700 dark:text-slate-200 font-medium">
                     <span
                       className={`w-2 h-2 rounded-full ${
                         matchedCandidate?.livenessPassed
@@ -634,7 +634,7 @@ export function FaceAttendanceKioskModal({
                           snapshotPhoto,
                         });
                       }}
-                      className="px-3 py-1.5 rounded-md bg-slate-900 text-white text-[11px] font-semibold hover:bg-slate-800 whitespace-nowrap"
+                      className="px-3 py-1.5 rounded-md bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950 text-[11px] font-semibold hover:bg-slate-800 dark:hover:bg-white whitespace-nowrap"
                     >
                       Confirm &amp; {matchedCandidate.nextAction === 'CLOCK_IN' ? 'Time In' : 'Time Out'} Now
                     </button>
@@ -661,28 +661,28 @@ export function FaceAttendanceKioskModal({
                     pinCode,
                   });
                 }}
-                className="rounded-xl border border-slate-200 bg-slate-50/70 p-5 space-y-4"
+                className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/70 p-5 space-y-4"
               >
                 <div>
-                  <h3 className="font-display text-sm font-semibold text-slate-900">Supervisor / Low-Light PIN Fallback</h3>
-                  <p className="text-xs text-slate-500 mt-0.5">
+                  <h3 className="font-display text-sm font-semibold text-slate-900 dark:text-slate-50">Supervisor / Low-Light PIN Fallback</h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                     Use when grill smoke, caps, or night-market lighting blocks facial matching. Camera snapshot is attached if available.
                   </p>
                 </div>
 
                 {pinErr && (
-                  <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">
+                  <div className="p-2.5 rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800/80 text-xs text-red-700 dark:text-red-300 font-medium">
                     {pinErr}
                   </div>
                 )}
 
                 <div className="space-y-3 text-xs">
                   <div>
-                    <label className="block font-medium text-slate-700 mb-1">Crew Member</label>
+                    <label className="block font-medium text-slate-700 dark:text-slate-200 mb-1">Crew Member</label>
                     <select
                       value={pinEmployeeId}
                       onChange={(e) => setPinEmployeeId(e.target.value)}
-                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2"
+                      className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 py-2"
                     >
                       {activeEmployees.map((emp) => {
                         const onShift = openShiftByEmployee.has(emp.id);
@@ -696,7 +696,7 @@ export function FaceAttendanceKioskModal({
                   </div>
 
                   <div>
-                    <label className="block font-medium text-slate-700 mb-1">Attendance PIN</label>
+                    <label className="block font-medium text-slate-700 dark:text-slate-200 mb-1">Attendance PIN</label>
                     <input
                       type="password"
                       inputMode="numeric"
@@ -704,7 +704,7 @@ export function FaceAttendanceKioskModal({
                       placeholder="Enter employee Attendance PIN"
                       value={pinCode}
                       onChange={(e) => setPinCode(e.target.value)}
-                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono tracking-widest"
+                      className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 py-2 font-mono tracking-widest"
                     />
                   </div>
                 </div>
@@ -712,7 +712,7 @@ export function FaceAttendanceKioskModal({
                 <button
                   type="submit"
                   disabled={submittingPunch || !pinEmployeeId}
-                  className="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50"
+                  className="inline-flex items-center gap-2 rounded-lg bg-slate-900 dark:bg-slate-100 px-4 py-2 text-xs font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white disabled:opacity-50"
                 >
                   <Clock className="w-3.5 h-3.5" />
                   {submittingPunch
@@ -729,15 +729,15 @@ export function FaceAttendanceKioskModal({
           <div className="lg:col-span-5 space-y-4">
             {/* Last Successful Punch Card */}
             {lastPunch ? (
-              <div className="rounded-xl border border-emerald-200 bg-emerald-50/70 p-4 space-y-3">
+              <div className="rounded-xl border border-emerald-200 dark:border-emerald-700/80 bg-emerald-50/70 dark:bg-emerald-950/45 p-4 space-y-3">
                 <div className="flex items-start justify-between gap-2">
-                  <div className="flex items-center gap-2 text-emerald-900">
-                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                  <div className="flex items-center gap-2 text-emerald-900 dark:text-emerald-300">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
                     <span className="text-xs font-semibold uppercase tracking-wide">
                       {lastPunch.action === 'CLOCK_IN' ? 'Time In Recorded' : 'Time Out Recorded'}
                     </span>
                   </div>
-                  <span className="text-[11px] font-mono text-emerald-800">
+                  <span className="text-[11px] font-mono text-emerald-800 dark:text-emerald-300">
                     {new Date(lastPunch.timestamp).toLocaleTimeString('en-PH', { hour: 'numeric', minute: '2-digit' })}
                   </span>
                 </div>
@@ -747,21 +747,21 @@ export function FaceAttendanceKioskModal({
                     <img
                       src={lastPunch.snapshotPhoto}
                       alt={lastPunch.employeeName}
-                      className="w-12 h-12 rounded-lg object-cover border border-emerald-200 shrink-0"
+                      className="w-12 h-12 rounded-lg object-cover border border-emerald-200 dark:border-emerald-700/80 shrink-0"
                     />
                   ) : (
                     <AvatarBadge name={lastPunch.employeeName} src={lastPunch.avatarUrl} size="md" />
                   )}
                   <div className="min-w-0">
-                    <p className="text-sm font-semibold text-slate-900 truncate">{lastPunch.employeeName}</p>
-                    <p className="text-xs text-slate-600">
+                    <p className="text-sm font-semibold text-slate-900 dark:text-slate-50 truncate">{lastPunch.employeeName}</p>
+                    <p className="text-xs text-slate-600 dark:text-slate-300">
                       {lastPunch.employeeCode} · {lastPunch.status} ·{' '}
                       {lastPunch.method === 'FACE_SCAN'
                         ? `Face Match${lastPunch.confidencePct ? ` (${lastPunch.confidencePct}%)` : ''}`
                         : 'PIN Fallback'}
                     </p>
                     {lastPunch.action === 'CLOCK_OUT' && (
-                      <p className="text-xs font-mono font-semibold text-emerald-800 mt-0.5">
+                      <p className="text-xs font-mono font-semibold text-emerald-800 dark:text-emerald-300 mt-0.5">
                         Shift: {lastPunch.workedHours ?? 0}h worked
                         {Number(lastPunch.overtimeHours || 0) > 0 ? ` · ${lastPunch.overtimeHours}h OT` : ''}
                       </p>
@@ -770,36 +770,36 @@ export function FaceAttendanceKioskModal({
                 </div>
               </div>
             ) : (
-              <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-4 text-xs text-slate-600 space-y-1">
-                <div className="flex items-center gap-2 font-semibold text-slate-800">
-                  <ShieldCheck className="w-4 h-4 text-slate-700" />
+              <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/60 p-4 text-xs text-slate-600 dark:text-slate-300 space-y-1">
+                <div className="flex items-center gap-2 font-semibold text-slate-800 dark:text-slate-100">
+                  <ShieldCheck className="w-4 h-4 text-slate-700 dark:text-slate-200" />
                   Ready for Shift Punch
                 </div>
-                <p className="text-slate-500">
+                <p className="text-slate-500 dark:text-slate-400">
                   Look into the camera for hands-free identification. Employees with an open shift automatically clock out and calculate overtime hours.
                 </p>
               </div>
             )}
 
             {/* Biometric Enrollment Readiness */}
-            <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+            <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 space-y-3">
               <div className="flex items-center justify-between">
                 <div>
-                  <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-700">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-700 dark:text-slate-200">
                     Enrolled Face Profiles
                   </h3>
-                  <p className="text-[11px] text-slate-500 mt-0.5">
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
                     {enrolledEmployees.length} of {activeEmployees.length} active crew enrolled on-device
                   </p>
                 </div>
-                <span className="font-mono text-sm font-bold text-slate-900">
+                <span className="font-mono text-sm font-bold text-slate-900 dark:text-slate-50">
                   {activeEmployees.length ? Math.round((enrolledEmployees.length / activeEmployees.length) * 100) : 0}%
                 </span>
               </div>
 
               {pendingAutoEnroll.length > 0 && canManageEmployees && (
-                <div className="rounded-lg border border-blue-200 bg-blue-50/70 p-3 space-y-2">
-                  <p className="text-[11px] text-blue-900">
+                <div className="rounded-lg border border-blue-200 dark:border-blue-700/80 bg-blue-50/70 dark:bg-blue-950/50 p-3 space-y-2">
+                  <p className="text-[11px] text-blue-900 dark:text-blue-300">
                     <span className="font-semibold">{pendingAutoEnroll.length} crew photo(s)</span> already uploaded can be enrolled for face scanning right now.
                   </p>
                   <button
@@ -814,16 +814,16 @@ export function FaceAttendanceKioskModal({
                 </div>
               )}
               {pendingAutoEnroll.length > 0 && !canManageEmployees && (
-                <p className="text-[11px] text-slate-500">
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
                   {pendingAutoEnroll.length} crew photo(s) await Face ID enrollment by an HR Manager or Owner.
                 </p>
               )}
 
               {enrollProgressMsg && (
-                <p className="text-[11px] font-medium text-emerald-700">{enrollProgressMsg}</p>
+                <p className="text-[11px] font-medium text-emerald-700 dark:text-emerald-300">{enrollProgressMsg}</p>
               )}
 
-              <div className="max-h-56 overflow-y-auto divide-y divide-slate-100 border-t border-slate-100 pt-1">
+              <div className="max-h-56 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800 border-t border-slate-100 dark:border-slate-800/80 pt-1">
                 {activeEmployees.map((emp) => {
                   const isEnrolled = Boolean(parseDescriptorJson(emp.face_descriptor_json));
                   const onShift = openShiftByEmployee.has(emp.id);
@@ -832,19 +832,19 @@ export function FaceAttendanceKioskModal({
                       <div className="flex items-center gap-2 min-w-0">
                         <AvatarBadge name={emp.full_name} src={emp.avatar_url} size="sm" />
                         <div className="min-w-0">
-                          <p className="font-medium text-slate-900 truncate">{emp.full_name}</p>
-                          <p className="text-[11px] text-slate-500 truncate">
+                          <p className="font-medium text-slate-900 dark:text-slate-50 truncate">{emp.full_name}</p>
+                          <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
                             {emp.employee_code} · {onShift ? 'On Shift' : 'Off Shift'}
                           </p>
                         </div>
                       </div>
                       <div className="flex items-center gap-1.5 text-[11px] shrink-0">
                         {isEnrolled ? (
-                          <span className="inline-flex items-center gap-1 text-emerald-700 font-medium">
+                          <span className="inline-flex items-center gap-1 text-emerald-700 dark:text-emerald-300 font-medium">
                             <UserCheck className="w-3.5 h-3.5" /> Face Ready
                           </span>
                         ) : (
-                          <span className="text-slate-400">Not Enrolled</span>
+                          <span className="text-slate-500 dark:text-slate-400">Not Enrolled</span>
                         )}
                       </div>
                     </div>
@@ -856,12 +856,12 @@ export function FaceAttendanceKioskModal({
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-between gap-3 px-5 py-3 border-t border-slate-200 bg-slate-50/70">
-          <p className="text-[11px] text-slate-500">Press Esc or click outside to close. Camera stops automatically on close.</p>
+        <div className="flex items-center justify-between gap-3 px-5 py-3 border-t border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/70">
+          <p className="text-[11px] text-slate-500 dark:text-slate-400">Press Esc or click outside to close. Camera stops automatically on close.</p>
           <button
             type="button"
             onClick={onClose}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-100 hover:text-slate-900 transition-colors"
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-4 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-white transition-colors"
           >
             <X className="w-3.5 h-3.5" /> Close Kiosk
           </button>

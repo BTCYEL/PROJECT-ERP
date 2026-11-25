@@ -1,4 +1,4 @@
-import React, { Component, useEffect, useMemo, useState } from 'react';
+import React, { Component, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   LayoutDashboard,
   ShoppingCart,
@@ -19,17 +19,45 @@ import {
   Settings,
   ScanFace,
   Lock,
+  ShieldAlert,
+  AlertTriangle,
+  Megaphone,
+  CheckCircle2,
+  Info,
 } from 'lucide-react';
 import { onAuthStateChanged, signOut, User } from 'firebase/auth';
 import { MotionConfig } from 'motion/react';
 import { auth } from './lib/firebase.ts';
 import { apiFetch } from './lib/api.ts';
 import {
+  DailyHuddleItem,
+  filterActiveHuddlesForInterface,
+  formatChannelLabel,
+  formatShiftWindowLabel,
+} from './lib/dailyHuddle.ts';
+import {
   resetFirebaseSyncCache,
   setActiveErpUserId,
   setSignedOutSession,
+  subscribeDailyHuddles,
   syncFirebaseUserAndSeed,
 } from './lib/firestoreErp.ts';
+import {
+  attemptSilentTerminalFirebaseSignIn,
+  fetchTerminalStatus,
+  getBrowserDeviceSummary,
+  getOrCreateHardwareUuid,
+  isTerminalModeDevice,
+  setTerminalModeEnabled,
+  TerminalServerStatus,
+  unpairTerminalDevice,
+  updateTerminalStationConfig,
+} from './lib/terminalAuth.ts';
+import {
+  clearTerminalPrinterConfig,
+  printerMappingFromDeviceRow,
+  saveTerminalPrinterConfig,
+} from './lib/printerDiscovery.ts';
 import { AuthUser, LocationRow, PERMISSIONS } from './types/erp.ts';
 import { LoginView } from './components/LoginView.tsx';
 import { DashboardModule } from './components/DashboardModule.tsx';
@@ -42,6 +70,10 @@ import { OperationsHrCrmModule } from './components/OperationsHrCrmModule.tsx';
 import { AvatarBadge, SettingsUserControlModule } from './components/SettingsUserControlModule.tsx';
 import { FaceAttendanceKioskModal } from './components/FaceAttendanceKioskModal.tsx';
 import { SessionLockModal } from './components/SessionLockModal.tsx';
+import { PublicDigitalReceiptView } from './components/PublicDigitalReceiptView.tsx';
+import { CustomerLoyaltyKiosk } from './components/CustomerLoyaltyKiosk.tsx';
+import { DailyHuddleBanner } from './components/DailyHuddleBanner.tsx';
+import { ThemeToggle } from './components/ThemeToggle.tsx';
 
 const IDLE_LOCK_STORAGE_KEY = 'maximus_bbq_idle_lock_mins';
 
@@ -66,14 +98,14 @@ class AppErrorBoundary extends Component<{ children: React.ReactNode }, ErrorBou
         // plain error message
       }
       return (
-        <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
-          <div className="max-w-md w-full bg-white border border-red-200 rounded-xl p-6 space-y-4">
-            <h2 className="font-display text-lg font-semibold text-slate-900">Workspace Sync Error</h2>
-            <p className="text-xs text-red-700 bg-red-50 border border-red-100 rounded-lg p-3 break-words">{friendlyMsg}</p>
+        <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex items-center justify-center p-6">
+          <div className="max-w-md w-full bg-white dark:bg-slate-900 border border-red-200 dark:border-red-800/80 rounded-xl p-6 space-y-4">
+            <h2 className="font-display text-lg font-semibold text-slate-900 dark:text-slate-50">Workspace Sync Error</h2>
+            <p className="text-xs text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-950/50 border border-red-100 dark:border-red-800/80 rounded-lg p-3 break-words">{friendlyMsg}</p>
             <div className="flex items-center gap-2">
               <button
                 onClick={() => window.location.reload()}
-                className="rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800"
+                className="rounded-lg bg-slate-900 dark:bg-slate-100 px-4 py-2 text-xs font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white"
               >
                 Reload Workspace
               </button>
@@ -83,7 +115,7 @@ class AppErrorBoundary extends Component<{ children: React.ReactNode }, ErrorBou
                   resetFirebaseSyncCache();
                   signOut(auth).finally(() => window.location.reload());
                 }}
-                className="rounded-lg border border-slate-200 px-4 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                className="rounded-lg border border-slate-200 dark:border-slate-800 px-4 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
               >
                 Sign Out
               </button>
@@ -103,6 +135,17 @@ interface NavItem {
   perm: string;
   icon: React.ComponentType<{ className?: string }>;
   ownerOrSuperAdminOnly?: boolean;
+  settingsAccess?: boolean;
+}
+
+function canAccessSettingsModule(u: AuthUser): boolean {
+  return (
+    u.roleCode === 'SUPER_ADMIN' ||
+    u.roleCode === 'BUSINESS_OWNER' ||
+    u.roleCode === 'OPERATIONS_MANAGER' ||
+    u.roleCode === 'FOOD_TRUCK_MANAGER' ||
+    u.permissions.includes(PERMISSIONS.POS_SELL)
+  );
 }
 
 const NAV_ITEMS: NavItem[] = [
@@ -118,7 +161,7 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'hr', label: 'HR & PH Payroll', group: 'Workforce & Fleet', perm: PERMISSIONS.HR_MANAGE, icon: Users },
   { id: 'crm', label: 'Customer CRM', group: 'Growth & Audit', perm: PERMISSIONS.CRM_MANAGE, icon: HeartHandshake },
   { id: 'reports', label: 'Reports & RBAC', group: 'Growth & Audit', perm: PERMISSIONS.REPORTS_VIEW, icon: FileSpreadsheet },
-  { id: 'settings', label: 'User Control', group: 'Administration', perm: PERMISSIONS.SETTINGS_ADMIN, icon: Settings, ownerOrSuperAdminOnly: true },
+  { id: 'settings', label: 'Settings & Devices', group: 'Administration', perm: PERMISSIONS.SETTINGS_ADMIN, icon: Settings, settingsAccess: true },
 ];
 
 function AppShell() {
@@ -131,11 +174,19 @@ function AppShell() {
   const [activeLocationId, setActiveLocationId] = useState<string>('ALL');
   const [notifications, setNotifications] = useState<any[]>([]);
   const [showNotifs, setShowNotifs] = useState(false);
+  const [dailyHuddles, setDailyHuddles] = useState<DailyHuddleItem[]>([]);
+  const [showHuddlePanel, setShowHuddlePanel] = useState(false);
+  const [ackingHuddleId, setAckingHuddleId] = useState<string | null>(null);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [showGlobalKiosk, setShowGlobalKiosk] = useState(false);
   const [kioskData, setKioskData] = useState<{ employees: any[]; attendance: any[] } | null>(null);
   const [pendingQuickAction, setPendingQuickAction] = useState<{ tab: string; action: string; nonce: number } | null>(null);
   const [isLocked, setIsLocked] = useState(false);
+  const [terminalMode, setTerminalMode] = useState<boolean>(() => isTerminalModeDevice());
+  const [terminalStatus, setTerminalStatus] = useState<TerminalServerStatus | null>(null);
+  const [terminalAuthState, setTerminalAuthState] = useState<'idle' | 'authenticating' | 'ready' | 'needs_pairing' | 'not_configured' | 'error'>('idle');
+  const [terminalAuthMessage, setTerminalAuthMessage] = useState('');
+  const silentAuthAttemptedRef = useRef(false);
   const [idleTimeoutMins, setIdleTimeoutMins] = useState<number>(() => {
     try {
       const saved = Number(localStorage.getItem(IDLE_LOCK_STORAGE_KEY));
@@ -145,6 +196,50 @@ function AppShell() {
     }
     return 15;
   });
+
+  const refreshTerminalEnvironment = useCallback(async (forceRetrySilentAuth = false): Promise<boolean> => {
+    const isTerm = isTerminalModeDevice();
+    setTerminalMode(isTerm);
+    const status = await fetchTerminalStatus();
+    setTerminalStatus(status);
+
+    if (!isTerm) {
+      setTerminalAuthState('idle');
+      setTerminalAuthMessage('');
+      return false;
+    }
+
+    if (auth.currentUser) {
+      setTerminalAuthState('ready');
+      setTerminalAuthMessage('');
+      return true;
+    }
+
+    if (silentAuthAttemptedRef.current && !forceRetrySilentAuth) {
+      return false;
+    }
+
+    silentAuthAttemptedRef.current = true;
+    setTerminalAuthState('authenticating');
+    setTerminalAuthMessage('');
+
+    const res = await attemptSilentTerminalFirebaseSignIn();
+    if (res.ok) {
+      setTerminalAuthState('ready');
+      setTerminalAuthMessage('');
+      return true;
+    }
+
+    if (res.status === 'not_paired') {
+      setTerminalAuthState('needs_pairing');
+    } else if (res.status === 'not_configured') {
+      setTerminalAuthState('not_configured');
+    } else {
+      setTerminalAuthState('error');
+    }
+    setTerminalAuthMessage(res.message || '');
+    return false;
+  }, []);
 
   const handleQuickAction = (tab: string, action?: string) => {
     setActiveTab(tab);
@@ -203,12 +298,57 @@ function AppShell() {
         setUser(null);
         setIsLocked(false);
         resetFirebaseSyncCache();
-        setBooting(false);
+        const triggeredSilentLogin = await refreshTerminalEnvironment(false);
+        if (!triggeredSilentLogin) {
+          setBooting(false);
+        }
         return;
       }
 
+      const currentTermMode = isTerminalModeDevice();
+      setTerminalMode(currentTermMode);
+      void fetchTerminalStatus().then(setTerminalStatus);
+
       try {
         await syncFirebaseUserAndSeed(fbUser);
+
+        if (currentTermMode) {
+          const check = await apiFetch<{ registered: boolean; status: string; device?: any }>('/terminal/device-check', {
+            method: 'POST',
+            body: JSON.stringify({
+              hardwareUuid: getOrCreateHardwareUuid(),
+              userAgentSummary: getBrowserDeviceSummary(),
+            }),
+          }).catch(() => null);
+
+          if (check?.registered && check.status === 'REVOKED') {
+            setTerminalModeEnabled(false);
+            clearTerminalPrinterConfig();
+            await unpairTerminalDevice(undefined, { forceRevoke: true }).catch(() => {});
+            setTerminalMode(false);
+            setTerminalAuthState('needs_pairing');
+            setTerminalAuthMessage('This terminal hardware UUID has been revoked in Settings. Re-pair with TERMINAL_ACCESS_KEY.');
+            setActiveErpUserId(null);
+            setSignedOutSession(true);
+            setUser(null);
+            setBooting(false);
+            return;
+          }
+
+          if (check?.registered && check.status === 'AUTHORIZED' && check.device) {
+            updateTerminalStationConfig({
+              stationEmail: check.device.station_email || undefined,
+              locationId: check.device.location_id || undefined,
+            });
+            const mapped = printerMappingFromDeviceRow(check.device, getOrCreateHardwareUuid());
+            if (mapped) {
+              saveTerminalPrinterConfig(mapped);
+            } else {
+              clearTerminalPrinterConfig();
+            }
+          }
+        }
+
         const erpUser = await apiFetch<AuthUser>('/auth/me');
         setUser(erpUser);
         setIsLocked(false);
@@ -233,7 +373,7 @@ function AppShell() {
       }
     });
     return () => unsub();
-  }, []);
+  }, [refreshTerminalEnvironment]);
 
   useEffect(() => {
     if (!user || isLocked || idleTimeoutMins <= 0) return;
@@ -268,10 +408,42 @@ function AppShell() {
     }
   }, [user, activeLocationId]);
 
+  useEffect(() => {
+    if (!firebaseUser || !user) {
+      setDailyHuddles([]);
+      return;
+    }
+    const unsub = subscribeDailyHuddles((rows) => {
+      setDailyHuddles(rows);
+    });
+    return () => unsub();
+  }, [firebaseUser, user]);
+
+  const refreshHuddles = async () => {
+    try {
+      const rows = await apiFetch<DailyHuddleItem[]>('/huddles');
+      setDailyHuddles(rows);
+    } catch {
+      // Ignore if signed out
+    }
+  };
+
+  const acknowledgeHuddle = async (huddleId: string) => {
+    if (!user) return;
+    setAckingHuddleId(huddleId);
+    try {
+      const updated = await apiFetch<DailyHuddleItem>(`/huddles/${huddleId}/acknowledge`, { method: 'POST' });
+      setDailyHuddles((prev) => prev.map((h) => (h.id === huddleId ? updated : h)));
+    } finally {
+      setAckingHuddleId(null);
+    }
+  };
+
   const visibleNav = useMemo(() => {
     if (!user) return [];
     const isOwnerOrSuper = user.roleCode === 'SUPER_ADMIN' || user.roleCode === 'BUSINESS_OWNER';
     return NAV_ITEMS.filter((n) => {
+      if (n.settingsAccess) return canAccessSettingsModule(user);
       if (n.ownerOrSuperAdminOnly) return isOwnerOrSuper;
       return isOwnerOrSuper || user.permissions.includes(n.perm);
     });
@@ -288,11 +460,21 @@ function AppShell() {
     }
   }, [currentTab, activeTab]);
 
+  const activeHeaderHuddles = useMemo(() => {
+    if (!user) return [];
+    return filterActiveHuddlesForInterface(dailyHuddles, {
+      channel: currentTab === 'pos' ? 'POS' : currentTab === 'kds' ? 'KDS' : 'MOBILE',
+      includeMobileChannel: true,
+      locationId: activeLocationId,
+    });
+  }, [user, dailyHuddles, currentTab, activeLocationId]);
+
   const handleAuthenticated = async (u: AuthUser) => {
     setBootError('');
     setIsLocked(false);
     const isOwnerOrSuper = u.roleCode === 'SUPER_ADMIN' || u.roleCode === 'BUSINESS_OWNER';
     const allowed = NAV_ITEMS.filter((n) => {
+      if (n.settingsAccess) return canAccessSettingsModule(u);
       if (n.ownerOrSuperAdminOnly) return isOwnerOrSuper;
       return isOwnerOrSuper || u.permissions.includes(n.perm);
     });
@@ -330,7 +512,7 @@ function AppShell() {
 
   if (booting) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-50 text-sm text-slate-500">
+      <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-slate-950 text-sm text-slate-500 dark:text-slate-400">
         Loading Maximus Barbecue ERP...
       </div>
     );
@@ -338,20 +520,20 @@ function AppShell() {
 
   if (bootError) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
-        <div className="max-w-md w-full bg-white border border-red-200 rounded-xl p-6 space-y-4">
-          <h2 className="font-display text-lg font-semibold text-slate-900">Unable to Connect to Cloud Workspace</h2>
-          <p className="text-xs text-red-700 bg-red-50 border border-red-100 rounded-lg p-3 break-words">{bootError}</p>
+      <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex items-center justify-center p-6">
+        <div className="max-w-md w-full bg-white dark:bg-slate-900 border border-red-200 dark:border-red-800/80 rounded-xl p-6 space-y-4">
+          <h2 className="font-display text-lg font-semibold text-slate-900 dark:text-slate-50">Unable to Connect to Cloud Workspace</h2>
+          <p className="text-xs text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-950/50 border border-red-100 dark:border-red-800/80 rounded-lg p-3 break-words">{bootError}</p>
           <div className="flex items-center gap-2">
             <button
               onClick={() => window.location.reload()}
-              className="rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800"
+              className="rounded-lg bg-slate-900 dark:bg-slate-100 px-4 py-2 text-xs font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white"
             >
               Retry
             </button>
             <button
               onClick={() => signOut(auth).finally(() => window.location.reload())}
-              className="rounded-lg border border-slate-200 px-4 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50"
+              className="rounded-lg border border-slate-200 dark:border-slate-800 px-4 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
             >
               Sign Out
             </button>
@@ -362,26 +544,40 @@ function AppShell() {
   }
 
   if (!firebaseUser || !user) {
-    return <LoginView firebaseUser={firebaseUser} onAuthenticated={handleAuthenticated} />;
+    return (
+      <LoginView
+        firebaseUser={firebaseUser}
+        onAuthenticated={handleAuthenticated}
+        isTerminalMode={terminalMode}
+        terminalStatus={terminalStatus}
+        terminalAuthState={terminalAuthState}
+        terminalAuthMessage={terminalAuthMessage}
+        onTerminalStateChanged={async (retrySilentAuth) => {
+          silentAuthAttemptedRef.current = false;
+          await refreshTerminalEnvironment(Boolean(retrySilentAuth));
+        }}
+      />
+    );
   }
 
   const unreadCount = notifications.filter((n) => n.is_read === 0).length;
+  const unackHuddleCount = activeHeaderHuddles.filter((h) => !h.acknowledgedBy.includes(user.id)).length;
   const activeItem = NAV_ITEMS.find((n) => n.id === currentTab) || visibleNav[0];
   const groups = Array.from(new Set(visibleNav.map((n) => n.group)));
 
   return (
     <MotionConfig reducedMotion="user">
-      <div className="min-h-screen bg-slate-50 flex">
+      <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex">
         {/* Desktop Sidebar */}
-        <aside className="hidden lg:flex lg:flex-col lg:w-64 lg:shrink-0 bg-white border-r border-slate-200 no-print">
-          <div className="h-16 px-4 flex items-center gap-2.5 border-b border-slate-200">
+        <aside className="hidden lg:flex lg:flex-col lg:w-64 lg:shrink-0 bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 no-print">
+          <div className="h-16 px-4 flex items-center gap-2.5 border-b border-slate-200 dark:border-slate-800">
             <img
               src="/assets/aistudio/Logo_836b4628.png"
               alt="Maximus Barbecue Logo"
               referrerPolicy="no-referrer"
               className="w-8 h-8 rounded-full object-contain shrink-0"
             />
-            <span className="font-display font-bold text-sm tracking-tight text-slate-900 whitespace-nowrap">
+            <span className="font-display font-bold text-sm tracking-tight text-slate-900 dark:text-slate-50 whitespace-nowrap">
               Maximus Barbecue
             </span>
           </div>
@@ -389,7 +585,7 @@ function AppShell() {
           <nav className="flex-1 overflow-y-auto p-3.5 space-y-5">
             {groups.map((grp) => (
               <div key={grp} className="space-y-1">
-                <p className="px-3 text-[11px] font-semibold text-slate-400">{grp}</p>
+                <p className="px-3 text-[11px] font-semibold text-slate-500 dark:text-slate-400">{grp}</p>
                 {visibleNav
                   .filter((item) => item.group === grp)
                   .map((item) => {
@@ -401,8 +597,8 @@ function AppShell() {
                         onClick={() => setActiveTab(item.id)}
                         className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-medium transition-colors whitespace-nowrap ${
                           active
-                            ? 'bg-slate-900 text-white'
-                            : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+                            ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950'
+                            : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-white'
                         }`}
                       >
                         <Icon className="w-4 h-4 shrink-0" />
@@ -414,28 +610,28 @@ function AppShell() {
             ))}
           </nav>
 
-          <div className="p-4 border-t border-slate-200 space-y-2.5">
+          <div className="p-4 border-t border-slate-200 dark:border-slate-800 space-y-2.5">
             <button
               type="button"
               onClick={openAttendanceKiosk}
-              className="w-full inline-flex items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-800 transition-colors"
+              className="w-full inline-flex items-center justify-center gap-1.5 rounded-lg bg-slate-900 dark:bg-slate-100 px-3 py-2 text-xs font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white transition-colors"
             >
               <ScanFace className="w-3.5 h-3.5" /> Attendance Kiosk
             </button>
             <div className="flex items-center gap-2.5 text-xs pt-0.5">
               <AvatarBadge name={user.fullName} src={user.avatarUrl} size="sm" />
               <div className="min-w-0">
-                <p className="font-semibold text-slate-900 truncate">{user.fullName}</p>
-                <p className="text-slate-500 truncate">{user.roleName}</p>
+                <p className="font-semibold text-slate-900 dark:text-slate-50 truncate">{user.fullName}</p>
+                <p className="text-slate-500 dark:text-slate-400 truncate">{user.roleName}</p>
               </div>
             </div>
-            <div className="flex items-center justify-between gap-2 text-[11px] text-slate-500">
+            <div className="flex items-center justify-between gap-2 text-[11px] text-slate-500 dark:text-slate-400">
               <span>Auto-Lock</span>
               <select
                 aria-label="Idle Auto-Lock Timeout"
                 value={idleTimeoutMins}
                 onChange={(e) => handleIdleTimeoutChange(Number(e.target.value))}
-                className="rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[11px] font-medium text-slate-700"
+                className="rounded border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 px-1.5 py-0.5 text-[11px] font-medium text-slate-700 dark:text-slate-200"
               >
                 <option value={5}>5m idle</option>
                 <option value={15}>15m idle</option>
@@ -447,14 +643,14 @@ function AppShell() {
               <button
                 type="button"
                 onClick={() => setIsLocked(true)}
-                className="inline-flex items-center justify-center gap-1 rounded-lg border border-slate-200 px-2.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+                className="inline-flex items-center justify-center gap-1 rounded-lg border border-slate-200 dark:border-slate-800 px-2.5 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap"
               >
                 <Lock className="w-3.5 h-3.5" /> Lock
               </button>
               <button
                 type="button"
                 onClick={handleLogout}
-                className="inline-flex items-center justify-center gap-1 rounded-lg border border-slate-200 px-2.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+                className="inline-flex items-center justify-center gap-1 rounded-lg border border-slate-200 dark:border-slate-800 px-2.5 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap"
               >
                 <LogOut className="w-3.5 h-3.5" /> Sign Out
               </button>
@@ -465,8 +661,8 @@ function AppShell() {
         {/* Mobile Drawer */}
         {mobileMenuOpen && (
           <div className="fixed inset-0 z-50 lg:hidden flex">
-            <div className="w-64 bg-white h-full border-r border-slate-200 flex flex-col">
-              <div className="h-16 px-4 flex items-center justify-between border-b border-slate-200">
+            <div className="w-64 bg-white dark:bg-slate-900 h-full border-r border-slate-200 dark:border-slate-800 flex flex-col">
+              <div className="h-16 px-4 flex items-center justify-between border-b border-slate-200 dark:border-slate-800">
                 <div className="flex items-center gap-2">
                   <img
                     src="/assets/aistudio/Logo_836b4628.png"
@@ -491,7 +687,7 @@ function AppShell() {
                         setMobileMenuOpen(false);
                       }}
                       className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-xs font-medium ${
-                        currentTab === item.id ? 'bg-slate-900 text-white' : 'text-slate-700 hover:bg-slate-100'
+                        currentTab === item.id ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950' : 'text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800'
                       }`}
                     >
                       <Icon className="w-4 h-4" />
@@ -500,14 +696,14 @@ function AppShell() {
                   );
                 })}
               </nav>
-              <div className="p-3 border-t space-y-2">
+              <div className="p-3 border-t border-slate-200 dark:border-slate-800 space-y-2">
                 <button
                   type="button"
                   onClick={() => {
                     setMobileMenuOpen(false);
                     openAttendanceKiosk();
                   }}
-                  className="w-full inline-flex items-center justify-center gap-1.5 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold"
+                  className="w-full inline-flex items-center justify-center gap-1.5 py-2 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950 text-xs font-semibold"
                 >
                   <ScanFace className="w-3.5 h-3.5" /> Attendance Kiosk
                 </button>
@@ -518,14 +714,14 @@ function AppShell() {
                       setMobileMenuOpen(false);
                       setIsLocked(true);
                     }}
-                    className="inline-flex items-center justify-center gap-1 py-2 rounded-lg border text-xs font-medium text-slate-700"
+                    className="inline-flex items-center justify-center gap-1 py-2 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
                   >
                     <Lock className="w-3.5 h-3.5" /> Lock
                   </button>
                   <button
                     type="button"
                     onClick={handleLogout}
-                    className="inline-flex items-center justify-center gap-1 py-2 rounded-lg border text-xs font-medium text-slate-700"
+                    className="inline-flex items-center justify-center gap-1 py-2 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
                   >
                     <LogOut className="w-3.5 h-3.5" /> Sign Out
                   </button>
@@ -538,18 +734,18 @@ function AppShell() {
 
         {/* Main Viewport */}
         <div className="flex-1 flex flex-col min-w-0">
-          <header className="h-16 bg-white border-b border-slate-200 px-4 lg:px-8 flex items-center justify-between gap-4 no-print">
+          <header className="h-16 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 px-4 lg:px-8 flex items-center justify-between gap-4 no-print">
             <div className="flex items-center gap-3 min-w-0">
               <button
                 onClick={() => setMobileMenuOpen(true)}
-                className="lg:hidden p-2 rounded-lg border border-slate-200 text-slate-700"
+                className="lg:hidden p-2 rounded-lg border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-200"
               >
                 <Menu className="w-4 h-4" />
               </button>
-              <div className="text-xs text-slate-500 truncate">
+              <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
                 <span>{activeItem?.group}</span>
                 <span className="mx-1.5">/</span>
-                <span className="font-semibold text-slate-900">{activeItem?.label}</span>
+                <span className="font-semibold text-slate-900 dark:text-slate-50">{activeItem?.label}</span>
               </div>
             </div>
 
@@ -558,7 +754,7 @@ function AppShell() {
                 aria-label="Filter by Food Truck & Location"
                 value={activeLocationId}
                 onChange={(e) => setActiveLocationId(e.target.value)}
-                className="max-w-[145px] sm:max-w-none rounded-lg border border-slate-200 bg-slate-50 px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-700"
+                className="max-w-[145px] sm:max-w-none rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200"
               >
                 <option value="ALL">All Trucks &amp; Commissary</option>
                 {locations.map((l) => (
@@ -566,20 +762,22 @@ function AppShell() {
                 ))}
               </select>
 
-              <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 min-w-0">
+              <div className="flex items-center gap-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 px-2.5 py-1.5 min-w-0">
                 <AvatarBadge name={user.fullName} src={user.avatarUrl} size="sm" />
                 <div className="leading-tight min-w-0">
-                  <p className="text-xs font-semibold text-slate-900 truncate max-w-[120px] sm:max-w-[180px]">{user.fullName}</p>
-                  <p className="text-[11px] text-slate-500 truncate max-w-[120px] sm:max-w-[180px]">{user.roleName}</p>
+                  <p className="text-xs font-semibold text-slate-900 dark:text-slate-50 truncate max-w-[120px] sm:max-w-[180px]">{user.fullName}</p>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate max-w-[120px] sm:max-w-[180px]">{user.roleName}</p>
                 </div>
               </div>
+
+              <ThemeToggle variant="header" />
 
               <button
                 type="button"
                 onClick={() => setIsLocked(true)}
                 title="Lock Terminal"
                 aria-label="Lock Terminal"
-                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap shrink-0"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
               >
                 <Lock className="w-3.5 h-3.5" />
                 <span className="hidden sm:inline">Lock</span>
@@ -587,12 +785,115 @@ function AppShell() {
 
               <div className="relative">
                 <button
+                  type="button"
                   onClick={() => {
+                    setShowNotifs(false);
+                    setShowHuddlePanel((prev) => !prev);
+                  }}
+                  className="relative p-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200"
+                  aria-label="Daily Huddle Briefings"
+                  title="Daily Huddle Briefings"
+                >
+                  <Megaphone className="w-4 h-4" />
+                  {unackHuddleCount > 0 && (
+                    <span className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-amber-600 text-white text-[10px] font-mono font-bold flex items-center justify-center">
+                      {unackHuddleCount}
+                    </span>
+                  )}
+                </button>
+
+                {showHuddlePanel && (
+                  <div className="absolute right-0 mt-2 w-80 sm:w-96 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-lg z-40 p-3 space-y-2">
+                    <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800/80 pb-2 gap-2">
+                      <div className="min-w-0">
+                        <span className="block text-xs font-semibold text-slate-900 dark:text-slate-50">Daily Huddle Briefings</span>
+                        <span className="block text-[10px] text-slate-500 dark:text-slate-400 truncate">
+                          {activeLocationId === 'ALL'
+                            ? 'All Trucks & Commissary'
+                            : locations.find((l) => l.id === activeLocationId)?.name || 'Selected Location'}
+                        </span>
+                      </div>
+                      <span className="text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400 shrink-0">
+                        {unackHuddleCount} unconfirmed
+                      </span>
+                    </div>
+
+                    <div className="max-h-80 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800">
+                      {activeHeaderHuddles.length === 0 ? (
+                        <p className="py-6 text-center text-xs text-slate-500 dark:text-slate-400">
+                          No active briefings for this truck / interface right now.
+                        </p>
+                      ) : (
+                        activeHeaderHuddles.map((h) => {
+                          const acked = h.acknowledgedBy.includes(user.id);
+                          const isCritical = h.priority === 'CRITICAL';
+                          const isUrgent = h.priority === 'URGENT';
+                          return (
+                            <div key={h.id} className="py-2.5 text-xs space-y-1.5">
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="flex items-start gap-1.5 min-w-0">
+                                  {isCritical ? (
+                                    <ShieldAlert className="w-3.5 h-3.5 text-red-600 dark:text-red-300 shrink-0 mt-0.5" />
+                                  ) : isUrgent ? (
+                                    <AlertTriangle className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                                  ) : (
+                                    <Info className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400 shrink-0 mt-0.5" />
+                                  )}
+                                  <div className="min-w-0">
+                                    <span className={`block font-semibold ${isCritical ? 'text-red-800 dark:text-red-300' : 'text-slate-900 dark:text-slate-50'}`}>
+                                      {h.title}
+                                    </span>
+                                    <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[10px] text-slate-500 dark:text-slate-400 mt-0.5">
+                                      <span
+                                        className={`font-semibold uppercase tracking-wide ${
+                                          isCritical ? 'text-red-600 dark:text-red-300' : isUrgent ? 'text-amber-700 dark:text-amber-300' : 'text-slate-600 dark:text-slate-300'
+                                        }`}
+                                      >
+                                        {isCritical ? 'Critical' : isUrgent ? 'Urgent' : 'Normal'}
+                                      </span>
+                                      <span>· {formatShiftWindowLabel(h.shiftWindow)}</span>
+                                      <span>· {h.locationName || 'All Trucks & Commissary'}</span>
+                                    </div>
+                                  </div>
+                                </div>
+                                {acked ? (
+                                  <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700 dark:text-emerald-300 shrink-0">
+                                    <CheckCircle2 className="w-3 h-3" />
+                                    Seen
+                                  </span>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    disabled={ackingHuddleId === h.id}
+                                    onClick={() => void acknowledgeHuddle(h.id)}
+                                    className="rounded-md bg-slate-900 dark:bg-slate-100 px-2 py-1 text-[11px] font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white disabled:opacity-50 shrink-0"
+                                  >
+                                    {ackingHuddleId === h.id ? 'Saving...' : 'Acknowledge'}
+                                  </button>
+                                )}
+                              </div>
+                              <p className="text-slate-600 dark:text-slate-300 pl-5 whitespace-pre-line">{h.message}</p>
+                              <p className="text-[10px] text-slate-500 dark:text-slate-400 pl-5">
+                                {h.authorName} ({h.authorRole}) · {h.targetChannels.map(formatChannelLabel).join(', ')}
+                              </p>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="relative">
+                <button
+                  onClick={() => {
+                    setShowHuddlePanel(false);
                     const next = !showNotifs;
                     setShowNotifs(next);
                     if (next) loadNotifications(activeLocationId);
                   }}
-                  className="relative p-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700"
+                  className="relative p-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200"
                   aria-label="Notifications"
                 >
                   <Bell className="w-4 h-4" />
@@ -604,40 +905,71 @@ function AppShell() {
                 </button>
 
                 {showNotifs && (
-                  <div className="absolute right-0 mt-2 w-80 rounded-xl border border-slate-200 bg-white shadow-lg z-40 p-3 space-y-2">
-                    <div className="flex items-center justify-between border-b border-slate-100 pb-2 gap-2">
+                  <div className="absolute right-0 mt-2 w-80 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-lg z-40 p-3 space-y-2">
+                    <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800/80 pb-2 gap-2">
                       <div className="min-w-0">
-                        <span className="block text-xs font-semibold text-slate-900">Automated ERP Alerts</span>
-                        <span className="block text-[10px] text-slate-500 truncate">
+                        <span className="block text-xs font-semibold text-slate-900 dark:text-slate-50">Automated ERP Alerts</span>
+                        <span className="block text-[10px] text-slate-500 dark:text-slate-400 truncate">
                           {activeLocationId === 'ALL'
                             ? 'All Trucks & Commissary'
                             : locations.find((l) => l.id === activeLocationId)?.name || 'Selected Location'}
                         </span>
                       </div>
-                      <span className="text-[11px] font-mono text-slate-500 shrink-0">{unreadCount} unread</span>
+                      <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400 shrink-0">{unreadCount} unread</span>
                     </div>
-                    <div className="max-h-72 overflow-y-auto divide-y divide-slate-100">
+                    <div className="max-h-72 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800">
                       {notifications.length === 0 ? (
-                        <p className="py-6 text-center text-xs text-slate-400">
+                        <p className="py-6 text-center text-xs text-slate-500 dark:text-slate-400">
                           {activeLocationId === 'ALL' ? 'No alerts' : 'No alerts for selected truck / location'}
                         </p>
                       ) : (
-                        notifications.map((n) => (
-                          <div key={n.id} className={`py-2.5 text-xs space-y-1 ${n.is_read ? 'opacity-60' : ''}`}>
-                            <div className="flex justify-between gap-2">
-                              <span className="font-semibold text-slate-900">{n.title}</span>
-                              {!n.is_read && (
-                                <button onClick={() => markRead(n.id)} className="text-[11px] text-slate-600 underline shrink-0">
-                                  Dismiss
-                                </button>
-                              )}
+                        notifications.map((n) => {
+                          const isCritical = n.severity === 'CRITICAL' || n.type === 'SAFETY_STOCK';
+                          const isWarning = !isCritical && n.severity === 'WARNING';
+                          return (
+                            <div key={n.id} className={`py-2.5 text-xs space-y-1 ${n.is_read ? 'opacity-55' : ''}`}>
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="flex items-start gap-1.5 min-w-0">
+                                  {isCritical ? (
+                                    <ShieldAlert className="w-3.5 h-3.5 text-red-600 dark:text-red-300 shrink-0 mt-0.5" />
+                                  ) : isWarning ? (
+                                    <AlertTriangle className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                                  ) : (
+                                    <Bell className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400 shrink-0 mt-0.5" />
+                                  )}
+                                  <div className="min-w-0">
+                                    <span className={`block font-semibold ${isCritical ? 'text-red-800 dark:text-red-300' : 'text-slate-900 dark:text-slate-50'}`}>
+                                      {n.title}
+                                    </span>
+                                    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] mt-0.5">
+                                      <span
+                                        className={`font-semibold uppercase tracking-wide ${
+                                          isCritical ? 'text-red-600 dark:text-red-300' : isWarning ? 'text-amber-700 dark:text-amber-300' : 'text-slate-500 dark:text-slate-400'
+                                        }`}
+                                      >
+                                        {isCritical ? 'Critical' : isWarning ? 'Warning' : 'Info'}
+                                      </span>
+                                      {n.location_name && (
+                                        <span className="font-medium text-slate-600 dark:text-slate-300">· {n.location_name}</span>
+                                      )}
+                                      {n.created_at && (
+                                        <span className="font-mono text-slate-500 dark:text-slate-400">
+                                          · {String(n.created_at).slice(0, 16).replace('T', ' ')}
+                                        </span>
+                                      )}
+                                    </div>
+                                  </div>
+                                </div>
+                                {!n.is_read && (
+                                  <button onClick={() => markRead(n.id)} className="text-[11px] text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white underline shrink-0">
+                                    Dismiss
+                                  </button>
+                                )}
+                              </div>
+                              <p className="text-slate-600 dark:text-slate-300 pl-5">{n.message}</p>
                             </div>
-                            {n.location_name && (
-                              <p className="text-[10px] font-medium text-amber-700">{n.location_name}</p>
-                            )}
-                            <p className="text-slate-600">{n.message}</p>
-                          </div>
-                        ))
+                          );
+                        })
                       )}
                     </div>
                   </div>
@@ -647,6 +979,16 @@ function AppShell() {
           </header>
 
           <main className="flex-1 p-4 lg:p-8 max-w-[1440px] w-full mx-auto">
+            {currentTab !== 'dashboard' && currentTab !== 'pos' && currentTab !== 'kds' && (
+              <DailyHuddleBanner
+                huddles={dailyHuddles}
+                user={user}
+                channel="MOBILE"
+                locationId={activeLocationId}
+                onAcknowledge={acknowledgeHuddle}
+                className="mb-4 lg:hidden"
+              />
+            )}
             {currentTab === 'dashboard' && (
               <DashboardModule
                 user={user}
@@ -658,6 +1000,9 @@ function AppShell() {
                 onQuickAction={handleQuickAction}
                 kioskData={kioskData}
                 onOpenAttendanceKiosk={openAttendanceKiosk}
+                huddles={dailyHuddles}
+                onAcknowledgeHuddle={acknowledgeHuddle}
+                onHuddlesChanged={refreshHuddles}
               />
             )}
             {currentTab === 'pos' && (
@@ -668,6 +1013,8 @@ function AppShell() {
                 activeLocationId={activeLocationId}
                 onLocationChange={setActiveLocationId}
                 onLocationsChanged={loadWorkspaceContext}
+                huddles={dailyHuddles}
+                onAcknowledgeHuddle={acknowledgeHuddle}
               />
             )}
             {currentTab === 'kds' && (
@@ -678,14 +1025,21 @@ function AppShell() {
                 activeLocationId={activeLocationId}
                 onLocationChange={setActiveLocationId}
                 onLocationsChanged={loadWorkspaceContext}
+                huddles={dailyHuddles}
+                onAcknowledgeHuddle={acknowledgeHuddle}
               />
             )}
-            {currentTab === 'products' && <ProductsBomModule />}
+            {currentTab === 'products' && (
+              <ProductsBomModule locations={locations} activeLocationId={activeLocationId} />
+            )}
             {currentTab === 'inventory' && (
               <InventoryModule
+                user={user}
                 locations={locations}
                 activeLocationId={activeLocationId}
                 onLocationChange={setActiveLocationId}
+                onNotificationsChanged={() => void loadNotifications(activeLocationId)}
+                onNavigate={setActiveTab}
                 quickAction={pendingQuickAction?.tab === 'inventory' ? pendingQuickAction : null}
                 onQuickActionHandled={() => setPendingQuickAction(null)}
               />
@@ -717,6 +1071,7 @@ function AppShell() {
                 locations={locations}
                 activeLocationId={activeLocationId}
                 onLocationsChanged={loadWorkspaceContext}
+                onNotificationsChanged={() => void loadNotifications(activeLocationId)}
               />
             )}
             {currentTab === 'hr' && (
@@ -739,8 +1094,16 @@ function AppShell() {
                 onLocationChange={setActiveLocationId}
               />
             )}
-            {currentTab === 'settings' && (user.roleCode === 'SUPER_ADMIN' || user.roleCode === 'BUSINESS_OWNER') && (
-              <SettingsUserControlModule currentUser={user} onProfileUpdated={refreshCurrentUser} />
+            {currentTab === 'settings' && canAccessSettingsModule(user) && (
+              <SettingsUserControlModule
+                currentUser={user}
+                onProfileUpdated={refreshCurrentUser}
+                terminalStatus={terminalStatus}
+                onTerminalStateChanged={async (retrySilentAuth) => {
+                  silentAuthAttemptedRef.current = false;
+                  await refreshTerminalEnvironment(Boolean(retrySilentAuth));
+                }}
+              />
             )}
           </main>
         </div>
@@ -778,6 +1141,78 @@ function AppShell() {
 }
 
 export default function App() {
+  const [receiptToken, setReceiptToken] = useState<string | null>(() => {
+    try {
+      return new URLSearchParams(window.location.search).get('receipt');
+    } catch {
+      return null;
+    }
+  });
+
+  const [isKioskParam, setIsKioskParam] = useState<boolean>(() => {
+    try {
+      const q = new URLSearchParams(window.location.search);
+      return q.get('kiosk') === 'loyalty' || q.get('loyalty') === 'join';
+    } catch {
+      return false;
+    }
+  });
+
+  useEffect(() => {
+    const syncUrlParams = () => {
+      try {
+        const q = new URLSearchParams(window.location.search);
+        setReceiptToken(q.get('receipt'));
+        setIsKioskParam(q.get('kiosk') === 'loyalty' || q.get('loyalty') === 'join');
+      } catch {
+        setReceiptToken(null);
+        setIsKioskParam(false);
+      }
+    };
+    window.addEventListener('popstate', syncUrlParams);
+    return () => window.removeEventListener('popstate', syncUrlParams);
+  }, []);
+
+  if (receiptToken) {
+    return (
+      <AppErrorBoundary>
+        <MotionConfig reducedMotion="user">
+          <PublicDigitalReceiptView
+            token={receiptToken}
+            onExitPublicReceipt={() => {
+              try {
+                window.history.replaceState({}, '', window.location.pathname || '/');
+              } catch {
+                // ignore history errors
+              }
+              setReceiptToken(null);
+            }}
+          />
+        </MotionConfig>
+      </AppErrorBoundary>
+    );
+  }
+
+  if (isKioskParam) {
+    return (
+      <AppErrorBoundary>
+        <MotionConfig reducedMotion="user">
+          <CustomerLoyaltyKiosk
+            mode="standalone"
+            onExit={() => {
+              try {
+                window.history.replaceState({}, '', window.location.pathname || '/');
+              } catch {
+                // ignore history errors
+              }
+              setIsKioskParam(false);
+            }}
+          />
+        </MotionConfig>
+      </AppErrorBoundary>
+    );
+  }
+
   return (
     <AppErrorBoundary>
       <AppShell />

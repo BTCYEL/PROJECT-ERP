@@ -1,5 +1,8 @@
 import { randomUUID } from 'crypto';
 import { db } from './db.ts';
+import { buildThresholdNotification, evaluateIngredientThreshold } from '../src/lib/inventoryAlerts.ts';
+import { buildWeeklyFoodCostSeries } from '../src/lib/financeCharts.ts';
+import { buildPredictiveProcurementPlan, SupplierQuoteOption } from '../src/lib/predictiveProcurement.ts';
 
 const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 const round4 = (n: number) => Math.round((n + Number.EPSILON) * 10000) / 10000;
@@ -25,11 +28,17 @@ export function writeAuditLog(
   );
 }
 
-export function createNotification(type: string, severity: 'INFO' | 'WARNING' | 'CRITICAL', title: string, message: string) {
-  const existing = db
-    .prepare('SELECT id FROM notifications WHERE type = ? AND title = ? AND is_read = 0')
-    .get(type, title);
-  if (existing) return;
+export function createNotification(
+  type: string,
+  severity: 'INFO' | 'WARNING' | 'CRITICAL',
+  title: string,
+  message: string,
+  options?: { onlyIfNeverNotified?: boolean },
+): boolean {
+  const existing = options?.onlyIfNeverNotified
+    ? db.prepare('SELECT id FROM notifications WHERE type = ? AND title = ?').get(type, title)
+    : db.prepare('SELECT id FROM notifications WHERE type = ? AND title = ? AND is_read = 0').get(type, title);
+  if (existing) return false;
   db.prepare('INSERT INTO notifications (id, type, severity, title, message) VALUES (?, ?, ?, ?, ?)').run(
     randomUUID(),
     type,
@@ -37,6 +46,70 @@ export function createNotification(type: string, severity: 'INFO' | 'WARNING' | 
     title,
     message,
   );
+  return true;
+}
+
+export function resolveMatchingNotificationsSql(types: string[], itemName: string, locationName?: string | null): number {
+  const rows = db
+    .prepare('SELECT id, type, title FROM notifications WHERE is_read = 0')
+    .all() as Array<{ id: string; type: string; title: string }>;
+  let resolved = 0;
+  for (const n of rows) {
+    if (!types.includes(n.type)) continue;
+    if (!String(n.title || '').includes(`: ${itemName}`)) continue;
+    if (locationName && !String(n.title || '').includes(`(${locationName})`)) continue;
+    db.prepare('UPDATE notifications SET is_read = 1 WHERE id = ?').run(n.id);
+    resolved++;
+  }
+  return resolved;
+}
+
+export function syncItemThresholdAlertsSql(
+  item: any,
+  locationId: string | null,
+  onHandQty: number,
+  options?: { onlyIfNeverNotified?: boolean },
+): { status: 'BELOW_SAFETY' | 'BELOW_REORDER' | 'NOMINAL'; createdCount: number; resolvedCount: number } {
+  const uomRow = item.uom_code
+    ? { code: item.uom_code }
+    : (db.prepare('SELECT code FROM uoms WHERE id = ?').get(item.base_uom_id) as { code: string } | undefined);
+  const locRow = locationId
+    ? (db.prepare('SELECT name FROM locations WHERE id = ?').get(locationId) as { name: string } | undefined)
+    : undefined;
+  const locName = locRow?.name || (locationId ? 'Location' : 'All Locations');
+
+  const evalResult = evaluateIngredientThreshold({
+    onHandQty,
+    safetyStock: Number(item.min_stock_level || 0),
+    reorderPoint: Number(item.reorder_point || 0),
+  });
+
+  if (evalResult.status === 'NOMINAL') {
+    const resolvedCount = resolveMatchingNotificationsSql(['SAFETY_STOCK', 'LOW_STOCK'], item.name, locationId ? locName : null);
+    return { status: 'NOMINAL', createdCount: 0, resolvedCount };
+  }
+
+  let resolvedCount = 0;
+  if (evalResult.status === 'BELOW_REORDER') {
+    resolvedCount = resolveMatchingNotificationsSql(['SAFETY_STOCK'], item.name, locationId ? locName : null);
+  }
+
+  const payload = buildThresholdNotification({
+    itemName: item.name,
+    sku: item.sku,
+    itemType: item.item_type,
+    uomCode: uomRow?.code || '',
+    locationName: locName,
+    evalResult,
+  });
+
+  let createdCount = 0;
+  if (payload) {
+    const created = createNotification(payload.type, payload.severity, payload.title, payload.message, options);
+    if (created) createdCount = 1;
+  }
+
+  return { status: evalResult.status, createdCount, resolvedCount };
 }
 
 export function convertQty(qty: number, fromUomId: string, toUomId: string): number {
@@ -118,6 +191,11 @@ export function receiveStockTx(input: {
     input.notes || null,
     input.userId || null,
   );
+
+  const postAgg = db
+    .prepare('SELECT COALESCE(SUM(remaining_qty), 0) AS qty FROM stock_batches WHERE inventory_item_id = ? AND location_id = ?')
+    .get(item.id, input.locationId) as { qty: number };
+  syncItemThresholdAlertsSql(item, input.locationId, postAgg.qty, { onlyIfNeverNotified: false });
 
   return { batchId, totalCost };
 }
@@ -208,18 +286,11 @@ export function deductStockTx(input: {
     consumedBatches.push({ qty: remaining, unitCost: fallbackCost });
   }
 
-  // Workflow D check: low stock notification
+  // Workflow D check: safety stock & reorder threshold alerts
   const postAgg = db
     .prepare('SELECT COALESCE(SUM(remaining_qty), 0) AS qty FROM stock_batches WHERE inventory_item_id = ? AND location_id = ?')
     .get(item.id, input.locationId) as { qty: number };
-  if (postAgg.qty <= item.reorder_point) {
-    createNotification(
-      'LOW_STOCK',
-      'WARNING',
-      `Low Stock: ${item.name}`,
-      `Remaining ${round2(postAgg.qty)} is at or below reorder point (${item.reorder_point}).`,
-    );
-  }
+  syncItemThresholdAlertsSql(item, input.locationId, postAgg.qty, { onlyIfNeverNotified: false });
 
   return { totalCogs: round2(totalCogs), consumedBatches };
 }
@@ -598,11 +669,27 @@ export function refundSale(saleId: string, reason: string, userId: string, userN
   })();
 }
 
-export function getDashboardSummary(params: { from?: string; to?: string; locationId?: string }) {
+export function getDashboardSummary(params: {
+  from?: string;
+  to?: string;
+  locationId?: string;
+  todayFrom?: string;
+  todayTo?: string;
+  yesterdayFrom?: string;
+  yesterdayTo?: string;
+}) {
   const to = params.to || new Date().toISOString();
   const from = params.from || new Date(Date.now() - 30 * 86400000).toISOString();
   const locClause = params.locationId ? 'AND location_id = ?' : '';
   const locArgs = params.locationId ? [from, to, params.locationId] : [from, to];
+
+  const nowDate = new Date();
+  const fallbackTodayStart = new Date(nowDate);
+  fallbackTodayStart.setUTCHours(0, 0, 0, 0);
+  const todayFrom = params.todayFrom || fallbackTodayStart.toISOString();
+  const todayTo = params.todayTo || nowDate.toISOString();
+  const yesterdayFrom = params.yesterdayFrom || new Date(new Date(todayFrom).getTime() - 86400000).toISOString();
+  const yesterdayTo = params.yesterdayTo || new Date(new Date(todayFrom).getTime() - 1).toISOString();
 
   const salesAgg = db
     .prepare(`
@@ -625,7 +712,11 @@ export function getDashboardSummary(params: { from?: string; to?: string; locati
     .get(...locArgs) as any;
 
   const pendingPOs = (
-    db.prepare("SELECT COUNT(*) AS cnt FROM purchase_orders WHERE status IN ('PENDING_APPROVAL', 'PENDING_MANAGER_SIGNATURE', 'APPROVED', 'PARTIAL')").get() as any
+    db
+      .prepare(
+        `SELECT COUNT(*) AS cnt FROM purchase_orders WHERE status IN ('PENDING_APPROVAL', 'PENDING_MANAGER_SIGNATURE', 'APPROVED', 'PARTIAL', 'PARTIALLY_RECEIVED') ${locClause}`,
+      )
+      .get(...(params.locationId ? [params.locationId] : [])) as any
   ).cnt;
 
   const totalSales = round2(salesAgg.total_sales);
@@ -650,6 +741,118 @@ export function getDashboardSummary(params: { from?: string; to?: string; locati
 
   const inventoryValuation = round2(invRows.reduce((s, r) => s + r.stock_value, 0));
   const lowStockItems = invRows.filter((r) => r.current_qty <= r.reorder_point);
+
+  // Summary KPI Cards with real DB comparisons
+  const calcPctChange = (current: number, previous: number) => {
+    if (previous > 0) return round2(((current - previous) / previous) * 100);
+    if (current > 0) return 100;
+    return 0;
+  };
+
+  const todaySalesArgs = params.locationId ? [todayFrom, todayTo, params.locationId] : [todayFrom, todayTo];
+  const yesterdaySalesArgs = params.locationId ? [yesterdayFrom, yesterdayTo, params.locationId] : [yesterdayFrom, yesterdayTo];
+
+  const todaySalesRow = db
+    .prepare(`
+      SELECT COALESCE(SUM(total_amount), 0) AS revenue, COUNT(*) AS orders
+      FROM sales
+      WHERE status = 'COMPLETED' AND sold_at >= ? AND sold_at <= ? ${locClause}
+    `)
+    .get(...todaySalesArgs) as any;
+
+  const yesterdaySalesRow = db
+    .prepare(`
+      SELECT COALESCE(SUM(total_amount), 0) AS revenue, COUNT(*) AS orders
+      FROM sales
+      WHERE status = 'COMPLETED' AND sold_at >= ? AND sold_at <= ? ${locClause}
+    `)
+    .get(...yesterdaySalesArgs) as any;
+
+  const todayRevenue = round2(todaySalesRow.revenue);
+  const yesterdayRevenue = round2(yesterdaySalesRow.revenue);
+
+  const pendingOrdersRow = db
+    .prepare(`
+      SELECT
+        COUNT(*) AS total_cnt,
+        COALESCE(SUM(CASE WHEN kds_status = 'PENDING' THEN 1 ELSE 0 END), 0) AS new_cnt,
+        COALESCE(SUM(CASE WHEN kds_status = 'PREPARING' THEN 1 ELSE 0 END), 0) AS prep_cnt,
+        COALESCE(SUM(CASE WHEN kds_status = 'READY' THEN 1 ELSE 0 END), 0) AS ready_cnt
+      FROM sales
+      WHERE status = 'COMPLETED' AND kds_status != 'COMPLETED' ${locClause}
+    `)
+    .get(...(params.locationId ? [params.locationId] : [])) as any;
+
+  const yesterdayPendingOrdersRow = db
+    .prepare(`
+      SELECT COUNT(*) AS cnt
+      FROM sales
+      WHERE status = 'COMPLETED' AND kds_status != 'COMPLETED' AND sold_at >= ? AND sold_at <= ? ${locClause}
+    `)
+    .get(...yesterdaySalesArgs) as any;
+
+  const pendingOrdersCount = Number(pendingOrdersRow.total_cnt || 0);
+  const yesterdayPendingOrdersCount = Number(yesterdayPendingOrdersRow.cnt || 0);
+
+  const activeEmpLocClause = params.locationId ? 'AND location_id = ?' : '';
+  const activeEmployeesCount = Number(
+    (
+      db
+        .prepare(`SELECT COUNT(*) AS cnt FROM employees WHERE is_active = 1 ${activeEmpLocClause}`)
+        .get(...(params.locationId ? [params.locationId] : [])) as any
+    ).cnt || 0,
+  );
+
+  const todayDateA = todayFrom.slice(0, 10);
+  const todayDateB = todayTo.slice(0, 10);
+  const yestDateA = yesterdayFrom.slice(0, 10);
+  const yestDateB = yesterdayTo.slice(0, 10);
+
+  const todayAttRow = db
+    .prepare(`
+      SELECT
+        COUNT(DISTINCT a.employee_id) AS clocked_in_today,
+        COUNT(DISTINCT CASE WHEN a.clock_out IS NULL THEN a.employee_id END) AS currently_on_shift
+      FROM attendance_logs a
+      JOIN employees e ON e.id = a.employee_id
+      WHERE ((a.clock_in >= ? AND a.clock_in <= ?) OR substr(a.clock_in, 1, 10) IN (?, ?))
+        ${params.locationId ? 'AND COALESCE(a.location_id, e.location_id) = ?' : ''}
+    `)
+    .get(...(params.locationId ? [todayFrom, todayTo, todayDateA, todayDateB, params.locationId] : [todayFrom, todayTo, todayDateA, todayDateB])) as any;
+
+  const yesterdayAttRow = db
+    .prepare(`
+      SELECT COUNT(DISTINCT a.employee_id) AS clocked_in_yesterday
+      FROM attendance_logs a
+      JOIN employees e ON e.id = a.employee_id
+      WHERE ((a.clock_in >= ? AND a.clock_in <= ?) OR substr(a.clock_in, 1, 10) IN (?, ?))
+        ${params.locationId ? 'AND COALESCE(a.location_id, e.location_id) = ?' : ''}
+    `)
+    .get(
+      ...(params.locationId
+        ? [yesterdayFrom, yesterdayTo, yestDateA, yestDateB, params.locationId]
+        : [yesterdayFrom, yesterdayTo, yestDateA, yestDateB]),
+    ) as any;
+
+  const clockedInToday = Number(todayAttRow?.clocked_in_today || 0);
+  const currentlyOnShift = Number(todayAttRow?.currently_on_shift || 0);
+  const clockedInYesterday = Number(yesterdayAttRow?.clocked_in_yesterday || 0);
+
+  // Reconstruct yesterday's inventory alerts by rolling back today's inventory transactions
+  const todayInvDeltas = db
+    .prepare(`
+      SELECT inventory_item_id, COALESCE(SUM(quantity_delta), 0) AS delta
+      FROM inventory_transactions
+      WHERE created_at >= ? AND created_at <= ? ${locClause}
+      GROUP BY inventory_item_id
+    `)
+    .all(...todaySalesArgs) as any[];
+  const deltaMap = new Map(todayInvDeltas.map((d) => [d.inventory_item_id, Number(d.delta || 0)]));
+  const yesterdayAlertCount = invRows.filter((r) => {
+    const prevQty = Number(r.current_qty || 0) - (deltaMap.get(r.id) || 0);
+    return prevQty <= Number(r.reorder_point || 0);
+  }).length;
+  const currentAlertCount = lowStockItems.length;
 
   const salesByPayment = db
     .prepare(`
@@ -729,6 +932,40 @@ export function getDashboardSummary(params: { from?: string; to?: string; locati
       avgTicket,
       inventoryValuation,
       pendingPOs,
+    },
+    summaryCards: {
+      totalRevenueToday: {
+        value: todayRevenue,
+        previousValue: yesterdayRevenue,
+        pctChange: calcPctChange(todayRevenue, yesterdayRevenue),
+        ordersToday: Number(todaySalesRow.orders || 0),
+        comparisonLabel: 'vs yesterday',
+      },
+      pendingOrders: {
+        value: pendingOrdersCount,
+        previousValue: yesterdayPendingOrdersCount,
+        pctChange: calcPctChange(pendingOrdersCount, yesterdayPendingOrdersCount),
+        newCount: Number(pendingOrdersRow.new_cnt || 0),
+        preparingCount: Number(pendingOrdersRow.prep_cnt || 0),
+        readyCount: Number(pendingOrdersRow.ready_cnt || 0),
+        pendingPOs,
+        comparisonLabel: 'vs yesterday',
+      },
+      activeEmployees: {
+        value: activeEmployeesCount,
+        onShiftCount: currentlyOnShift,
+        clockedInToday,
+        previousValue: clockedInYesterday,
+        pctChange: calcPctChange(clockedInToday, clockedInYesterday),
+        comparisonLabel: 'shift vs yesterday',
+      },
+      inventoryReorderAlerts: {
+        value: currentAlertCount,
+        previousValue: yesterdayAlertCount,
+        pctChange: calcPctChange(currentAlertCount, yesterdayAlertCount),
+        criticalOutCount: lowStockItems.filter((r) => Number(r.current_qty || 0) <= 0).length,
+        comparisonLabel: 'vs yesterday',
+      },
     },
     lowStockItems,
     expiringBatches,
@@ -920,3 +1157,310 @@ export function getFinancialStatements(from?: string, to?: string) {
     },
   };
 }
+
+export function getWeeklyFoodCostTrends(input: { locationId?: string; weeks?: number }) {
+  const rawLoc = String(input.locationId || '').trim();
+  const locId = rawLoc && rawLoc !== 'ALL' ? rawLoc : '';
+  const weeks = Math.min(26, Math.max(2, Math.round(Number(input.weeks || 8) || 8)));
+
+  const sales = (
+    locId
+      ? db
+          .prepare(
+            "SELECT location_id, subtotal, tax_amount, total_amount, total_cogs, sold_at FROM sales WHERE status = 'COMPLETED' AND location_id = ?",
+          )
+          .all(locId)
+      : db
+          .prepare(
+            "SELECT location_id, subtotal, tax_amount, total_amount, total_cogs, sold_at FROM sales WHERE status = 'COMPLETED'",
+          )
+          .all()
+  ) as Array<{
+    location_id: string;
+    subtotal: number;
+    tax_amount: number;
+    total_amount: number;
+    total_cogs: number;
+    sold_at: string;
+  }>;
+
+  const wasteTxns = (
+    locId
+      ? db
+          .prepare(
+            "SELECT location_id, total_cost, created_at FROM inventory_transactions WHERE txn_type IN ('OUT_WASTE', 'OUT_SPOILAGE') AND location_id = ?",
+          )
+          .all(locId)
+      : db
+          .prepare(
+            "SELECT location_id, total_cost, created_at FROM inventory_transactions WHERE txn_type IN ('OUT_WASTE', 'OUT_SPOILAGE')",
+          )
+          .all()
+  ) as Array<{ location_id: string; total_cost: number; created_at: string }>;
+
+  const targetAgg = db
+    .prepare('SELECT AVG(target_food_cost_pct) AS avg_target FROM products WHERE target_food_cost_pct > 0')
+    .get() as { avg_target: number | null } | undefined;
+
+  return buildWeeklyFoodCostSeries({
+    sales: sales.map((s) => ({
+      locationId: s.location_id,
+      soldAt: s.sold_at,
+      subtotal: Number(s.subtotal || 0),
+      taxAmount: Number(s.tax_amount || 0),
+      totalAmount: Number(s.total_amount || 0),
+      totalCogs: Number(s.total_cogs || 0),
+    })),
+    wasteTxns: wasteTxns.map((w) => ({
+      locationId: w.location_id,
+      txnDate: w.created_at,
+      totalCost: Number(w.total_cost || 0),
+    })),
+    targetFoodCostPct: Number(targetAgg?.avg_target || 35),
+    locationId: locId || 'ALL',
+    weeks,
+  });
+}
+
+export function getPredictiveProcurementPlan(input: {
+  locationId?: string;
+  lookbackDays?: number;
+  coverageDays?: number;
+}) {
+  const rawLoc = String(input.locationId || '').trim();
+  const locId = rawLoc && rawLoc !== 'ALL' ? rawLoc : '';
+  const lookbackDays = Math.min(180, Math.max(30, Math.round(Number(input.lookbackDays || 90) || 90)));
+  const coverageDays = Math.min(45, Math.max(3, Math.round(Number(input.coverageDays || 14) || 14)));
+
+  const itemRows = db
+    .prepare(`
+      SELECT i.id, i.sku, i.name, i.item_type, i.base_uom_id, i.min_stock_level, i.reorder_point, i.last_unit_cost, u.code AS uom_code
+      FROM inventory_items i
+      JOIN uoms u ON u.id = i.base_uom_id
+      ORDER BY i.name ASC
+    `)
+    .all() as any[];
+
+  const baseUomByItem = new Map(itemRows.map((r) => [r.id, String(r.base_uom_id)]));
+
+  const onHandRows = (
+    locId
+      ? db
+          .prepare('SELECT inventory_item_id, COALESCE(SUM(remaining_qty), 0) AS qty FROM stock_batches WHERE remaining_qty > 0 AND location_id = ? GROUP BY inventory_item_id')
+          .all(locId)
+      : db
+          .prepare('SELECT inventory_item_id, COALESCE(SUM(remaining_qty), 0) AS qty FROM stock_batches WHERE remaining_qty > 0 GROUP BY inventory_item_id')
+          .all()
+  ) as Array<{ inventory_item_id: string; qty: number }>;
+
+  const onHandByItem = new Map<string, number>();
+  for (const r of onHandRows) {
+    onHandByItem.set(r.inventory_item_id, Number(r.qty || 0));
+  }
+
+  const openPoRows = (
+    locId
+      ? db
+          .prepare(`
+            SELECT poi.inventory_item_id, COALESCE(SUM(MAX(0, poi.ordered_qty - poi.received_qty)), 0) AS pending_qty
+            FROM purchase_order_items poi
+            JOIN purchase_orders po ON po.id = poi.purchase_order_id
+            WHERE po.status IN ('DRAFT', 'PENDING_APPROVAL', 'PENDING_MANAGER_SIGNATURE', 'APPROVED', 'PARTIAL', 'PARTIALLY_RECEIVED')
+              AND po.location_id = ?
+            GROUP BY poi.inventory_item_id
+          `)
+          .all(locId)
+      : db
+          .prepare(`
+            SELECT poi.inventory_item_id, COALESCE(SUM(MAX(0, poi.ordered_qty - poi.received_qty)), 0) AS pending_qty
+            FROM purchase_order_items poi
+            JOIN purchase_orders po ON po.id = poi.purchase_order_id
+            WHERE po.status IN ('DRAFT', 'PENDING_APPROVAL', 'PENDING_MANAGER_SIGNATURE', 'APPROVED', 'PARTIAL', 'PARTIALLY_RECEIVED')
+            GROUP BY poi.inventory_item_id
+          `)
+          .all()
+  ) as Array<{ inventory_item_id: string; pending_qty: number }>;
+
+  const openPoByItem = new Map<string, number>();
+  for (const r of openPoRows) {
+    openPoByItem.set(r.inventory_item_id, Number(r.pending_qty || 0));
+  }
+
+  const cutoffIso = new Date(Date.now() - (lookbackDays + 2) * 86400000).toISOString();
+  const txnRows = (
+    locId
+      ? db
+          .prepare(`
+            SELECT inventory_item_id, location_id, txn_type, quantity_delta, reference_type, reference_id, created_at
+            FROM inventory_transactions
+            WHERE created_at >= ? AND location_id = ?
+          `)
+          .all(cutoffIso, locId)
+      : db
+          .prepare(`
+            SELECT inventory_item_id, location_id, txn_type, quantity_delta, reference_type, reference_id, created_at
+            FROM inventory_transactions
+            WHERE created_at >= ?
+          `)
+          .all(cutoffIso)
+  ) as any[];
+
+  const saleLineRows = (
+    locId
+      ? db
+          .prepare(`
+            SELECT s.id AS sale_id, s.location_id, s.sold_at, si.product_id, si.quantity, si.modifiers_json,
+                   COALESCE(pv.portion_multiplier, 1.0) AS portion_multiplier
+            FROM sale_items si
+            JOIN sales s ON s.id = si.sale_id
+            LEFT JOIN product_variants pv ON pv.id = si.variant_id
+            WHERE s.status = 'COMPLETED' AND s.sold_at >= ? AND s.location_id = ?
+          `)
+          .all(cutoffIso, locId)
+      : db
+          .prepare(`
+            SELECT s.id AS sale_id, s.location_id, s.sold_at, si.product_id, si.quantity, si.modifiers_json,
+                   COALESCE(pv.portion_multiplier, 1.0) AS portion_multiplier
+            FROM sale_items si
+            JOIN sales s ON s.id = si.sale_id
+            LEFT JOIN product_variants pv ON pv.id = si.variant_id
+            WHERE s.status = 'COMPLETED' AND s.sold_at >= ?
+          `)
+          .all(cutoffIso)
+  ) as any[];
+
+  const recipeRows = db
+    .prepare(`
+      SELECT r.product_id, r.yield_qty, ri.inventory_item_id, ri.quantity, ri.uom_id, ri.waste_factor_pct
+      FROM recipes r
+      JOIN recipe_ingredients ri ON ri.recipe_id = r.id
+    `)
+    .all() as any[];
+
+  const recipeByProduct = new Map<string, any[]>();
+  for (const r of recipeRows) {
+    const arr = recipeByProduct.get(r.product_id) || [];
+    arr.push(r);
+    recipeByProduct.set(r.product_id, arr);
+  }
+
+  const modRows = db.prepare('SELECT id, inventory_item_id, deduct_qty, uom_id FROM modifier_options WHERE inventory_item_id IS NOT NULL AND deduct_qty > 0').all() as any[];
+  const modById = new Map(modRows.map((m) => [m.id, m]));
+
+  const salesBomUsages: Array<{
+    saleId: string;
+    locationId: string;
+    inventoryItemId: string;
+    quantity: number;
+    soldAt: string;
+  }> = [];
+
+  for (const sl of saleLineRows) {
+    const ingredients = recipeByProduct.get(sl.product_id) || [];
+    const mult = Number(sl.portion_multiplier || 1);
+    const lineQty = Number(sl.quantity || 0);
+
+    for (const ing of ingredients) {
+      const targetUom = baseUomByItem.get(ing.inventory_item_id);
+      if (!targetUom) continue;
+      try {
+        const rawQty = ((Number(ing.quantity) * (1 + Number(ing.waste_factor_pct || 0) / 100)) / Number(ing.yield_qty || 1)) * mult * lineQty;
+        const baseQty = convertQty(rawQty, ing.uom_id, targetUom);
+        if (baseQty > 0) {
+          salesBomUsages.push({
+            saleId: sl.sale_id,
+            locationId: sl.location_id,
+            inventoryItemId: ing.inventory_item_id,
+            quantity: baseQty,
+            soldAt: sl.sold_at,
+          });
+        }
+      } catch {
+        // ignore conversion errors
+      }
+    }
+
+    if (sl.modifiers_json) {
+      try {
+        const mods = JSON.parse(sl.modifiers_json) as Array<{ id?: string }>;
+        for (const mRef of mods || []) {
+          const mod = mRef?.id ? modById.get(mRef.id) : null;
+          if (!mod) continue;
+          const targetUom = baseUomByItem.get(mod.inventory_item_id);
+          if (!targetUom || !mod.uom_id) continue;
+          const baseQty = convertQty(Number(mod.deduct_qty || 0) * lineQty, mod.uom_id, targetUom);
+          if (baseQty > 0) {
+            salesBomUsages.push({
+              saleId: sl.sale_id,
+              locationId: sl.location_id,
+              inventoryItemId: mod.inventory_item_id,
+              quantity: baseQty,
+              soldAt: sl.sold_at,
+            });
+          }
+        }
+      } catch {
+        // ignore malformed modifier json
+      }
+    }
+  }
+
+  const activeSuppliers = db.prepare('SELECT id, name, code FROM suppliers WHERE is_active = 1 ORDER BY name ASC').all() as Array<{
+    id: string;
+    name: string;
+    code: string;
+  }>;
+
+  const quoteRows = db
+    .prepare(`
+      SELECT si.supplier_id, si.inventory_item_id, si.unit_price, si.lead_time_days, s.name AS supplier_name
+      FROM supplier_items si
+      JOIN suppliers s ON s.id = si.supplier_id
+      WHERE s.is_active = 1
+      ORDER BY si.unit_price ASC, si.lead_time_days ASC
+    `)
+    .all() as any[];
+
+  const supplierQuotesByItem = new Map<string, SupplierQuoteOption[]>();
+  for (const q of quoteRows) {
+    const list = supplierQuotesByItem.get(q.inventory_item_id) || [];
+    list.push({
+      supplierId: q.supplier_id,
+      supplierName: q.supplier_name,
+      unitPrice: Number(q.unit_price || 0),
+      leadTimeDays: Number(q.lead_time_days || 2),
+    });
+    supplierQuotesByItem.set(q.inventory_item_id, list);
+  }
+
+  return buildPredictiveProcurementPlan({
+    items: itemRows.map((i) => ({
+      id: i.id,
+      sku: String(i.sku || ''),
+      name: String(i.name || ''),
+      itemType: String(i.item_type || 'RAW_MATERIAL'),
+      uomCode: String(i.uom_code || 'pcs'),
+      safetyStock: Number(i.min_stock_level || 0),
+      reorderPoint: Number(i.reorder_point || 0),
+      lastUnitCost: Number(i.last_unit_cost || 0),
+    })),
+    onHandByItem,
+    openPoByItem,
+    txns: txnRows.map((t) => ({
+      inventoryItemId: t.inventory_item_id,
+      locationId: t.location_id,
+      txnType: t.txn_type,
+      quantityDelta: Number(t.quantity_delta || 0),
+      referenceType: t.reference_type,
+      referenceId: t.reference_id,
+      txnDate: String(t.created_at || ''),
+    })),
+    salesBomUsages,
+    supplierQuotesByItem,
+    suppliers: activeSuppliers,
+    locationId: locId || 'ALL',
+    lookbackDays,
+    coverageDays,
+  });
+}
+

@@ -1,6 +1,10 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import bcrypt from 'bcryptjs';
-import { randomUUID } from 'crypto';
+import { createHmac, createVerify, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'crypto';
+import { readFileSync } from 'fs';
+import net from 'net';
+import os from 'os';
+import path from 'path';
 import { GoogleGenAI } from '@google/genai';
 import { db } from './db.ts';
 import {
@@ -9,13 +13,18 @@ import {
   getDashboardSummary,
   getFinancialStatements,
   getFoodCostingAnalytics,
+  getPredictiveProcurementPlan,
   getProductCostingList,
+  getWeeklyFoodCostTrends,
   processSale,
   receiveStockTx,
   refundSale,
+  syncItemThresholdAlertsSql,
   writeAuditLog,
 } from './erpEngine.ts';
 import { AuthUser, PERMISSIONS } from '../src/types/erp.ts';
+import { findScheduleCandidateConflicts, formatOverlapDuration, ShiftWindowLike } from '../src/lib/shiftConflicts.ts';
+import { evaluateIngredientThreshold } from '../src/lib/inventoryAlerts.ts';
 
 declare global {
   namespace Express {
@@ -26,6 +35,7 @@ declare global {
 }
 
 const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+const round4 = (n: number) => Math.round((n + Number.EPSILON) * 10000) / 10000;
 
 function loadUserWithPermissions(userId: string): AuthUser | null {
   const user = db
@@ -330,6 +340,892 @@ apiRouter.post('/auth/logout', authMiddleware, (req, res) => {
   res.json({ ok: true });
 });
 
+// ==========================================
+// 1B. TERMINAL-MODE DEVICE PAIRING & SILENT AUTH
+// ==========================================
+const TERMINAL_COOKIE_NAME = 'maximus_terminal_device';
+const TERMINAL_COOKIE_TTL_SECS = 60 * 60 * 24 * 30;
+const TERMINAL_SIGNING_KEY = process.env.TERMINAL_SIGNING_SECRET || randomBytes(32).toString('hex');
+
+function parseCookieHeader(req: Request, name: string): string | null {
+  const raw = req.headers.cookie;
+  if (!raw) return null;
+  for (const part of raw.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx <= 0) continue;
+    const k = part.slice(0, idx).trim();
+    if (k === name) {
+      return decodeURIComponent(part.slice(idx + 1).trim());
+    }
+  }
+  return null;
+}
+
+function isTrustedTerminalRequest(req: Request): boolean {
+  const xrw = String(req.headers['x-requested-with'] || '');
+  if (xrw === 'XMLHttpRequest') return true;
+  const origin = String(req.headers.origin || '');
+  const host = String(req.headers['x-forwarded-host'] || req.headers.host || '');
+  if (!origin || !host) return false;
+  try {
+    return new URL(origin).host === host;
+  } catch {
+    return false;
+  }
+}
+
+function sanitizeHardwareUuid(raw: unknown): string {
+  const val = String(raw || '').trim();
+  if (!/^[a-zA-Z0-9_-]{8,128}$/.test(val)) return '';
+  return val;
+}
+
+function signTerminalDeviceToken(hardwareUuid?: string): string {
+  const exp = Date.now() + TERMINAL_COOKIE_TTL_SECS * 1000;
+  const nonce = randomBytes(16).toString('hex');
+  const cleanHw = sanitizeHardwareUuid(hardwareUuid);
+  const payload = cleanHw ? `${exp}.${nonce}.${cleanHw}` : `${exp}.${nonce}`;
+  const sig = createHmac('sha256', TERMINAL_SIGNING_KEY).update(payload).digest('hex');
+  return `${payload}.${sig}`;
+}
+
+function parseTerminalDeviceToken(token: string | null): { valid: boolean; hardwareUuid: string | null } {
+  if (!token) return { valid: false, hardwareUuid: null };
+  const parts = token.split('.');
+  if (parts.length !== 3 && parts.length !== 4) return { valid: false, hardwareUuid: null };
+  const expStr = parts[0];
+  const nonce = parts[1];
+  const hw = parts.length === 4 ? parts[2] : '';
+  const sig = parts[parts.length - 1];
+  const exp = Number(expStr);
+  if (!Number.isFinite(exp) || exp <= Date.now() || !nonce || !sig) {
+    return { valid: false, hardwareUuid: null };
+  }
+  if (parts.length === 4 && !sanitizeHardwareUuid(hw)) {
+    return { valid: false, hardwareUuid: null };
+  }
+  const payload = parts.length === 4 ? `${expStr}.${nonce}.${hw}` : `${expStr}.${nonce}`;
+  const expected = createHmac('sha256', TERMINAL_SIGNING_KEY).update(payload).digest('hex');
+  const a = Buffer.from(sig, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  const valid = a.length === b.length && timingSafeEqual(a, b);
+  return { valid, hardwareUuid: valid && hw ? hw : null };
+}
+
+function setTerminalDeviceCookie(res: Response, token: string): void {
+  res.setHeader(
+    'Set-Cookie',
+    `${TERMINAL_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; Max-Age=${TERMINAL_COOKIE_TTL_SECS}; HttpOnly; Secure; SameSite=None; Partitioned`,
+  );
+}
+
+function clearTerminalDeviceCookie(res: Response): void {
+  res.setHeader(
+    'Set-Cookie',
+    `${TERMINAL_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None; Partitioned`,
+  );
+}
+
+function verifySecretString(candidate: string, expected: string): boolean {
+  const a = Buffer.from(candidate, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
+function getClaimedTerminalKeyHash(): string | null {
+  const row = db.prepare("SELECT value FROM app_settings WHERE key = 'terminal_pairing_key_hash'").get() as { value: string } | undefined;
+  return row?.value || null;
+}
+
+function verifyTerminalPasscode(passcode: string): boolean {
+  const envKey = String(process.env.TERMINAL_ACCESS_KEY || '').trim();
+  if (envKey) {
+    return verifySecretString(passcode, envKey);
+  }
+  const stored = getClaimedTerminalKeyHash();
+  if (!stored || !stored.includes(':')) return false;
+  const [salt, hashHex] = stored.split(':');
+  if (!salt || !hashHex) return false;
+  const derived = scryptSync(passcode, salt, 64).toString('hex');
+  return verifySecretString(derived, hashHex);
+}
+
+apiRouter.get('/terminal/status', (req, res) => {
+  const credentialsConfigured = Boolean(
+    String(process.env.TERMINAL_SERVICE_EMAIL || '').trim() &&
+    String(process.env.TERMINAL_SERVICE_PASSWORD || '').trim(),
+  );
+  const hasEnvAccessKey = Boolean(String(process.env.TERMINAL_ACCESS_KEY || '').trim());
+  const hasClaimedKey = Boolean(getClaimedTerminalKeyHash());
+  const accessKeyConfigured = hasEnvAccessKey || hasClaimedKey;
+  const accessKeySource = hasEnvAccessKey ? 'ENV' : hasClaimedKey ? 'SETUP_KEY' : 'NONE';
+  const parsedToken = parseTerminalDeviceToken(parseCookieHeader(req, TERMINAL_COOKIE_NAME));
+  const devicePaired = parsedToken.valid;
+  res.json({
+    credentialsConfigured,
+    accessKeyConfigured,
+    accessKeySource,
+    devicePaired,
+    pairedHardwareUuid: parsedToken.hardwareUuid || '',
+    stationEmail: devicePaired ? String(process.env.TERMINAL_STATION_EMAIL || '').trim().toLowerCase() : '',
+    stationLocationId: devicePaired ? String(process.env.TERMINAL_STATION_LOCATION_ID || '').trim() : '',
+  });
+});
+
+apiRouter.post('/terminal/claim-key', (req, res) => {
+  if (!isTrustedTerminalRequest(req)) {
+    res.status(403).json({ error: 'Invalid request origin' });
+    return;
+  }
+  if (String(process.env.TERMINAL_ACCESS_KEY || '').trim()) {
+    res.status(409).json({ error: 'Terminal pairing passcode is already configured by environment secrets' });
+    return;
+  }
+  const passcode = String(req.body?.passcode || '').trim();
+  if (passcode.length < 6 || passcode.length > 128) {
+    res.status(400).json({ error: 'Setup passcode must be 6 to 128 characters' });
+    return;
+  }
+  const hardwareUuid = sanitizeHardwareUuid(req.body?.hardwareUuid);
+  const salt = randomBytes(16).toString('hex');
+  const hashHex = scryptSync(passcode, salt, 64).toString('hex');
+  const result = db
+    .prepare("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('terminal_pairing_key_hash', ?)")
+    .run(`${salt}:${hashHex}`);
+  if (result.changes === 0) {
+    res.status(409).json({ error: 'Terminal setup passcode has already been claimed. Enter the existing passcode to pair.' });
+    return;
+  }
+  setTerminalDeviceCookie(res, signTerminalDeviceToken(hardwareUuid || undefined));
+  res.json({ ok: true, devicePaired: true, hardwareUuid: hardwareUuid || '' });
+});
+
+apiRouter.post('/terminal/pair', (req, res) => {
+  if (!isTrustedTerminalRequest(req)) {
+    res.status(403).json({ error: 'Invalid request origin' });
+    return;
+  }
+  const passcode = String(req.body?.passcode || '').trim();
+  const hardwareUuid = sanitizeHardwareUuid(req.body?.hardwareUuid);
+  const hasKey = Boolean(String(process.env.TERMINAL_ACCESS_KEY || '').trim() || getClaimedTerminalKeyHash());
+  if (!hasKey) {
+    res.status(400).json({ error: 'No terminal pairing passcode has been configured yet' });
+    return;
+  }
+  if (!passcode || !verifyTerminalPasscode(passcode)) {
+    res.status(401).json({ error: 'Incorrect terminal pairing passcode' });
+    return;
+  }
+  setTerminalDeviceCookie(res, signTerminalDeviceToken(hardwareUuid || undefined));
+  res.json({ ok: true, devicePaired: true, hardwareUuid: hardwareUuid || '' });
+});
+
+apiRouter.post('/terminal/verify-access-key', (req, res) => {
+  if (!isTrustedTerminalRequest(req)) {
+    res.status(403).json({ error: 'Invalid request origin' });
+    return;
+  }
+  const hardwareUuid = sanitizeHardwareUuid(req.body?.hardwareUuid);
+  if (!hardwareUuid) {
+    res.status(400).json({ error: 'Hardware UUID must be 8 to 128 alphanumeric, underscore, or hyphen characters' });
+    return;
+  }
+  const accessKey = String(req.body?.accessKey || req.body?.passcode || '').trim();
+  const hasKey = Boolean(String(process.env.TERMINAL_ACCESS_KEY || '').trim() || getClaimedTerminalKeyHash());
+  if (!hasKey) {
+    res.status(400).json({ error: 'No TERMINAL_ACCESS_KEY has been configured on the server yet' });
+    return;
+  }
+  if (!accessKey || !verifyTerminalPasscode(accessKey)) {
+    res.status(401).json({ error: 'Invalid TERMINAL_ACCESS_KEY. Device verification failed.' });
+    return;
+  }
+  const pairCurrentBrowser = Boolean(req.body?.pairCurrentBrowser);
+  if (pairCurrentBrowser) {
+    setTerminalDeviceCookie(res, signTerminalDeviceToken(hardwareUuid));
+  }
+  res.json({
+    verified: true,
+    hardwareUuid,
+    verifiedAt: new Date().toISOString(),
+    devicePaired: pairCurrentBrowser,
+  });
+});
+
+apiRouter.post('/terminal/unpair', (req, res) => {
+  if (!isTrustedTerminalRequest(req)) {
+    res.status(403).json({ error: 'Invalid request origin' });
+    return;
+  }
+  const hasKey = Boolean(String(process.env.TERMINAL_ACCESS_KEY || '').trim() || getClaimedTerminalKeyHash());
+  const passcode = String(req.body?.passcode || '').trim();
+  const forceByAdmin = Boolean(req.body?.forceRevoke);
+  if (!forceByAdmin && hasKey && (!passcode || !verifyTerminalPasscode(passcode))) {
+    res.status(401).json({ error: 'Enter the terminal pairing passcode to disconnect this terminal' });
+    return;
+  }
+  clearTerminalDeviceCookie(res);
+  res.json({ ok: true, devicePaired: false });
+});
+
+apiRouter.post('/terminal/silent-auth', (req, res) => {
+  if (!isTrustedTerminalRequest(req)) {
+    res.status(403).json({ error: 'Invalid request origin' });
+    return;
+  }
+  const parsedToken = parseTerminalDeviceToken(parseCookieHeader(req, TERMINAL_COOKIE_NAME));
+  if (!parsedToken.valid) {
+    res.status(401).json({ error: 'Device is not paired for silent terminal sign-in' });
+    return;
+  }
+  const reqHardwareUuid = sanitizeHardwareUuid(req.body?.hardwareUuid);
+  if (parsedToken.hardwareUuid && reqHardwareUuid && parsedToken.hardwareUuid !== reqHardwareUuid) {
+    res.status(401).json({ error: 'Terminal hardware UUID mismatch. Please re-pair this POS register.' });
+    return;
+  }
+  const email = String(process.env.TERMINAL_SERVICE_EMAIL || '').trim();
+  const password = String(process.env.TERMINAL_SERVICE_PASSWORD || '').trim();
+  const stationEmail = String(process.env.TERMINAL_STATION_EMAIL || '').trim().toLowerCase();
+  const stationLocationId = String(process.env.TERMINAL_STATION_LOCATION_ID || '').trim();
+
+  if (!email || !password) {
+    res.json({
+      configured: false,
+      reason: 'TERMINAL_CREDENTIALS_NOT_CONFIGURED',
+      stationEmail,
+      stationLocationId,
+      hardwareUuid: reqHardwareUuid || parsedToken.hardwareUuid || '',
+    });
+    return;
+  }
+
+  res.json({
+    configured: true,
+    email,
+    password,
+    stationEmail,
+    stationLocationId,
+    hardwareUuid: reqHardwareUuid || parsedToken.hardwareUuid || '',
+  });
+});
+
+// ==========================================
+// 1C. NETWORKED THERMAL RECEIPT PRINTER DISCOVERY & ESC/POS PRINTING
+// ==========================================
+const FIREBASE_PROJECT_ID = (() => {
+  try {
+    const cfg = JSON.parse(readFileSync(path.resolve(process.cwd(), 'firebase-applet-config.json'), 'utf8'));
+    return String(cfg.projectId || '').trim();
+  } catch {
+    return '';
+  }
+})();
+
+let cachedGoogleCerts: { certs: Record<string, string>; expiresAtMs: number } | null = null;
+
+async function fetchGoogleSecureTokenCerts(): Promise<Record<string, string>> {
+  if (cachedGoogleCerts && Date.now() < cachedGoogleCerts.expiresAtMs) {
+    return cachedGoogleCerts.certs;
+  }
+  const resp = await fetch('https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com');
+  if (!resp.ok) {
+    throw new Error(`Unable to fetch Firebase public keys (${resp.status})`);
+  }
+  const certs = (await resp.json()) as Record<string, string>;
+  const cc = String(resp.headers.get('cache-control') || '');
+  const maxAgeMatch = cc.match(/max-age=(\d+)/i);
+  const ttlMs = maxAgeMatch ? Math.max(60, Number(maxAgeMatch[1])) * 1000 : 300_000;
+  cachedGoogleCerts = { certs, expiresAtMs: Date.now() + ttlMs };
+  return certs;
+}
+
+function decodeBase64Url(str: string): Buffer {
+  const normalized = str.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = normalized.length % 4 === 0 ? '' : '='.repeat(4 - (normalized.length % 4));
+  return Buffer.from(`${normalized}${pad}`, 'base64');
+}
+
+async function verifyFirebaseBearerToken(token: string): Promise<{ uid: string; email: string }> {
+  const parts = token.split('.');
+  if (parts.length !== 3) throw new Error('Malformed Firebase ID token');
+  const [headerB64, payloadB64, sigB64] = parts;
+  const header = JSON.parse(decodeBase64Url(headerB64).toString('utf8'));
+  const payload = JSON.parse(decodeBase64Url(payloadB64).toString('utf8'));
+
+  if (header?.alg !== 'RS256' || !header?.kid) {
+    throw new Error('Unsupported Firebase token algorithm');
+  }
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (!payload?.exp || Number(payload.exp) <= nowSec) {
+    throw new Error('Firebase ID token expired');
+  }
+  if (!payload?.sub || typeof payload.sub !== 'string') {
+    throw new Error('Firebase token missing subject');
+  }
+  if (FIREBASE_PROJECT_ID) {
+    if (payload.aud !== FIREBASE_PROJECT_ID) {
+      throw new Error('Firebase token audience mismatch');
+    }
+    if (payload.iss !== `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`) {
+      throw new Error('Firebase token issuer mismatch');
+    }
+  }
+  if (payload.email_verified !== true) {
+    throw new Error('Verified email required for printer operations');
+  }
+
+  const certs = await fetchGoogleSecureTokenCerts();
+  const pem = certs[String(header.kid)];
+  if (!pem) {
+    throw new Error('Unknown Firebase signing certificate');
+  }
+  const verifier = createVerify('RSA-SHA256');
+  verifier.update(`${headerB64}.${payloadB64}`);
+  verifier.end();
+  const valid = verifier.verify(pem, decodeBase64Url(sigB64));
+  if (!valid) {
+    throw new Error('Invalid Firebase ID token signature');
+  }
+  return {
+    uid: String(payload.sub),
+    email: String(payload.email || ''),
+  };
+}
+
+async function requirePrinterAuth(req: Request, res: Response, next: NextFunction) {
+  if (!isTrustedTerminalRequest(req)) {
+    res.status(403).json({ error: 'Invalid request origin' });
+    return;
+  }
+  const rawAuth = String(req.headers.authorization || '');
+  const bearer = rawAuth.startsWith('Bearer ') ? rawAuth.slice(7).trim() : '';
+  if (!bearer) {
+    res.status(401).json({ error: 'Firebase authentication token required' });
+    return;
+  }
+  try {
+    await verifyFirebaseBearerToken(bearer);
+    next();
+  } catch (err: any) {
+    res.status(401).json({ error: err?.message || 'Unauthorized printer request' });
+  }
+}
+
+const ALLOWED_THERMAL_PORTS = new Set([9100, 9101, 9102]);
+
+function parseStrictIpv4Octets(ip: string): [number, number, number, number] | null {
+  const m = String(ip || '').trim().match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return null;
+  const nums = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])];
+  if (nums.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+  return [nums[0], nums[1], nums[2], nums[3]];
+}
+
+function isPrivateRfc1918Octets(octets: [number, number, number, number]): boolean {
+  const [a, b] = octets;
+  if (a === 10) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  return false;
+}
+
+function isValidPrivateRfc1918Ip(ip: string): boolean {
+  const octets = parseStrictIpv4Octets(ip);
+  return octets ? isPrivateRfc1918Octets(octets) : false;
+}
+
+function octetsToInt(octets: [number, number, number, number]): number {
+  return (((octets[0] << 24) >>> 0) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0;
+}
+
+function intToIp(num: number): string {
+  return [(num >>> 24) & 255, (num >>> 16) & 255, (num >>> 8) & 255, num & 255].join('.');
+}
+
+function detectLocalLanSubnets(): Array<{ name: string; address: string; cidr24: string }> {
+  const ifaces = os.networkInterfaces();
+  const found: Array<{ name: string; address: string; cidr24: string }> = [];
+  const seenCidr = new Set<string>();
+  for (const [name, list] of Object.entries(ifaces)) {
+    if (!Array.isArray(list)) continue;
+    for (const info of list) {
+      if (info.family !== 'IPv4' || info.internal) continue;
+      const octets = parseStrictIpv4Octets(info.address);
+      if (!octets || !isPrivateRfc1918Octets(octets)) continue;
+      const cidr24 = `${octets[0]}.${octets[1]}.${octets[2]}.0/24`;
+      if (!seenCidr.has(cidr24)) {
+        seenCidr.add(cidr24);
+        found.push({ name, address: info.address, cidr24 });
+      }
+    }
+  }
+  return found;
+}
+
+function expandPrivateScanTargets(rawTarget?: string): { ips: string[]; description: string } {
+  const cleaned = String(rawTarget || '').trim();
+  if (!cleaned) {
+    const localIfaces = detectLocalLanSubnets();
+    if (localIfaces.length === 0) {
+      return { ips: [], description: 'No private LAN interface detected on host' };
+    }
+    const primary = localIfaces[0];
+    const octets = parseStrictIpv4Octets(primary.address)!;
+    const base = `${octets[0]}.${octets[1]}.${octets[2]}`;
+    const ips: string[] = [];
+    for (let i = 1; i <= 254; i++) {
+      ips.push(`${base}.${i}`);
+    }
+    return { ips, description: primary.cidr24 };
+  }
+
+  if (cleaned.includes('/')) {
+    const [ipPart, prefixStr] = cleaned.split('/');
+    const octets = parseStrictIpv4Octets(ipPart);
+    const prefix = Number(prefixStr);
+    if (!octets || !Number.isInteger(prefix) || prefix < 24 || prefix > 32) {
+      throw new Error('Subnet CIDR must be an IPv4 private range between /24 and /32 (e.g. 192.168.1.0/24)');
+    }
+    if (!isPrivateRfc1918Octets(octets)) {
+      throw new Error('Only private LAN IPv4 subnets (10.x, 172.16-31.x, 192.168.x) may be scanned');
+    }
+    const mask = prefix === 0 ? 0 : (~((1 << (32 - prefix)) - 1)) >>> 0;
+    const ipInt = octetsToInt(octets);
+    const network = (ipInt & mask) >>> 0;
+    const size = 1 << (32 - prefix);
+    const ips: string[] = [];
+    const startOffset = size > 2 ? 1 : 0;
+    const endOffset = size > 2 ? size - 2 : size - 1;
+    for (let offset = startOffset; offset <= endOffset && ips.length < 254; offset++) {
+      const candidateIp = intToIp((network + offset) >>> 0);
+      if (isValidPrivateRfc1918Ip(candidateIp)) {
+        ips.push(candidateIp);
+      }
+    }
+    return { ips, description: `${intToIp(network)}/${prefix}` };
+  }
+
+  const singleOctets = parseStrictIpv4Octets(cleaned);
+  if (!singleOctets || !isPrivateRfc1918Octets(singleOctets)) {
+    throw new Error('Target IP must be a valid private LAN IPv4 address (10.x, 172.16-31.x, or 192.168.x)');
+  }
+  return { ips: [cleaned], description: cleaned };
+}
+
+interface TcpPrinterProbeResult {
+  ip: string;
+  port: number;
+  reachable: boolean;
+  latencyMs: number;
+  escPosDetected: boolean;
+  paperStatus: 'READY' | 'PAPER_LOW' | 'PAPER_OUT' | 'COVER_OPEN' | 'UNKNOWN';
+  statusSummary: string;
+  protocol: string;
+  suggestedName: string;
+}
+
+function probeThermalTcpEndpoint(ip: string, port: number, connectTimeoutMs = 280): Promise<TcpPrinterProbeResult> {
+  return new Promise((resolve) => {
+    const startMs = Date.now();
+    const socket = new net.Socket();
+    let settled = false;
+    let connected = false;
+    const chunks: Buffer[] = [];
+
+    const finish = (reachable: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      if (!reachable) {
+        resolve({
+          ip,
+          port,
+          reachable: false,
+          latencyMs: Date.now() - startMs,
+          escPosDetected: false,
+          paperStatus: 'UNKNOWN',
+          statusSummary: 'Unreachable',
+          protocol: 'RAW_TCP_ESCPOS',
+          suggestedName: `Thermal Printer (${ip})`,
+        });
+        return;
+      }
+
+      const combined = Buffer.concat(chunks);
+      let escPosDetected = false;
+      let paperStatus: TcpPrinterProbeResult['paperStatus'] = 'UNKNOWN';
+      let statusSummary = `TCP ${port} Open · ESC/POS Ready`;
+
+      if (combined.length > 0) {
+        const s1 = combined[0];
+        if ((s1 & 0x93) === 0x12) {
+          escPosDetected = true;
+          const offline = (s1 & 0x08) !== 0;
+          paperStatus = offline ? 'COVER_OPEN' : 'READY';
+          statusSummary = offline ? 'ESC/POS Online (Cover/Offline Flag)' : 'ESC/POS Online & Ready';
+        }
+        if (combined.length > 1) {
+          const s4 = combined[1];
+          if ((s4 & 0x93) === 0x12) {
+            escPosDetected = true;
+            if ((s4 & 0x60) !== 0) {
+              paperStatus = 'PAPER_OUT';
+              statusSummary = 'ESC/POS Ready · Paper Out';
+            } else if ((s4 & 0x0c) !== 0) {
+              paperStatus = 'PAPER_LOW';
+              statusSummary = 'ESC/POS Ready · Paper Low';
+            } else if (paperStatus === 'UNKNOWN') {
+              paperStatus = 'READY';
+              statusSummary = 'ESC/POS Online & Ready';
+            }
+          }
+        }
+      }
+
+      resolve({
+        ip,
+        port,
+        reachable: true,
+        latencyMs: Math.max(1, Date.now() - startMs),
+        escPosDetected,
+        paperStatus,
+        statusSummary,
+        protocol: 'RAW_TCP_ESCPOS',
+        suggestedName: escPosDetected ? `ESC/POS Thermal (${ip})` : `Network Receipt Printer (${ip})`,
+      });
+    };
+
+    socket.setTimeout(connectTimeoutMs);
+    socket.on('connect', () => {
+      connected = true;
+      socket.setTimeout(160);
+      try {
+        // Safe ESC/POS real-time status queries: DLE EOT 1 & DLE EOT 4
+        socket.write(Buffer.from([0x10, 0x04, 0x01, 0x10, 0x04, 0x04]));
+      } catch {
+        // ignore write errors on probe
+      }
+      setTimeout(() => finish(true), 140);
+    });
+    socket.on('data', (chunk) => {
+      chunks.push(chunk);
+      if (Buffer.concat(chunks).length >= 2) {
+        finish(true);
+      }
+    });
+    socket.on('timeout', () => finish(connected));
+    socket.on('error', () => finish(connected));
+    socket.on('close', () => finish(connected));
+
+    socket.connect(port, ip);
+  });
+}
+
+function sanitizeEscPosText(input: unknown, maxLen = 80): string {
+  return String(input ?? '')
+    .replace(/[\x00-\x1f\x7f]/g, ' ')
+    .replace(/₱/g, 'PHP ')
+    .replace(/[^\x20-\x7e]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLen);
+}
+
+function formatEscPosTwoCol(left: string, right: string, cols: number): string {
+  const cleanL = sanitizeEscPosText(left, cols);
+  const cleanR = sanitizeEscPosText(right, cols);
+  const minGap = 1;
+  const maxLeft = Math.max(4, cols - cleanR.length - minGap);
+  const clippedLeft = cleanL.slice(0, maxLeft);
+  const spaces = Math.max(1, cols - clippedLeft.length - cleanR.length);
+  return `${clippedLeft}${' '.repeat(spaces)}${cleanR}`;
+}
+
+function buildEscPosTestPageBuffer(params: {
+  paperWidthMm: 58 | 80;
+  printerName: string;
+  ip: string;
+  port: number;
+  terminalName: string;
+  hardwareUuid: string;
+}): Buffer {
+  const cols = params.paperWidthMm === 58 ? 32 : 42;
+  const hr = '-'.repeat(cols);
+  const chunks: Buffer[] = [];
+  const line = (s = '') => chunks.push(Buffer.from(`${s}\n`, 'ascii'));
+
+  chunks.push(Buffer.from([0x1b, 0x40])); // ESC @ Reset
+  chunks.push(Buffer.from([0x1b, 0x61, 0x01])); // Center
+  chunks.push(Buffer.from([0x1b, 0x45, 0x01])); // Bold ON
+  line('MAXIMUS BARBECUE ERP');
+  chunks.push(Buffer.from([0x1b, 0x45, 0x00])); // Bold OFF
+  line('THERMAL PRINTER TEST SLIP');
+  line(hr);
+  chunks.push(Buffer.from([0x1b, 0x61, 0x00])); // Left
+  line(formatEscPosTwoCol('Printer:', params.printerName || 'LAN Thermal', cols));
+  line(formatEscPosTwoCol('Endpoint:', `${params.ip}:${params.port}`, cols));
+  line(formatEscPosTwoCol('Paper Width:', `${params.paperWidthMm}mm (${cols} cols)`, cols));
+  line(formatEscPosTwoCol('Terminal:', params.terminalName || 'POS Register', cols));
+  line(`UUID: ${sanitizeEscPosText(params.hardwareUuid || 'N/A', cols - 6)}`);
+  line(formatEscPosTwoCol('Printed:', new Date().toISOString().slice(0, 19).replace('T', ' '), cols));
+  line(hr);
+  chunks.push(Buffer.from([0x1b, 0x61, 0x01])); // Center
+  line('PRINTER MAPPING VERIFIED');
+  line('\n\n');
+  chunks.push(Buffer.from([0x1d, 0x56, 0x42, 0x0a])); // GS V 66 10 partial cut
+  return Buffer.concat(chunks);
+}
+
+function buildEscPosReceiptBuffer(paperWidthMm: 58 | 80, receipt: any): Buffer {
+  const cols = paperWidthMm === 58 ? 32 : 42;
+  const hr = '-'.repeat(cols);
+  const chunks: Buffer[] = [];
+  const line = (s = '') => chunks.push(Buffer.from(`${s}\n`, 'ascii'));
+  const fmtMoney = (n: unknown) => `PHP ${Number(n || 0).toFixed(2)}`;
+
+  chunks.push(Buffer.from([0x1b, 0x40])); // ESC @
+  chunks.push(Buffer.from([0x1b, 0x61, 0x01])); // Center
+  chunks.push(Buffer.from([0x1b, 0x45, 0x01])); // Bold ON
+  line(sanitizeEscPosText(receipt.businessName || 'MAXIMUS BARBECUE', cols));
+  chunks.push(Buffer.from([0x1b, 0x45, 0x00])); // Bold OFF
+  if (receipt.locationName) line(sanitizeEscPosText(receipt.locationName, cols));
+  if (receipt.locationAddress) line(sanitizeEscPosText(receipt.locationAddress, cols));
+  line(hr);
+
+  chunks.push(Buffer.from([0x1b, 0x61, 0x00])); // Left
+  line(formatEscPosTwoCol('Receipt:', String(receipt.receiptNumber || ''), cols));
+  if (receipt.soldAt) {
+    const dt = new Date(String(receipt.soldAt));
+    const dtStr = Number.isNaN(dt.getTime()) ? String(receipt.soldAt) : dt.toLocaleString('en-PH');
+    line(formatEscPosTwoCol('Date:', dtStr, cols));
+  }
+  if (receipt.cashierName) line(formatEscPosTwoCol('Cashier:', String(receipt.cashierName), cols));
+  if (receipt.orderChannel) line(formatEscPosTwoCol('Channel:', String(receipt.orderChannel), cols));
+  if (receipt.buzzerNumber) line(formatEscPosTwoCol('Buzzer:', `#${receipt.buzzerNumber}`, cols));
+  if (receipt.customerName) line(formatEscPosTwoCol('Customer:', String(receipt.customerName), cols));
+  line(hr);
+
+  const items = Array.isArray(receipt.items) ? receipt.items : [];
+  for (const it of items) {
+    const qty = Number(it.qty || 0);
+    const name = sanitizeEscPosText(it.name || 'Item', cols);
+    line(name);
+    line(formatEscPosTwoCol(`  ${qty} x ${Number(it.price || 0).toFixed(2)}`, fmtMoney(it.lineTotal), cols));
+  }
+  line(hr);
+  line(formatEscPosTwoCol('Subtotal:', fmtMoney(receipt.subtotal), cols));
+  if (Number(receipt.discountAmount || 0) > 0) {
+    line(formatEscPosTwoCol('Discount:', `-${fmtMoney(receipt.discountAmount)}`, cols));
+  }
+  line(formatEscPosTwoCol('VAT / Tax:', fmtMoney(receipt.taxAmount), cols));
+  chunks.push(Buffer.from([0x1b, 0x45, 0x01])); // Bold ON
+  line(formatEscPosTwoCol('TOTAL DUE:', fmtMoney(receipt.totalAmount), cols));
+  chunks.push(Buffer.from([0x1b, 0x45, 0x00])); // Bold OFF
+
+  const payments = Array.isArray(receipt.payments) ? receipt.payments : [];
+  if (payments.length > 0) {
+    line(hr);
+    for (const p of payments) {
+      line(formatEscPosTwoCol(`Paid (${String(p.method || 'CASH')}):`, fmtMoney(p.amount), cols));
+    }
+  }
+  line(hr);
+  chunks.push(Buffer.from([0x1b, 0x61, 0x01])); // Center
+  line('THANK YOU FOR DINING WITH US!');
+  if (receipt.shareUrl) {
+    line('Digital Receipt Available Online');
+  }
+  line('\n\n');
+  chunks.push(Buffer.from([0x1d, 0x56, 0x42, 0x0a])); // Feed + Partial cut
+  return Buffer.concat(chunks);
+}
+
+function sendRawEscPosBuffer(ip: string, port: number, data: Buffer, timeoutMs = 3000): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const socket = new net.Socket();
+    let settled = false;
+    const done = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      if (err) reject(err);
+      else resolve(data.length);
+    };
+
+    socket.setTimeout(timeoutMs);
+    socket.on('timeout', () => done(new Error(`Timed out connecting to printer ${ip}:${port}`)));
+    socket.on('error', (err) => done(new Error(`Unable to reach printer ${ip}:${port} (${err.message})`)));
+    socket.connect(port, ip, () => {
+      socket.write(data, (writeErr) => {
+        if (writeErr) {
+          done(new Error(`Failed writing print job to ${ip}:${port}: ${writeErr.message}`));
+          return;
+        }
+        socket.end(() => done());
+      });
+    });
+  });
+}
+
+apiRouter.get('/printers/subnets', requirePrinterAuth, (_req, res) => {
+  const interfaces = detectLocalLanSubnets();
+  const isCloudContainerHint = Boolean(process.env.K_SERVICE || process.env.CLOUD_RUN_JOB || interfaces.length === 0);
+  res.json({
+    detectedSubnets: interfaces.map((i) => i.cidr24),
+    interfaces,
+    isCloudContainerHint,
+    cloudNetworkNote: isCloudContainerHint
+      ? 'This app server is running in a cloud container isolated from your shop Wi-Fi router. LAN scans probe the host network; you can still probe or manually map a known shop printer IP (e.g. 192.168.1.88:9100) to this terminal.'
+      : 'Local LAN interface detected. Scan the subnet below to discover ESC/POS thermal receipt printers on TCP port 9100.',
+  });
+});
+
+apiRouter.post('/printers/scan', requirePrinterAuth, async (req, res) => {
+  try {
+    const startMs = Date.now();
+    const rawPorts = Array.isArray(req.body?.ports) ? req.body.ports : [9100];
+    const ports: number[] = Array.from(
+      new Set<number>(
+        rawPorts
+          .map((p: unknown) => Number(p))
+          .filter((p: number) => ALLOWED_THERMAL_PORTS.has(p)),
+      ),
+    );
+    const activePorts: number[] = ports.length > 0 ? ports : [9100];
+    const { ips, description } = expandPrivateScanTargets(req.body?.target);
+    const detectedSubnets = detectLocalLanSubnets().map((i) => i.cidr24);
+    const isCloudContainerHint = Boolean(process.env.K_SERVICE || process.env.CLOUD_RUN_JOB || detectedSubnets.length === 0);
+
+    if (ips.length === 0) {
+      res.json({
+        scannedHosts: 0,
+        durationMs: Date.now() - startMs,
+        detectedSubnets,
+        targetDescription: description,
+        printers: [],
+        cloudNetworkNote:
+          'No private LAN network interface is attached to this server host. Enter a private subnet CIDR (e.g. 192.168.1.0/24) or directly map your shop printer IP.',
+      });
+      return;
+    }
+
+    const targets: Array<{ ip: string; port: number }> = [];
+    for (const ip of ips) {
+      for (const port of activePorts) {
+        targets.push({ ip, port });
+      }
+    }
+    const cappedTargets = targets.slice(0, 510);
+    const printers: TcpPrinterProbeResult[] = [];
+    const batchSize = 32;
+
+    for (let i = 0; i < cappedTargets.length; i += batchSize) {
+      const slice = cappedTargets.slice(i, i + batchSize);
+      const results = await Promise.all(slice.map((t) => probeThermalTcpEndpoint(t.ip, t.port, 240)));
+      for (const r of results) {
+        if (r.reachable) printers.push(r);
+      }
+    }
+
+    printers.sort((a, b) => Number(b.escPosDetected) - Number(a.escPosDetected) || a.latencyMs - b.latencyMs);
+
+    res.json({
+      scannedHosts: ips.length,
+      durationMs: Date.now() - startMs,
+      detectedSubnets,
+      targetDescription: description,
+      printers,
+      cloudNetworkNote: isCloudContainerHint
+        ? 'Server is running in a cloud environment, so local store Wi-Fi printers on your food truck router cannot be reached directly from the cloud host. You can still map your shop printer IP directly below.'
+        : '',
+    });
+  } catch (err: any) {
+    res.status(400).json({ error: err?.message || 'Unable to scan network printers' });
+  }
+});
+
+apiRouter.post('/printers/probe', requirePrinterAuth, async (req, res) => {
+  const ip = String(req.body?.ip || '').trim();
+  const port = Number(req.body?.port || 9100);
+  if (!isValidPrivateRfc1918Ip(ip)) {
+    res.status(400).json({ error: 'Printer IP must be a private LAN IPv4 address (10.x, 172.16-31.x, or 192.168.x)' });
+    return;
+  }
+  if (!ALLOWED_THERMAL_PORTS.has(port)) {
+    res.status(400).json({ error: 'Printer port must be 9100, 9101, or 9102' });
+    return;
+  }
+  const result = await probeThermalTcpEndpoint(ip, port, 900);
+  res.json({
+    reachable: result.reachable,
+    printer: result.reachable ? result : null,
+    error: result.reachable ? undefined : `No thermal printer responded at ${ip}:${port} within 900ms`,
+  });
+});
+
+apiRouter.post('/printers/test-print', requirePrinterAuth, async (req, res) => {
+  const ip = String(req.body?.ip || '').trim();
+  const port = Number(req.body?.port || 9100);
+  const paperWidthMm: 58 | 80 = Number(req.body?.paperWidthMm) === 58 ? 58 : 80;
+  if (!isValidPrivateRfc1918Ip(ip)) {
+    res.status(400).json({ error: 'Printer IP must be a private LAN IPv4 address (10.x, 172.16-31.x, or 192.168.x)' });
+    return;
+  }
+  if (!ALLOWED_THERMAL_PORTS.has(port)) {
+    res.status(400).json({ error: 'Printer port must be 9100, 9101, or 9102' });
+    return;
+  }
+  try {
+    const payload = buildEscPosTestPageBuffer({
+      paperWidthMm,
+      printerName: String(req.body?.printerName || 'LAN Thermal Printer'),
+      ip,
+      port,
+      terminalName: String(req.body?.terminalName || 'POS Terminal'),
+      hardwareUuid: String(req.body?.hardwareUuid || ''),
+    });
+    const bytesSent = await sendRawEscPosBuffer(ip, port, payload, 2500);
+    res.json({
+      ok: true,
+      bytesSent,
+      message: `Sent ${bytesSent}-byte ESC/POS test slip to ${ip}:${port}`,
+    });
+  } catch (err: any) {
+    res.status(502).json({ error: err?.message || `Unable to send test print to ${ip}:${port}` });
+  }
+});
+
+apiRouter.post('/printers/print-receipt', requirePrinterAuth, async (req, res) => {
+  const ip = String(req.body?.ip || '').trim();
+  const port = Number(req.body?.port || 9100);
+  const paperWidthMm: 58 | 80 = Number(req.body?.paperWidthMm) === 58 ? 58 : 80;
+  const receipt = req.body?.receipt;
+  if (!isValidPrivateRfc1918Ip(ip)) {
+    res.status(400).json({ error: 'Printer IP must be a private LAN IPv4 address (10.x, 172.16-31.x, or 192.168.x)' });
+    return;
+  }
+  if (!ALLOWED_THERMAL_PORTS.has(port)) {
+    res.status(400).json({ error: 'Printer port must be 9100, 9101, or 9102' });
+    return;
+  }
+  if (!receipt || typeof receipt !== 'object') {
+    res.status(400).json({ error: 'Receipt payload is required' });
+    return;
+  }
+  try {
+    const payload = buildEscPosReceiptBuffer(paperWidthMm, receipt);
+    const bytesSent = await sendRawEscPosBuffer(ip, port, payload, 3000);
+    res.json({
+      ok: true,
+      bytesSent,
+      message: `Printed receipt ${sanitizeEscPosText(receipt.receiptNumber || '', 40)} to ${ip}:${port}`,
+    });
+  } catch (err: any) {
+    res.status(502).json({ error: err?.message || `Unable to print receipt to ${ip}:${port}` });
+  }
+});
+
 // All routes below require authentication
 apiRouter.use(authMiddleware);
 
@@ -350,8 +1246,18 @@ apiRouter.post('/notifications/:id/read', (req, res) => {
 });
 
 apiRouter.get('/dashboard/summary', requirePerm(PERMISSIONS.DASHBOARD_VIEW), (req, res) => {
-  const { from, to, locationId } = req.query as Record<string, string | undefined>;
-  res.json(getDashboardSummary({ from, to, locationId: locationId || undefined }));
+  const { from, to, locationId, todayFrom, todayTo, yesterdayFrom, yesterdayTo } = req.query as Record<string, string | undefined>;
+  res.json(
+    getDashboardSummary({
+      from,
+      to,
+      locationId: locationId || undefined,
+      todayFrom: todayFrom || undefined,
+      todayTo: todayTo || undefined,
+      yesterdayFrom: yesterdayFrom || undefined,
+      yesterdayTo: yesterdayTo || undefined,
+    }),
+  );
 });
 
 // ==========================================
@@ -709,7 +1615,7 @@ apiRouter.patch('/products/:id/availability', requirePerm(PERMISSIONS.PRODUCT_MA
 // ==========================================
 apiRouter.get('/inventory', requirePerm(PERMISSIONS.INVENTORY_VIEW), (req, res) => {
   const locationId = req.query.locationId as string | undefined;
-  const items = db
+  const rawItems = db
     .prepare(`
       SELECT i.*, u.code AS uom_code,
         COALESCE((SELECT SUM(b.remaining_qty) FROM stock_batches b WHERE b.inventory_item_id = i.id ${locationId ? 'AND b.location_id = ?' : ''}), 0) AS on_hand_qty,
@@ -718,7 +1624,21 @@ apiRouter.get('/inventory', requirePerm(PERMISSIONS.INVENTORY_VIEW), (req, res) 
       JOIN uoms u ON u.id = i.base_uom_id
       ORDER BY i.name ASC
     `)
-    .all(...(locationId ? [locationId, locationId] : []));
+    .all(...(locationId ? [locationId, locationId] : [])) as any[];
+
+  const items = rawItems.map((item) => {
+    const evalRes = evaluateIngredientThreshold({
+      onHandQty: Number(item.on_hand_qty || 0),
+      safetyStock: Number(item.min_stock_level || 0),
+      reorderPoint: Number(item.reorder_point || 0),
+    });
+    return {
+      ...item,
+      safety_stock_level: evalRes.safetyStock,
+      threshold_status: evalRes.status,
+      safety_deficit: evalRes.status === 'BELOW_SAFETY' ? evalRes.deficitQty : 0,
+    };
+  });
 
   const batches = db
     .prepare(`
@@ -746,7 +1666,323 @@ apiRouter.get('/inventory', requirePerm(PERMISSIONS.INVENTORY_VIEW), (req, res) 
     .all(...(locationId ? [locationId] : []));
 
   const uoms = db.prepare('SELECT * FROM uoms').all();
-  res.json({ items, batches, movements, uoms });
+  const belowSafetyItems = items.filter((i) => i.threshold_status === 'BELOW_SAFETY');
+  const belowReorderItems = items.filter((i) => i.threshold_status === 'BELOW_REORDER');
+  const rawBelowSafetyItems = belowSafetyItems.filter((i) => i.item_type === 'RAW_MATERIAL');
+
+  res.json({
+    items,
+    batches,
+    movements,
+    uoms,
+    alertsSummary: {
+      belowSafetyCount: belowSafetyItems.length,
+      belowReorderCount: belowReorderItems.length,
+      rawBelowSafetyCount: rawBelowSafetyItems.length,
+      rawItemsBelowSafety: rawBelowSafetyItems.map((i) => ({
+        id: i.id,
+        sku: i.sku,
+        name: i.name,
+        onHandQty: i.on_hand_qty,
+        safetyStock: i.safety_stock_level,
+        deficitQty: i.safety_deficit,
+        uomCode: i.uom_code,
+      })),
+    },
+  });
+});
+
+apiRouter.post('/inventory/alerts/scan', requirePerm(PERMISSIONS.INVENTORY_VIEW), (req, res) => {
+  try {
+    const rawLoc = String(req.body?.locationId || '').trim();
+    const locFilterId = rawLoc && rawLoc !== 'ALL' ? rawLoc : '';
+    const onlyIfNeverNotified = Boolean(req.body?.onlyIfNeverNotified);
+    const rawOnly = req.body?.rawOnly !== false;
+
+    const candidateItems = db
+      .prepare(`
+        SELECT i.*, u.code AS uom_code
+        FROM inventory_items i
+        JOIN uoms u ON u.id = i.base_uom_id
+        WHERE (i.min_stock_level > 0 OR i.reorder_point > 0)
+        ${rawOnly ? "AND i.item_type = 'RAW_MATERIAL'" : ''}
+        ORDER BY i.name ASC
+      `)
+      .all() as any[];
+
+    const activeLocs = db.prepare('SELECT id, name FROM locations WHERE is_active = 1').all() as Array<{ id: string; name: string }>;
+    const activeLocMap = new Map(activeLocs.map((l) => [l.id, l.name]));
+
+    let scannedCount = 0;
+    let belowSafetyCount = 0;
+    let belowReorderCount = 0;
+    let createdCount = 0;
+    let resolvedCount = 0;
+    const alerts: any[] = [];
+
+    for (const item of candidateItems) {
+      if (locFilterId) {
+        scannedCount++;
+        const agg = db
+          .prepare('SELECT COALESCE(SUM(remaining_qty), 0) AS qty FROM stock_batches WHERE inventory_item_id = ? AND location_id = ?')
+          .get(item.id, locFilterId) as { qty: number };
+        const locQty = round2(Number(agg?.qty || 0));
+        const syncRes = syncItemThresholdAlertsSql(item, locFilterId, locQty, { onlyIfNeverNotified });
+        createdCount += syncRes.createdCount;
+        resolvedCount += syncRes.resolvedCount;
+        if (syncRes.status === 'BELOW_SAFETY') {
+          belowSafetyCount++;
+          alerts.push({
+            inventoryItemId: item.id,
+            sku: item.sku,
+            name: item.name,
+            itemType: item.item_type,
+            locationId: locFilterId,
+            locationName: activeLocMap.get(locFilterId) || 'Location',
+            onHandQty: locQty,
+            safetyStock: Number(item.min_stock_level || 0),
+            reorderPoint: Number(item.reorder_point || 0),
+            uomCode: item.uom_code,
+            status: syncRes.status,
+          });
+        } else if (syncRes.status === 'BELOW_REORDER') {
+          belowReorderCount++;
+        }
+      } else {
+        const stockedRows = db
+          .prepare(`
+            SELECT DISTINCT location_id FROM stock_batches WHERE inventory_item_id = ?
+            UNION
+            SELECT DISTINCT location_id FROM inventory_transactions WHERE inventory_item_id = ?
+          `)
+          .all(item.id, item.id) as Array<{ location_id: string }>;
+        const stockedLocIds = stockedRows.map((r) => r.location_id).filter((lid) => activeLocMap.has(lid));
+
+        if (stockedLocIds.length === 0) {
+          scannedCount++;
+          const syncRes = syncItemThresholdAlertsSql(item, null, 0, { onlyIfNeverNotified });
+          createdCount += syncRes.createdCount;
+          resolvedCount += syncRes.resolvedCount;
+          if (syncRes.status === 'BELOW_SAFETY') {
+            belowSafetyCount++;
+            alerts.push({
+              inventoryItemId: item.id,
+              sku: item.sku,
+              name: item.name,
+              itemType: item.item_type,
+              locationId: null,
+              locationName: 'All Locations',
+              onHandQty: 0,
+              safetyStock: Number(item.min_stock_level || 0),
+              reorderPoint: Number(item.reorder_point || 0),
+              uomCode: item.uom_code,
+              status: syncRes.status,
+            });
+          } else if (syncRes.status === 'BELOW_REORDER') {
+            belowReorderCount++;
+          }
+        } else {
+          for (const lid of stockedLocIds) {
+            scannedCount++;
+            const agg = db
+              .prepare('SELECT COALESCE(SUM(remaining_qty), 0) AS qty FROM stock_batches WHERE inventory_item_id = ? AND location_id = ?')
+              .get(item.id, lid) as { qty: number };
+            const locQty = round2(Number(agg?.qty || 0));
+            const syncRes = syncItemThresholdAlertsSql(item, lid, locQty, { onlyIfNeverNotified });
+            createdCount += syncRes.createdCount;
+            resolvedCount += syncRes.resolvedCount;
+            if (syncRes.status === 'BELOW_SAFETY') {
+              belowSafetyCount++;
+              alerts.push({
+                inventoryItemId: item.id,
+                sku: item.sku,
+                name: item.name,
+                itemType: item.item_type,
+                locationId: lid,
+                locationName: activeLocMap.get(lid) || 'Location',
+                onHandQty: locQty,
+                safetyStock: Number(item.min_stock_level || 0),
+                reorderPoint: Number(item.reorder_point || 0),
+                uomCode: item.uom_code,
+                status: syncRes.status,
+              });
+            } else if (syncRes.status === 'BELOW_REORDER') {
+              belowReorderCount++;
+            }
+          }
+        }
+      }
+    }
+
+    res.json({
+      scannedCount,
+      belowSafetyCount,
+      belowReorderCount,
+      createdCount,
+      resolvedCount,
+      alerts,
+    });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.get('/inventory/predictive-procurement', requirePerm(PERMISSIONS.INVENTORY_VIEW), (req, res) => {
+  try {
+    const locationId = req.query.locationId ? String(req.query.locationId) : undefined;
+    const lookbackDays = req.query.lookbackDays ? Number(req.query.lookbackDays) : 90;
+    const coverageDays = req.query.coverageDays ? Number(req.query.coverageDays) : 14;
+    const plan = getPredictiveProcurementPlan({ locationId, lookbackDays, coverageDays });
+    res.json(plan);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/inventory/predictive-procurement/auto-po', requirePerm(PERMISSIONS.PO_CREATE), (req, res) => {
+  try {
+    const { locationId, status, notes, coverageDays, items } = req.body || {};
+    const rawLocId = String(locationId || '').trim();
+    if (!rawLocId || rawLocId === 'ALL') {
+      throw new Error('Select a specific delivery location (e.g., Commissary or Food Truck) before creating auto-restock POs');
+    }
+    const targetLoc = db.prepare('SELECT id, name FROM locations WHERE id = ? AND is_active = 1').get(rawLocId) as
+      | { id: string; name: string }
+      | undefined;
+    if (!targetLoc) throw new Error('Selected delivery location was not found');
+
+    const requestedStatus = String(status || 'DRAFT').toUpperCase();
+    if (requestedStatus !== 'DRAFT' && requestedStatus !== 'PENDING_APPROVAL') {
+      throw new Error('Predictive auto-restock POs can only be created as DRAFT or PENDING_APPROVAL');
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new Error('Select at least one ingredient to generate purchase order(s)');
+    }
+    if (items.length > 120) {
+      throw new Error('Too many line items in a single auto-restock batch');
+    }
+
+    const activeSuppliers = db.prepare('SELECT id, name FROM suppliers WHERE is_active = 1').all() as Array<{
+      id: string;
+      name: string;
+    }>;
+    const supById = new Map(activeSuppliers.map((s) => [s.id, s]));
+    const itemRows = db.prepare('SELECT id, name FROM inventory_items').all() as Array<{ id: string; name: string }>;
+    const itemById = new Map(itemRows.map((i) => [i.id, i]));
+
+    const groupedBySup = new Map<
+      string,
+      {
+        supplierId: string;
+        supplierName: string;
+        leadTimeDays: number;
+        lines: Array<{ inventoryItemId: string; orderedQty: number; unitCost: number }>;
+      }
+    >();
+
+    for (const rawLine of items) {
+      const invId = String(rawLine?.inventoryItemId || '').trim();
+      const supId = String(rawLine?.supplierId || '').trim();
+      const orderedQty = round2(Number(rawLine?.orderedQty || 0));
+      const unitCost = round4(Number(rawLine?.unitCost ?? 0));
+      const leadTimeDays = Math.max(1, Math.min(30, Math.round(Number(rawLine?.leadTimeDays || 2))));
+
+      const invItem = itemById.get(invId);
+      if (!invItem) throw new Error('One or more selected inventory items could not be found');
+      const sup = supById.get(supId);
+      if (!sup) throw new Error(`Please assign an active supplier for "${invItem.name}"`);
+      if (!Number.isFinite(orderedQty) || orderedQty <= 0) {
+        throw new Error(`Restock quantity for "${invItem.name}" must be greater than zero`);
+      }
+      if (!Number.isFinite(unitCost) || unitCost < 0) {
+        throw new Error(`Unit cost for "${invItem.name}" cannot be negative`);
+      }
+
+      const existingGroup = groupedBySup.get(supId);
+      if (existingGroup) {
+        const existingLine = existingGroup.lines.find((l) => l.inventoryItemId === invId);
+        if (existingLine) {
+          existingLine.orderedQty = round2(existingLine.orderedQty + orderedQty);
+          existingLine.unitCost = unitCost;
+        } else {
+          existingGroup.lines.push({ inventoryItemId: invId, orderedQty, unitCost });
+        }
+        existingGroup.leadTimeDays = Math.max(existingGroup.leadTimeDays, leadTimeDays);
+      } else {
+        groupedBySup.set(supId, {
+          supplierId: supId,
+          supplierName: sup.name,
+          leadTimeDays,
+          lines: [{ inventoryItemId: invId, orderedQty, unitCost }],
+        });
+      }
+    }
+
+    const covDays = Math.min(45, Math.max(3, Math.round(Number(coverageDays || 14) || 14)));
+    const noteBase = String(notes || `Predictive 90d restock (${covDays}d target coverage)`).trim().slice(0, 500);
+
+    const createdPos = db.transaction(() => {
+      const created: Array<{
+        id: string;
+        poNumber: string;
+        supplierId: string;
+        supplierName: string;
+        status: string;
+        totalAmount: number;
+        lineCount: number;
+      }> = [];
+      let seqIdx = 0;
+
+      const insPo = db.prepare(
+        'INSERT INTO purchase_orders (id, po_number, supplier_id, location_id, status, total_amount, approved_by, notes, expected_at) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)',
+      );
+      const insLine = db.prepare(
+        'INSERT INTO purchase_order_items (id, purchase_order_id, inventory_item_id, ordered_qty, unit_cost) VALUES (?, ?, ?, ?, ?)',
+      );
+
+      for (const group of groupedBySup.values()) {
+        for (let offset = 0; offset < group.lines.length; offset += 60) {
+          const chunk = group.lines.slice(offset, offset + 60);
+          seqIdx += 1;
+          const poId = randomUUID();
+          const poNumber = `PO-${Date.now().toString().slice(-5)}${String(seqIdx).padStart(2, '0')}`;
+          const totalAmount = round2(chunk.reduce((s, l) => s + l.orderedQty * l.unitCost, 0));
+          const expectedIso = new Date(Date.now() + group.leadTimeDays * 86400000).toISOString().slice(0, 10);
+
+          insPo.run(poId, poNumber, group.supplierId, targetLoc.id, requestedStatus, totalAmount, noteBase, expectedIso);
+          for (const l of chunk) {
+            insLine.run(randomUUID(), poId, l.inventoryItemId, l.orderedQty, l.unitCost);
+          }
+
+          writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'AUTO_CREATE_PREDICTIVE_PO', 'PurchaseOrder', poId, {
+            poNumber,
+            supplier: group.supplierName,
+            location: targetLoc.name,
+            totalAmount,
+            status: requestedStatus,
+            lineCount: chunk.length,
+          });
+
+          created.push({
+            id: poId,
+            poNumber,
+            supplierId: group.supplierId,
+            supplierName: group.supplierName,
+            status: requestedStatus,
+            totalAmount,
+            lineCount: chunk.length,
+          });
+        }
+      }
+
+      return created;
+    })();
+
+    res.status(201).json({ createdPos });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 apiRouter.post('/inventory/items', requireAnyPerm(PERMISSIONS.INVENTORY_ADJUST, PERMISSIONS.PRODUCT_MANAGE), (req, res) => {
@@ -765,6 +2001,9 @@ apiRouter.post('/inventory/items', requireAnyPerm(PERMISSIONS.INVENTORY_ADJUST, 
     const cost = Number(lastUnitCost || 0);
     if (!Number.isFinite(cost) || cost < 0) throw new Error('Unit cost cannot be negative');
 
+    const safety = Math.max(0, Number(minStockLevel || 0));
+    const reorder = Math.max(0, Number(reorderPoint || 0));
+
     const id = randomUUID();
     db.prepare(`
       INSERT INTO inventory_items (id, sku, name, item_type, base_uom_id, costing_method, min_stock_level, reorder_point, last_unit_cost, weighted_avg_cost)
@@ -776,17 +2015,29 @@ apiRouter.post('/inventory/items', requireAnyPerm(PERMISSIONS.INVENTORY_ADJUST, 
       itemType || 'RAW_MATERIAL',
       baseUomId,
       costingMethod || 'FIFO',
-      Number(minStockLevel || 0),
-      Number(reorderPoint || 0),
+      safety,
+      reorder,
       cost,
       cost,
     );
 
     const created = db
       .prepare('SELECT i.*, u.code AS uom_code FROM inventory_items i JOIN uoms u ON u.id = i.base_uom_id WHERE i.id = ?')
-      .get(id);
-    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'CREATE_INGREDIENT', 'InventoryItem', id, { name: cleanName, sku: cleanSku });
-    res.status(201).json(created);
+      .get(id) as any;
+
+    let alertsCreated = 0;
+    if (safety > 0 || reorder > 0) {
+      const syncRes = syncItemThresholdAlertsSql(created, null, 0, { onlyIfNeverNotified: false });
+      alertsCreated = syncRes.createdCount;
+    }
+
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'CREATE_INGREDIENT', 'InventoryItem', id, {
+      name: cleanName,
+      sku: cleanSku,
+      safetyStock: safety,
+      alertsCreated,
+    });
+    res.status(201).json({ ...created, alerts_created: alertsCreated });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
@@ -828,6 +2079,8 @@ apiRouter.put('/inventory/items/:id', requireAnyPerm(PERMISSIONS.INVENTORY_ADJUS
 
     const hasBatches = db.prepare('SELECT 1 FROM stock_batches WHERE inventory_item_id = ? AND remaining_qty > 0 LIMIT 1').get(itemId);
     const nextWeightedAvg = hasBatches ? existing.weighted_avg_cost : cost;
+    const nextSafety = Math.max(0, Number(minStockLevel ?? existing.min_stock_level ?? 0));
+    const nextReorder = Math.max(0, Number(reorderPoint ?? existing.reorder_point ?? 0));
 
     db.prepare(`
       UPDATE inventory_items
@@ -840,8 +2093,8 @@ apiRouter.put('/inventory/items/:id', requireAnyPerm(PERMISSIONS.INVENTORY_ADJUS
       itemType || existing.item_type || 'RAW_MATERIAL',
       baseUomId,
       costingMethod || existing.costing_method || 'FIFO',
-      Number(minStockLevel ?? existing.min_stock_level ?? 0),
-      Number(reorderPoint ?? existing.reorder_point ?? 0),
+      nextSafety,
+      nextReorder,
       cost,
       nextWeightedAvg,
       itemId,
@@ -849,9 +2102,41 @@ apiRouter.put('/inventory/items/:id', requireAnyPerm(PERMISSIONS.INVENTORY_ADJUS
 
     const updated = db
       .prepare('SELECT i.*, u.code AS uom_code FROM inventory_items i JOIN uoms u ON u.id = i.base_uom_id WHERE i.id = ?')
-      .get(itemId);
-    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'UPDATE_INGREDIENT', 'InventoryItem', itemId, { name: cleanName, sku: cleanSku, cost });
-    res.json(updated);
+      .get(itemId) as any;
+
+    const activeLocs = db.prepare('SELECT id FROM locations WHERE is_active = 1').all() as Array<{ id: string }>;
+    const activeLocSet = new Set(activeLocs.map((l) => l.id));
+    const stockedRows = db
+      .prepare(`
+        SELECT DISTINCT location_id FROM stock_batches WHERE inventory_item_id = ?
+        UNION
+        SELECT DISTINCT location_id FROM inventory_transactions WHERE inventory_item_id = ?
+      `)
+      .all(itemId, itemId) as Array<{ location_id: string }>;
+    const stockedLocIds = stockedRows.map((r) => r.location_id).filter((lid) => activeLocSet.has(lid));
+
+    let alertsCreated = 0;
+    if (stockedLocIds.length === 0) {
+      const syncRes = syncItemThresholdAlertsSql(updated, null, 0, { onlyIfNeverNotified: false });
+      alertsCreated += syncRes.createdCount;
+    } else {
+      for (const lid of stockedLocIds) {
+        const agg = db
+          .prepare('SELECT COALESCE(SUM(remaining_qty), 0) AS qty FROM stock_batches WHERE inventory_item_id = ? AND location_id = ?')
+          .get(itemId, lid) as { qty: number };
+        const syncRes = syncItemThresholdAlertsSql(updated, lid, round2(Number(agg?.qty || 0)), { onlyIfNeverNotified: false });
+        alertsCreated += syncRes.createdCount;
+      }
+    }
+
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'UPDATE_INGREDIENT', 'InventoryItem', itemId, {
+      name: cleanName,
+      sku: cleanSku,
+      cost,
+      safetyStock: nextSafety,
+      alertsCreated,
+    });
+    res.json({ ...updated, alerts_created: alertsCreated });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
@@ -1665,6 +2950,17 @@ apiRouter.get('/finance/overview', requirePerm(PERMISSIONS.FINANCE_VIEW), (req, 
   const statements = getFinancialStatements(from, to);
 
   res.json({ expenses, closings, journals, accounts, pettyCash, periods, statements, expenseCategories });
+});
+
+apiRouter.get('/finance/weekly-food-cost', requirePerm(PERMISSIONS.FINANCE_VIEW), (req, res) => {
+  try {
+    const locationId = typeof req.query.locationId === 'string' ? req.query.locationId.trim() : undefined;
+    const rawWeeks = Number(req.query.weeks || 8);
+    const weeks = Number.isFinite(rawWeeks) ? Math.min(26, Math.max(2, Math.round(rawWeeks))) : 8;
+    res.json(getWeeklyFoodCostTrends({ locationId, weeks }));
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || 'Unable to compute weekly food cost trends' });
+  }
 });
 
 apiRouter.post('/finance/expenses', requirePerm(PERMISSIONS.FINANCE_VIEW), (req, res) => {
@@ -2537,11 +3833,48 @@ apiRouter.get('/hr', requirePerm(PERMISSIONS.HR_MANAGE), (_req, res) => {
       .prepare('SELECT pi.*, e.full_name, e.employee_code FROM payroll_items pi JOIN employees e ON e.id = pi.employee_id WHERE pi.payroll_run_id = ?')
       .all(pr.id),
   }));
+  const rawTemplates = db.prepare('SELECT * FROM shift_templates ORDER BY is_active DESC, start_time ASC, name ASC').all() as any[];
+  const shiftTemplates = rawTemplates.map((t) => {
+    let daysOfWeek: string[] = [];
+    let locationIds: string[] = [];
+    try {
+      daysOfWeek = JSON.parse(t.days_of_week_json || '[]');
+    } catch {
+      daysOfWeek = [];
+    }
+    try {
+      locationIds = JSON.parse(t.location_ids_json || '[]');
+    } catch {
+      locationIds = [];
+    }
+    return {
+      ...t,
+      days_of_week: Array.isArray(daysOfWeek) ? daysOfWeek : [],
+      location_ids: Array.isArray(locationIds) ? locationIds : [],
+    };
+  });
+  const shiftSchedules = db
+    .prepare(`
+      SELECT s.*,
+             l.name AS location_name,
+             l.code AS location_code,
+             e.full_name AS employee_name,
+             e.employee_code AS employee_code,
+             e.position AS employee_position
+      FROM shift_schedules s
+      LEFT JOIN locations l ON l.id = s.location_id
+      LEFT JOIN employees e ON e.id = s.employee_id
+      ORDER BY s.shift_date ASC, s.start_time ASC, l.name ASC
+      LIMIT 300
+    `)
+    .all();
   res.json({
     employees,
     attendance,
     payrollRules: rules ? { ...rules, config: JSON.parse(rules.rule_json) } : null,
     payrollRuns,
+    shiftTemplates,
+    shiftSchedules,
   });
 });
 
@@ -2891,6 +4224,669 @@ apiRouter.post('/hr/payroll/run', requirePerm(PERMISSIONS.PAYROLL_RUN), (req, re
   res.status(201).json(run);
 });
 
+const VALID_WEEKDAYS = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
+const VALID_SHIFT_STATUSES = ['SCHEDULED', 'CONFIRMED', 'COMPLETED', 'CANCELLED'];
+
+function normalizeWeekdays(raw: any): string[] {
+  if (!Array.isArray(raw)) return ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
+  const cleaned = raw
+    .map((d) => String(d).trim().toUpperCase())
+    .filter((d) => VALID_WEEKDAYS.includes(d));
+  return Array.from(new Set(cleaned)).slice(0, 7);
+}
+
+function normalizeTimeStr(raw: any, fallback: string): string {
+  const val = String(raw || '').trim();
+  if (/^\d{2}:\d{2}$/.test(val)) return val;
+  return fallback;
+}
+
+apiRouter.post('/hr/shift-templates', requirePerm(PERMISSIONS.HR_MANAGE), (req, res) => {
+  try {
+    const {
+      code,
+      name,
+      startTime,
+      endTime,
+      breakMinutes = 60,
+      daysOfWeek,
+      locationIds = [],
+      defaultRole = null,
+      headcountNeeded = 2,
+      notes = null,
+      isActive = true,
+    } = req.body || {};
+
+    const cleanName = String(name || '').trim().slice(0, 120);
+    const cleanCode = String(code || '').trim().toUpperCase().slice(0, 32);
+    if (!cleanName) throw new Error('Shift template name is required');
+    if (!cleanCode) throw new Error('Shift template code is required');
+
+    const dup = db.prepare('SELECT id FROM shift_templates WHERE lower(code) = lower(?)').get(cleanCode);
+    if (dup) throw new Error(`Shift template code "${cleanCode}" already exists`);
+
+    const cleanStart = normalizeTimeStr(startTime, '07:00');
+    const cleanEnd = normalizeTimeStr(endTime, '15:00');
+    const cleanBreak = Math.max(0, Math.min(480, Math.round(Number(breakMinutes ?? 60))));
+    const cleanHeadcount = Math.max(1, Math.min(100, Math.round(Number(headcountNeeded ?? 2))));
+    const cleanDays = normalizeWeekdays(daysOfWeek);
+    const cleanLocs = Array.isArray(locationIds)
+      ? Array.from(new Set(locationIds.map((l) => String(l).trim()).filter(Boolean))).slice(0, 25)
+      : [];
+    const cleanRole = defaultRole ? String(defaultRole).trim().slice(0, 120) : null;
+    const cleanNotes = notes ? String(notes).trim().slice(0, 400) : null;
+    const id = randomUUID();
+
+    db.prepare(`
+      INSERT INTO shift_templates (
+        id, code, name, start_time, end_time, break_minutes, days_of_week_json,
+        location_ids_json, default_role, headcount_needed, notes, is_active,
+        created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+    `).run(
+      id,
+      cleanCode,
+      cleanName,
+      cleanStart,
+      cleanEnd,
+      cleanBreak,
+      JSON.stringify(cleanDays),
+      JSON.stringify(cleanLocs),
+      cleanRole,
+      cleanHeadcount,
+      cleanNotes,
+      isActive === false ? 0 : 1,
+    );
+
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'CREATE_SHIFT_TEMPLATE', 'ShiftTemplate', id, {
+      code: cleanCode,
+      name: cleanName,
+      locationsCount: cleanLocs.length,
+    });
+    res.status(201).json({ id });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.put('/hr/shift-templates/:id', requirePerm(PERMISSIONS.HR_MANAGE), (req, res) => {
+  try {
+    const id = req.params.id;
+    const existing = db.prepare('SELECT * FROM shift_templates WHERE id = ?').get(id) as any;
+    if (!existing) {
+      res.status(404).json({ error: 'Shift template not found' });
+      return;
+    }
+
+    const {
+      code,
+      name,
+      startTime,
+      endTime,
+      breakMinutes,
+      daysOfWeek,
+      locationIds,
+      defaultRole,
+      headcountNeeded,
+      notes,
+      isActive,
+    } = req.body || {};
+
+    const cleanName = String(name ?? existing.name).trim().slice(0, 120);
+    const cleanCode = String(code ?? existing.code).trim().toUpperCase().slice(0, 32);
+    if (!cleanName) throw new Error('Shift template name is required');
+    if (!cleanCode) throw new Error('Shift template code is required');
+
+    const dup = db.prepare('SELECT id FROM shift_templates WHERE lower(code) = lower(?) AND id != ?').get(cleanCode, id);
+    if (dup) throw new Error(`Shift template code "${cleanCode}" is already used by another template`);
+
+    const cleanStart = startTime !== undefined ? normalizeTimeStr(startTime, existing.start_time) : existing.start_time;
+    const cleanEnd = endTime !== undefined ? normalizeTimeStr(endTime, existing.end_time) : existing.end_time;
+    const cleanBreak = breakMinutes !== undefined
+      ? Math.max(0, Math.min(480, Math.round(Number(breakMinutes))))
+      : existing.break_minutes;
+    const cleanHeadcount = headcountNeeded !== undefined
+      ? Math.max(1, Math.min(100, Math.round(Number(headcountNeeded))))
+      : existing.headcount_needed;
+    const cleanDays = daysOfWeek !== undefined ? normalizeWeekdays(daysOfWeek) : JSON.parse(existing.days_of_week_json || '[]');
+    const cleanLocs = locationIds !== undefined
+      ? (Array.isArray(locationIds) ? Array.from(new Set(locationIds.map((l) => String(l).trim()).filter(Boolean))).slice(0, 25) : [])
+      : JSON.parse(existing.location_ids_json || '[]');
+    const cleanRole = defaultRole !== undefined ? (defaultRole ? String(defaultRole).trim().slice(0, 120) : null) : existing.default_role;
+    const cleanNotes = notes !== undefined ? (notes ? String(notes).trim().slice(0, 400) : null) : existing.notes;
+    const nextActive = isActive === undefined ? existing.is_active : isActive ? 1 : 0;
+
+    db.prepare(`
+      UPDATE shift_templates
+      SET code = ?, name = ?, start_time = ?, end_time = ?, break_minutes = ?,
+          days_of_week_json = ?, location_ids_json = ?, default_role = ?,
+          headcount_needed = ?, notes = ?, is_active = ?, updated_at = datetime('now')
+      WHERE id = ?
+    `).run(
+      cleanCode,
+      cleanName,
+      cleanStart,
+      cleanEnd,
+      cleanBreak,
+      JSON.stringify(cleanDays),
+      JSON.stringify(cleanLocs),
+      cleanRole,
+      cleanHeadcount,
+      cleanNotes,
+      nextActive,
+      id,
+    );
+
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'UPDATE_SHIFT_TEMPLATE', 'ShiftTemplate', id, {
+      code: cleanCode,
+      name: cleanName,
+      isActive: Boolean(nextActive),
+    });
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.delete('/hr/shift-templates/:id', requirePerm(PERMISSIONS.HR_MANAGE), (req, res) => {
+  try {
+    const id = req.params.id;
+    const existing = db.prepare('SELECT * FROM shift_templates WHERE id = ?').get(id) as any;
+    if (!existing) {
+      res.status(404).json({ error: 'Shift template not found' });
+      return;
+    }
+    db.prepare('DELETE FROM shift_templates WHERE id = ?').run(id);
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'DELETE_SHIFT_TEMPLATE', 'ShiftTemplate', id, {
+      code: existing.code,
+      name: existing.name,
+    });
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+function loadActiveScheduleWindowsSql(): ShiftWindowLike[] {
+  const rows = db
+    .prepare(`
+      SELECT s.id, s.template_id, s.template_name, s.location_id, s.employee_id,
+             s.shift_date, s.start_time, s.end_time, s.status,
+             l.name AS location_name, e.full_name AS employee_name, e.employee_code AS employee_code
+      FROM shift_schedules s
+      LEFT JOIN locations l ON l.id = s.location_id
+      LEFT JOIN employees e ON e.id = s.employee_id
+      WHERE s.status != 'CANCELLED'
+    `)
+    .all() as any[];
+  return rows.map((r) => ({
+    id: r.id,
+    templateId: r.template_id,
+    templateName: r.template_name,
+    locationId: r.location_id,
+    locationName: r.location_name || r.location_id,
+    employeeId: r.employee_id,
+    employeeName: r.employee_name || null,
+    employeeCode: r.employee_code || null,
+    shiftDate: r.shift_date,
+    startTime: r.start_time,
+    endTime: r.end_time,
+    status: r.status,
+  }));
+}
+
+apiRouter.post('/hr/shift-schedules', requirePerm(PERMISSIONS.HR_MANAGE), (req, res) => {
+  try {
+    const {
+      templateId = null,
+      templateName,
+      locationId,
+      employeeId = null,
+      shiftDate,
+      startTime,
+      endTime,
+      breakMinutes = 60,
+      status = 'SCHEDULED',
+      notes = null,
+      conflictPolicy = 'PROMPT',
+    } = req.body || {};
+
+    const cleanLocId = String(locationId || '').trim();
+    const loc = db.prepare('SELECT id, name FROM locations WHERE id = ?').get(cleanLocId) as any;
+    if (!loc) throw new Error('Valid location is required');
+
+    const dateStr = String(shiftDate || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) throw new Error('Valid shiftDate (YYYY-MM-DD) is required');
+
+    const tpl = templateId ? (db.prepare('SELECT * FROM shift_templates WHERE id = ?').get(String(templateId)) as any) : null;
+    const cleanTplName = String(templateName || tpl?.name || 'Custom Shift').trim().slice(0, 120);
+    const cleanStart = normalizeTimeStr(startTime || tpl?.start_time, '07:00');
+    const cleanEnd = normalizeTimeStr(endTime || tpl?.end_time, '15:00');
+    const cleanBreak = Math.max(0, Math.min(480, Math.round(Number(breakMinutes ?? tpl?.break_minutes ?? 60))));
+    const cleanStatus = VALID_SHIFT_STATUSES.includes(String(status).toUpperCase()) ? String(status).toUpperCase() : 'SCHEDULED';
+    const cleanEmpId = employeeId ? String(employeeId).trim() : null;
+    const emp = cleanEmpId ? (db.prepare('SELECT id, full_name, employee_code FROM employees WHERE id = ?').get(cleanEmpId) as any) : null;
+    if (cleanEmpId && !emp) throw new Error('Selected employee not found');
+
+    const newId = randomUUID();
+    const candidate: ShiftWindowLike = {
+      id: newId,
+      templateId: tpl?.id || null,
+      templateName: cleanTplName,
+      locationId: loc.id,
+      locationName: loc.name,
+      employeeId: emp?.id || null,
+      employeeName: emp?.full_name || null,
+      employeeCode: emp?.employee_code || null,
+      shiftDate: dateStr,
+      startTime: cleanStart,
+      endTime: cleanEnd,
+      status: cleanStatus,
+    };
+
+    const existingWindows = loadActiveScheduleWindowsSql();
+    const conflicts = findScheduleCandidateConflicts([candidate], existingWindows);
+    const policy = String(conflictPolicy || 'PROMPT').toUpperCase();
+
+    if (conflicts.length > 0 && policy === 'PROMPT') {
+      res.json({ saved: false, requiresConfirmation: true, createdCount: 0, conflicts });
+      return;
+    }
+
+    const cleanNotes = notes ? String(notes).trim().slice(0, 400) : null;
+    db.prepare(`
+      INSERT INTO shift_schedules (
+        id, template_id, template_name, location_id, employee_id, shift_date,
+        start_time, end_time, break_minutes, status, notes, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+    `).run(newId, tpl?.id || null, cleanTplName, loc.id, emp?.id || null, dateStr, cleanStart, cleanEnd, cleanBreak, cleanStatus, cleanNotes);
+
+    if (conflicts.length > 0) {
+      const c = conflicts[0];
+      createNotification(
+        'SHIFT_CONFLICT',
+        'WARNING',
+        `Overlapping Shift Conflict: ${c.employeeName}`,
+        `${c.newTemplateName} (${c.newTimeRange} at ${c.newLocationName}) on ${c.shiftDate} overlaps ${c.existingTemplateName} (${c.existingTimeRange} at ${c.existingLocationName}) by ${formatOverlapDuration(c.overlapMinutes)}.`,
+      );
+    }
+
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'CREATE_SHIFT_SCHEDULE', 'ShiftSchedule', newId, {
+      templateName: cleanTplName,
+      locationId: loc.id,
+      employeeId: emp?.id || null,
+      shiftDate: dateStr,
+      conflictCount: conflicts.length,
+    });
+
+    res.status(201).json({
+      saved: true,
+      requiresConfirmation: false,
+      id: newId,
+      createdCount: 1,
+      conflicts,
+      createdIds: [newId],
+    });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/hr/shift-schedules/generate', requirePerm(PERMISSIONS.HR_MANAGE), (req, res) => {
+  try {
+    const {
+      templateId,
+      locationIds,
+      startDate,
+      endDate,
+      daysOfWeek,
+      assignmentMode = 'OPEN_SLOTS',
+      employeeIds = [],
+      headcountPerLocation,
+      notes = null,
+      conflictPolicy = 'PROMPT',
+    } = req.body || {};
+
+    const tpl = db.prepare('SELECT * FROM shift_templates WHERE id = ?').get(templateId) as any;
+    if (!tpl) {
+      res.status(404).json({ error: 'Shift template not found' });
+      return;
+    }
+
+    const startStr = String(startDate || '').slice(0, 10);
+    const endStr = String(endDate || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(startStr) || !/^\d{4}-\d{2}-\d{2}$/.test(endStr)) {
+      throw new Error('Valid startDate and endDate (YYYY-MM-DD) are required');
+    }
+    if (startStr > endStr) {
+      throw new Error('Start date must be on or before end date');
+    }
+
+    const parseUtc = (isoDate: string) => {
+      const [y, m, d] = isoDate.split('-').map(Number);
+      return Date.UTC(y, m - 1, d);
+    };
+    const startMs = parseUtc(startStr);
+    const endMs = parseUtc(endStr);
+    const spanDays = Math.round((endMs - startMs) / 86400000) + 1;
+    if (spanDays > 62) {
+      throw new Error('Schedule generation range cannot exceed 62 days at once');
+    }
+
+    const tplDays = normalizeWeekdays(daysOfWeek !== undefined ? daysOfWeek : JSON.parse(tpl.days_of_week_json || '[]'));
+    if (tplDays.length === 0) {
+      throw new Error('Select at least one recurring day of the week');
+    }
+
+    const allLocRows = db.prepare('SELECT id, name FROM locations').all() as any[];
+    const locNameMap = new Map(allLocRows.map((l) => [l.id, l.name]));
+    const allLocs = allLocRows.map((l) => l.id);
+    const rawTargetLocs = Array.isArray(locationIds) && locationIds.length > 0
+      ? locationIds
+      : JSON.parse(tpl.location_ids_json || '[]');
+    const targetLocs: string[] = (rawTargetLocs.length > 0 ? rawTargetLocs : allLocs)
+      .map((l: any) => String(l).trim())
+      .filter((l: string) => allLocs.includes(l));
+
+    if (targetLocs.length === 0) {
+      throw new Error('Select at least one valid location for schedule generation');
+    }
+
+    const activeEmployees = db.prepare('SELECT id, location_id, full_name, employee_code FROM employees WHERE is_active = 1').all() as any[];
+    const empMap = new Map(activeEmployees.map((e) => [e.id, e]));
+    const selectedEmpSet = new Set(Array.isArray(employeeIds) ? employeeIds.map((e: any) => String(e)) : []);
+    const headcount = Math.max(1, Math.min(20, Math.round(Number(headcountPerLocation ?? tpl.headcount_needed ?? 1))));
+    const cleanNotes = notes ? String(notes).trim().slice(0, 400) : (tpl.notes || null);
+    const policy = String(conflictPolicy || 'PROMPT').toUpperCase();
+
+    const existingWindows = loadActiveScheduleWindowsSql();
+    const candidates: Array<ShiftWindowLike & { breakMinutes: number; notes: string | null }> = [];
+    let skippedCount = 0;
+
+    for (let t = startMs; t <= endMs; t += 86400000) {
+      const dt = new Date(t);
+      const dayCode = VALID_WEEKDAYS[dt.getUTCDay()];
+      if (!tplDays.includes(dayCode)) continue;
+      const dateStr = dt.toISOString().slice(0, 10);
+
+      for (const locId of targetLocs) {
+        const existingForSlot = existingWindows.filter(
+          (s) => s.templateId === tpl.id && s.locationId === locId && s.shiftDate === dateStr,
+        );
+
+        if (assignmentMode === 'SELECTED_EMPLOYEES' && selectedEmpSet.size > 0) {
+          for (const empId of selectedEmpSet) {
+            if (existingForSlot.some((s) => s.employeeId === empId)) {
+              skippedCount++;
+              continue;
+            }
+            const emp = empMap.get(empId);
+            candidates.push({
+              id: randomUUID(),
+              templateId: tpl.id,
+              templateName: tpl.name,
+              locationId: locId,
+              locationName: locNameMap.get(locId) || locId,
+              employeeId: empId,
+              employeeName: emp?.full_name || null,
+              employeeCode: emp?.employee_code || null,
+              shiftDate: dateStr,
+              startTime: tpl.start_time,
+              endTime: tpl.end_time,
+              breakMinutes: tpl.break_minutes,
+              status: 'SCHEDULED',
+              notes: cleanNotes,
+            });
+          }
+        } else if (assignmentMode === 'AUTO_BY_LOCATION') {
+          const locEmployees = activeEmployees.filter((e) => e.location_id === locId).slice(0, headcount);
+          let addedHere = 0;
+          for (const emp of locEmployees) {
+            if (existingForSlot.some((s) => s.employeeId === emp.id)) {
+              skippedCount++;
+              continue;
+            }
+            candidates.push({
+              id: randomUUID(),
+              templateId: tpl.id,
+              templateName: tpl.name,
+              locationId: locId,
+              locationName: locNameMap.get(locId) || locId,
+              employeeId: emp.id,
+              employeeName: emp.full_name,
+              employeeCode: emp.employee_code,
+              shiftDate: dateStr,
+              startTime: tpl.start_time,
+              endTime: tpl.end_time,
+              breakMinutes: tpl.break_minutes,
+              status: 'SCHEDULED',
+              notes: cleanNotes,
+            });
+            addedHere++;
+          }
+          const totalNow = existingForSlot.length + addedHere;
+          const remainingOpen = Math.max(0, headcount - totalNow);
+          for (let k = 0; k < remainingOpen; k++) {
+            candidates.push({
+              id: randomUUID(),
+              templateId: tpl.id,
+              templateName: tpl.name,
+              locationId: locId,
+              locationName: locNameMap.get(locId) || locId,
+              employeeId: null,
+              employeeName: null,
+              employeeCode: null,
+              shiftDate: dateStr,
+              startTime: tpl.start_time,
+              endTime: tpl.end_time,
+              breakMinutes: tpl.break_minutes,
+              status: 'SCHEDULED',
+              notes: cleanNotes,
+            });
+          }
+        } else {
+          const toCreate = Math.max(0, headcount - existingForSlot.length);
+          if (toCreate === 0) {
+            skippedCount++;
+            continue;
+          }
+          for (let k = 0; k < toCreate; k++) {
+            candidates.push({
+              id: randomUUID(),
+              templateId: tpl.id,
+              templateName: tpl.name,
+              locationId: locId,
+              locationName: locNameMap.get(locId) || locId,
+              employeeId: null,
+              employeeName: null,
+              employeeCode: null,
+              shiftDate: dateStr,
+              startTime: tpl.start_time,
+              endTime: tpl.end_time,
+              breakMinutes: tpl.break_minutes,
+              status: 'SCHEDULED',
+              notes: cleanNotes,
+            });
+          }
+        }
+      }
+    }
+
+    const detectedConflicts = findScheduleCandidateConflicts(candidates, existingWindows);
+    if (detectedConflicts.length > 0 && policy === 'PROMPT') {
+      res.json({
+        saved: false,
+        requiresConfirmation: true,
+        createdCount: 0,
+        skippedCount,
+        conflicts: detectedConflicts,
+        createdIds: [],
+      });
+      return;
+    }
+
+    const conflictingCandidateIds = new Set(detectedConflicts.map((c) => c.newScheduleId));
+    const rowsToInsert =
+      policy === 'SKIP_CONFLICTS'
+        ? candidates.filter((c) => !conflictingCandidateIds.has(c.id))
+        : candidates;
+    const finalSkippedCount =
+      skippedCount + (policy === 'SKIP_CONFLICTS' ? candidates.length - rowsToInsert.length : 0);
+    const savedConflicts = policy === 'SKIP_CONFLICTS' ? [] : detectedConflicts;
+
+    const insSchedule = db.prepare(`
+      INSERT INTO shift_schedules (
+        id, template_id, template_name, location_id, employee_id, shift_date,
+        start_time, end_time, break_minutes, status, notes, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCHEDULED', ?, datetime('now'), datetime('now'))
+    `);
+
+    const tx = db.transaction(() => {
+      for (const row of rowsToInsert) {
+        insSchedule.run(
+          row.id,
+          row.templateId,
+          row.templateName,
+          row.locationId,
+          row.employeeId || null,
+          row.shiftDate,
+          row.startTime,
+          row.endTime,
+          row.breakMinutes,
+          row.notes,
+        );
+      }
+      return {
+        saved: true,
+        requiresConfirmation: false,
+        createdCount: rowsToInsert.length,
+        skippedCount: finalSkippedCount,
+        conflicts: savedConflicts,
+        createdIds: rowsToInsert.map((r) => r.id),
+      };
+    });
+
+    const result = tx();
+    if (savedConflicts.length > 0) {
+      createNotification(
+        'SHIFT_CONFLICT',
+        'WARNING',
+        `${savedConflicts.length} Overlapping Shift Conflict(s) Saved`,
+        `Schedule generation for ${tpl.name} (${startStr} to ${endStr}) contains ${savedConflicts.length} overlapping crew shift(s). Review the HR Shift Roster to reassign.`,
+      );
+    }
+
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'GENERATE_SHIFT_SCHEDULES', 'ShiftTemplate', tpl.id, {
+      templateName: tpl.name,
+      startDate: startStr,
+      endDate: endStr,
+      locationsCount: targetLocs.length,
+      createdCount: result.createdCount,
+      skippedCount: result.skippedCount,
+      conflictCount: savedConflicts.length,
+      conflictPolicy: policy,
+    });
+    res.status(201).json(result);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.patch('/hr/shift-schedules/:id', requirePerm(PERMISSIONS.HR_MANAGE), (req, res) => {
+  try {
+    const id = req.params.id;
+    const existing = db.prepare('SELECT * FROM shift_schedules WHERE id = ?').get(id) as any;
+    if (!existing) {
+      res.status(404).json({ error: 'Shift schedule entry not found' });
+      return;
+    }
+
+    const { locationId, employeeId, shiftDate, startTime, endTime, breakMinutes, status, notes } = req.body || {};
+    const nextStatus = status !== undefined ? String(status).trim().toUpperCase() : existing.status;
+    if (!VALID_SHIFT_STATUSES.includes(nextStatus)) {
+      throw new Error('Invalid shift status');
+    }
+
+    const nextLoc = locationId !== undefined ? String(locationId).trim() : existing.location_id;
+    const nextEmp = employeeId !== undefined ? (employeeId ? String(employeeId).trim() : null) : existing.employee_id;
+    const nextDate = shiftDate !== undefined ? String(shiftDate).slice(0, 10) : existing.shift_date;
+    const nextStart = startTime !== undefined ? normalizeTimeStr(startTime, existing.start_time) : existing.start_time;
+    const nextEnd = endTime !== undefined ? normalizeTimeStr(endTime, existing.end_time) : existing.end_time;
+    const nextBreak = breakMinutes !== undefined
+      ? Math.max(0, Math.min(480, Math.round(Number(breakMinutes))))
+      : existing.break_minutes;
+    const nextNotes = notes !== undefined ? (notes ? String(notes).trim().slice(0, 400) : null) : existing.notes;
+
+    db.prepare(`
+      UPDATE shift_schedules
+      SET location_id = ?, employee_id = ?, shift_date = ?, start_time = ?, end_time = ?,
+          break_minutes = ?, status = ?, notes = ?, updated_at = datetime('now')
+      WHERE id = ?
+    `).run(nextLoc, nextEmp, nextDate, nextStart, nextEnd, nextBreak, nextStatus, nextNotes, id);
+
+    const locRow = db.prepare('SELECT name FROM locations WHERE id = ?').get(nextLoc) as any;
+    const empRow = nextEmp ? (db.prepare('SELECT full_name, employee_code FROM employees WHERE id = ?').get(nextEmp) as any) : null;
+    const updatedWindow: ShiftWindowLike = {
+      id,
+      templateId: existing.template_id,
+      templateName: existing.template_name,
+      locationId: nextLoc,
+      locationName: locRow?.name || nextLoc,
+      employeeId: nextEmp,
+      employeeName: empRow?.full_name || null,
+      employeeCode: empRow?.employee_code || null,
+      shiftDate: nextDate,
+      startTime: nextStart,
+      endTime: nextEnd,
+      status: nextStatus,
+    };
+    const otherWindows = loadActiveScheduleWindowsSql().filter((w) => w.id !== id);
+    const conflicts = findScheduleCandidateConflicts([updatedWindow], otherWindows);
+
+    if (conflicts.length > 0) {
+      const c = conflicts[0];
+      createNotification(
+        'SHIFT_CONFLICT',
+        'WARNING',
+        `Overlapping Shift Conflict: ${c.employeeName}`,
+        `${c.newTemplateName} (${c.newTimeRange} at ${c.newLocationName}) on ${c.shiftDate} overlaps ${c.existingTemplateName} (${c.existingTimeRange} at ${c.existingLocationName}) by ${formatOverlapDuration(c.overlapMinutes)}.`,
+      );
+    }
+
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'UPDATE_SHIFT_SCHEDULE', 'ShiftSchedule', id, {
+      status: nextStatus,
+      employeeId: nextEmp,
+      locationId: nextLoc,
+      conflictCount: conflicts.length,
+    });
+    res.json({ ok: true, conflicts });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.delete('/hr/shift-schedules/:id', requirePerm(PERMISSIONS.HR_MANAGE), (req, res) => {
+  try {
+    const id = req.params.id;
+    const existing = db.prepare('SELECT * FROM shift_schedules WHERE id = ?').get(id) as any;
+    if (!existing) {
+      res.status(404).json({ error: 'Shift schedule entry not found' });
+      return;
+    }
+    db.prepare('DELETE FROM shift_schedules WHERE id = ?').run(id);
+    writeAuditLog(req.authUser!.id, req.authUser!.fullName, 'DELETE_SHIFT_SCHEDULE', 'ShiftSchedule', id, {
+      templateName: existing.template_name,
+      shiftDate: existing.shift_date,
+    });
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 // ==========================================
 // 11. CRM, REPORTS & GOVERNANCE
 // ==========================================
@@ -3116,9 +5112,21 @@ apiRouter.post('/settings/users', requireOwnerOrSuperAdmin, (req, res) => {
   }
 });
 
-apiRouter.put('/settings/users/:id', requireOwnerOrSuperAdmin, (req, res) => {
+apiRouter.put('/settings/users/:id', (req, res) => {
   try {
+    const authUser = req.authUser;
+    if (!authUser) {
+      res.status(401).json({ error: 'Unauthenticated' });
+      return;
+    }
     const targetId = req.params.id;
+    const isOwnerOrSuperAdmin = authUser.roleCode === 'SUPER_ADMIN' || authUser.roleCode === 'BUSINESS_OWNER';
+    const isSelfUpdate = targetId === authUser.id;
+    if (!isOwnerOrSuperAdmin && !isSelfUpdate) {
+      res.status(403).json({ error: 'Restricted: Company Owner, Super Admin, or account owner access required' });
+      return;
+    }
+
     const existing = db
       .prepare('SELECT u.*, r.code AS role_code FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?')
       .get(targetId) as any;
@@ -3130,8 +5138,31 @@ apiRouter.put('/settings/users/:id', requireOwnerOrSuperAdmin, (req, res) => {
     const { email, password, shiftPin, clearPin, unlockAccount, fullName, roleId, assignedLocationId, avatarUrl, isActive } = req.body || {};
     const cleanEmail = String(email ?? existing.email).trim().toLowerCase();
     const cleanName = String(fullName ?? existing.full_name).trim();
-    const nextRoleId = roleId || existing.role_id;
-    const nextActive = isActive === undefined ? existing.is_active : isActive ? 1 : 0;
+
+    if (!isOwnerOrSuperAdmin) {
+      if (roleId !== undefined && roleId !== existing.role_id) {
+        res.status(403).json({ error: 'Permission denied: only Company Owner or Super Admin can change user roles' });
+        return;
+      }
+      if (isActive !== undefined && (isActive ? 1 : 0) !== existing.is_active) {
+        res.status(403).json({ error: 'Permission denied: only Company Owner or Super Admin can change account active status' });
+        return;
+      }
+      if (assignedLocationId !== undefined && (assignedLocationId || null) !== (existing.assigned_location_id || null)) {
+        res.status(403).json({ error: 'Permission denied: only Company Owner or Super Admin can change assigned location' });
+        return;
+      }
+      if (unlockAccount) {
+        res.status(403).json({ error: 'Permission denied: only Company Owner or Super Admin can unlock accounts' });
+        return;
+      }
+    }
+
+    const nextRoleId = isOwnerOrSuperAdmin ? (roleId || existing.role_id) : existing.role_id;
+    const nextActive = isOwnerOrSuperAdmin ? (isActive === undefined ? existing.is_active : isActive ? 1 : 0) : existing.is_active;
+    const nextAssignedLocationId = isOwnerOrSuperAdmin
+      ? (assignedLocationId !== undefined ? (assignedLocationId || null) : existing.assigned_location_id)
+      : existing.assigned_location_id;
 
     if (!cleanEmail) throw new Error('Email is required');
     if (!cleanName) throw new Error('Full name is required');
@@ -3144,7 +5175,7 @@ apiRouter.put('/settings/users/:id', requireOwnerOrSuperAdmin, (req, res) => {
     const nextRole = db.prepare('SELECT id, code FROM roles WHERE id = ?').get(nextRoleId) as any;
     if (!nextRole) throw new Error('Selected role does not exist');
 
-    if (targetId === req.authUser!.id) {
+    if (targetId === authUser.id && isOwnerOrSuperAdmin) {
       if (nextActive === 0) throw new Error('You cannot deactivate your own active session account');
       if (nextRole.code !== 'SUPER_ADMIN' && nextRole.code !== 'BUSINESS_OWNER') {
         throw new Error('You cannot remove your own Owner/Super Admin access while signed in');
@@ -3167,7 +5198,7 @@ apiRouter.put('/settings/users/:id', requireOwnerOrSuperAdmin, (req, res) => {
       UPDATE users
       SET email = ?, password_hash = ?, shift_pin_hash = ?, failed_login_attempts = ?, locked_until = ?, full_name = ?, role_id = ?, assigned_location_id = ?, avatar_url = ?, is_active = ?
       WHERE id = ?
-    `).run(cleanEmail, nextPwdHash, nextPinHash, nextFails, nextLock, cleanName, nextRoleId, assignedLocationId || null, nextAvatar, nextActive, targetId);
+    `).run(cleanEmail, nextPwdHash, nextPinHash, nextFails, nextLock, cleanName, nextRoleId, nextAssignedLocationId, nextAvatar, nextActive, targetId);
 
     if (nextActive === 0) {
       db.prepare('DELETE FROM sessions WHERE user_id = ?').run(targetId);

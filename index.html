@@ -12,8 +12,25 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400..700;1,9..40,400..700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@500;600;700&display=swap" rel="stylesheet" />
+    <script>
+      (function () {
+        try {
+          var root = document.documentElement;
+          var savedTheme = localStorage.getItem('maximus_bbq_theme');
+          var theme = savedTheme === 'dark' ? 'dark' : 'light';
+          var hc = localStorage.getItem('maximus_bbq_high_contrast') === '1';
+          root.classList.remove('light', 'dark');
+          root.classList.add(theme);
+          if (hc) root.classList.add('high-contrast');
+          else root.classList.remove('high-contrast');
+          root.dataset.theme = theme;
+          root.dataset.contrast = hc ? 'high' : 'standard';
+          root.style.colorScheme = theme;
+        } catch (e) {}
+      })();
+    </script>
   </head>
-  <body class="bg-slate-50 text-slate-900 antialiased">
+  <body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100 antialiased transition-colors duration-150">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

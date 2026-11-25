@@ -9,6 +9,7 @@ import {
   LogOut,
   Mail,
   MapPin,
+  Monitor,
   ScanFace,
   ShieldCheck,
 } from 'lucide-react';
@@ -21,13 +22,29 @@ import {
   setSignedOutSession,
   syncFirebaseUserAndSeed,
 } from '../lib/firestoreErp.ts';
+import {
+  claimTerminalPasscode,
+  getTerminalStationConfig,
+  isEnvForcedTerminalMode,
+  pairTerminalDevice,
+  setTerminalModeEnabled,
+  TerminalServerStatus,
+  unpairTerminalDevice,
+  updateTerminalStationConfig,
+} from '../lib/terminalAuth.ts';
 import { AuthUser, LocationRow } from '../types/erp.ts';
 import { AvatarBadge } from './SettingsUserControlModule.tsx';
 import { FaceAttendanceKioskModal } from './FaceAttendanceKioskModal.tsx';
+import { ThemeToggle } from './ThemeToggle.tsx';
 
 interface Props {
   firebaseUser: User | null;
   onAuthenticated: (user: AuthUser) => void;
+  isTerminalMode?: boolean;
+  terminalStatus?: TerminalServerStatus | null;
+  terminalAuthState?: 'idle' | 'authenticating' | 'ready' | 'needs_pairing' | 'not_configured' | 'error';
+  terminalAuthMessage?: string;
+  onTerminalStateChanged?: (retrySilentAuth?: boolean) => Promise<void> | void;
 }
 
 interface OperatorSummary {
@@ -43,11 +60,22 @@ interface OperatorSummary {
   is_google_owner?: boolean;
 }
 
-export function LoginView({ firebaseUser, onAuthenticated }: Props) {
-  const [authTab, setAuthTab] = useState<'password' | 'pin'>('password');
+export function LoginView({
+  firebaseUser,
+  onAuthenticated,
+  isTerminalMode = false,
+  terminalStatus = null,
+  terminalAuthState = 'idle',
+  terminalAuthMessage = '',
+  onTerminalStateChanged,
+}: Props) {
+  const [authTab, setAuthTab] = useState<'password' | 'pin'>(() => (isTerminalMode ? 'pin' : 'password'));
 
-  // Password form state (strictly empty initial inputs)
-  const [email, setEmail] = useState('');
+  // Password form state (strictly empty initial inputs unless Terminal station email is configured)
+  const [email, setEmail] = useState(() => {
+    if (!isTerminalMode) return '';
+    return terminalStatus?.stationEmail || getTerminalStationConfig().stationEmail || '';
+  });
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [capsLockOn, setCapsLockOn] = useState(false);
@@ -55,9 +83,20 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
   // Operator & Shift PIN state
   const [operators, setOperators] = useState<OperatorSummary[]>([]);
   const [locations, setLocations] = useState<LocationRow[]>([]);
-  const [pinLocationFilter, setPinLocationFilter] = useState<string>('ALL');
+  const [pinLocationFilter, setPinLocationFilter] = useState<string>(() => {
+    if (!isTerminalMode) return 'ALL';
+    return terminalStatus?.stationLocationId || getTerminalStationConfig().locationId || 'ALL';
+  });
   const [selectedOperatorId, setSelectedOperatorId] = useState<string>('');
   const [pin, setPin] = useState('');
+
+  // Terminal-mode setup & pairing UI state
+  const [showTerminalSetup, setShowTerminalSetup] = useState(false);
+  const [terminalPasscode, setTerminalPasscode] = useState('');
+  const [stationEmailInput, setStationEmailInput] = useState(
+    () => terminalStatus?.stationEmail || getTerminalStationConfig().stationEmail || '',
+  );
+  const [terminalActionBusy, setTerminalActionBusy] = useState(false);
 
   // Pre-login Attendance Kiosk state
   const [showKiosk, setShowKiosk] = useState(false);
@@ -68,6 +107,21 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
 
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+
+  // Keep Terminal Mode defaults synchronized (Shift PIN tab + fixed station Work Email + default location)
+  useEffect(() => {
+    if (!isTerminalMode) return;
+    setAuthTab('pin');
+    const resolvedStationEmail = terminalStatus?.stationEmail || getTerminalStationConfig().stationEmail || '';
+    if (resolvedStationEmail) {
+      setEmail((prev) => prev || resolvedStationEmail);
+      setStationEmailInput((prev) => prev || resolvedStationEmail);
+    }
+    const resolvedLocId = terminalStatus?.stationLocationId || getTerminalStationConfig().locationId || '';
+    if (resolvedLocId) {
+      setPinLocationFilter((prev) => (prev === 'ALL' ? resolvedLocId : prev));
+    }
+  }, [isTerminalMode, terminalStatus]);
 
   const loadLoginMetadata = useCallback(async () => {
     const [ops, locs] = await Promise.all([
@@ -173,6 +227,71 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
     }
   };
 
+  const handleEnableAndPairTerminal = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setTerminalActionBusy(true);
+    try {
+      const cleanStationEmail = stationEmailInput.trim().toLowerCase();
+      setTerminalModeEnabled(true, {
+        stationEmail: cleanStationEmail,
+      });
+      if (cleanStationEmail) {
+        setEmail(cleanStationEmail);
+      }
+
+      if (!terminalStatus?.devicePaired) {
+        const cleanPasscode = terminalPasscode.trim();
+        if (!cleanPasscode) {
+          throw new Error('Enter a terminal pairing passcode (min. 6 characters)');
+        }
+        if (terminalStatus?.accessKeyConfigured) {
+          await pairTerminalDevice(cleanPasscode);
+        } else {
+          await claimTerminalPasscode(cleanPasscode);
+        }
+      }
+
+      setTerminalPasscode('');
+      setShowTerminalSetup(false);
+      await onTerminalStateChanged?.(true);
+    } catch (err: any) {
+      setError(err?.message || 'Unable to activate Terminal Mode on this device');
+    } finally {
+      setTerminalActionBusy(false);
+    }
+  };
+
+  const handleExitTerminalMode = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setTerminalActionBusy(true);
+    try {
+      if (terminalStatus?.devicePaired) {
+        await unpairTerminalDevice(terminalPasscode.trim() || undefined);
+      }
+      setTerminalModeEnabled(false);
+      setTerminalPasscode('');
+      setShowTerminalSetup(false);
+      setActiveErpUserId(null);
+      setSignedOutSession(false);
+      resetFirebaseSyncCache();
+      await signOut(auth);
+      await onTerminalStateChanged?.(false);
+    } catch (err: any) {
+      setError(err?.message || 'Unable to exit Terminal Mode');
+    } finally {
+      setTerminalActionBusy(false);
+    }
+  };
+
+  const handleSaveStationEmail = () => {
+    const clean = stationEmailInput.trim().toLowerCase();
+    updateTerminalStationConfig({ stationEmail: clean });
+    if (clean) setEmail(clean);
+    setShowTerminalSetup(false);
+  };
+
   const handlePasswordLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
@@ -269,10 +388,10 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
   };
 
   return (
-    <div className="min-h-screen bg-slate-100 flex items-center justify-center p-4 sm:p-6">
-      <div className="w-full max-w-5xl grid grid-cols-1 lg:grid-cols-12 bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+    <div className="min-h-screen bg-slate-100 dark:bg-slate-950 flex items-center justify-center p-4 sm:p-6">
+      <div className="w-full max-w-5xl grid grid-cols-1 lg:grid-cols-12 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl overflow-hidden shadow-sm">
         {/* Brand & Security Architecture Column */}
-        <div className="lg:col-span-5 p-8 lg:p-10 flex flex-col justify-between bg-slate-900 text-white">
+        <div className="lg:col-span-5 p-8 lg:p-10 flex flex-col justify-between bg-slate-900 dark:bg-slate-950 text-white border-b lg:border-b-0 lg:border-r border-slate-800">
           <div>
             <div className="flex items-center gap-3">
               <img
@@ -289,7 +408,7 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
               </div>
             </div>
 
-            <h1 className="mt-8 font-display text-2xl sm:text-3xl font-bold tracking-tight leading-tight text-balance">
+            <h1 className="mt-8 font-display text-2xl sm:text-3xl font-bold tracking-tight leading-tight text-balance text-white">
               Operations Access for Food Trucks &amp; Commissary
             </h1>
             <p className="mt-3 text-sm text-slate-300 leading-relaxed">
@@ -324,34 +443,182 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
 
         {/* Authentication Terminal Column */}
         <div className="lg:col-span-7 p-6 sm:p-8 lg:p-10 flex flex-col justify-between space-y-6">
+          <div className="flex items-center justify-end">
+            <ThemeToggle variant="full" />
+          </div>
           {!firebaseUser ? (
             <div className="space-y-6 my-auto py-4">
               <div>
-                <p className="text-xs font-mono uppercase tracking-wider text-slate-400">Step 1 · Cloud Workspace</p>
-                <h2 className="mt-1 font-display text-2xl font-semibold text-slate-900">Connect Cloud Workspace</h2>
-                <p className="mt-1.5 text-sm text-slate-500">
-                  Authenticate with your workspace Google account to unlock Cloud Firestore persistence and operator sign-in.
+                <p className="text-xs font-mono uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                  {isTerminalMode ? 'Shared Device · Terminal Mode' : 'Step 1 · Cloud Workspace'}
+                </p>
+                <h2 className="mt-1 font-display text-2xl font-semibold text-slate-900 dark:text-slate-50">
+                  {isTerminalMode ? 'Connect POS Terminal' : 'Connect Cloud Workspace'}
+                </h2>
+                <p className="mt-1.5 text-sm text-slate-500 dark:text-slate-400">
+                  {isTerminalMode
+                    ? 'This device is in Terminal Mode. Pair the terminal once for silent background sign-in, or connect with your workspace Google account.'
+                    : 'Authenticate with your workspace Google account to unlock Cloud Firestore persistence and operator sign-in.'}
                 </p>
               </div>
 
+              {isTerminalMode && terminalAuthState === 'authenticating' && (
+                <div className="p-3 rounded-lg bg-slate-900 dark:bg-slate-800 text-white text-xs font-medium flex items-center gap-2 border border-slate-800 dark:border-slate-700">
+                  <Monitor className="w-4 h-4 shrink-0 animate-pulse" />
+                  <span>Silently authenticating POS Terminal with Firebase...</span>
+                </div>
+              )}
+
+              {isTerminalMode && terminalAuthMessage && terminalAuthState !== 'authenticating' && (
+                <div className="p-3 rounded-lg bg-amber-50 dark:bg-amber-950/45 border border-amber-200 dark:border-amber-700/80 text-xs text-amber-800 dark:text-amber-300 font-medium">
+                  {terminalAuthMessage}
+                </div>
+              )}
+
               {error && (
-                <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">
+                <div className="p-3 rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800/80 text-xs text-red-700 dark:text-red-300 font-medium">
                   {error}
                 </div>
               )}
+
+              {isTerminalMode && (!terminalStatus?.devicePaired || showTerminalSetup) ? (
+                <form onSubmit={handleEnableAndPairTerminal} className="space-y-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 p-4">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-slate-900 dark:text-slate-50 flex items-center gap-1.5">
+                      <Monitor className="w-4 h-4 text-slate-700 dark:text-slate-200" />
+                      {terminalStatus?.accessKeyConfigured
+                        ? 'Pair Terminal Device for Silent Sign-In'
+                        : 'Set First-Run Terminal Pairing Passcode'}
+                    </span>
+                    {!isEnvForcedTerminalMode() && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setTerminalModeEnabled(false);
+                          void onTerminalStateChanged?.(false);
+                        }}
+                        className="text-[11px] font-medium text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-100 underline"
+                      >
+                        Standard Mode
+                      </button>
+                    )}
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">
+                      {terminalStatus?.accessKeyConfigured ? 'Terminal Pairing Passcode' : 'Create Setup Passcode (min. 6 chars)'}
+                    </label>
+                    <input
+                      type="password"
+                      required
+                      minLength={6}
+                      placeholder="Enter pairing passcode"
+                      value={terminalPasscode}
+                      onChange={(e) => setTerminalPasscode(e.target.value)}
+                      className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs text-slate-900 dark:text-slate-50"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">
+                      Fixed Terminal Work Email (optional pre-fill)
+                    </label>
+                    <input
+                      type="email"
+                      placeholder="e.g. cashier@maximusbbq.ph"
+                      value={stationEmailInput}
+                      onChange={(e) => setStationEmailInput(e.target.value)}
+                      className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs text-slate-900 dark:text-slate-50"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={terminalActionBusy}
+                    className="w-full flex items-center justify-center gap-2 rounded-lg bg-slate-900 dark:bg-slate-100 px-4 py-2.5 text-xs font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white disabled:opacity-50"
+                  >
+                    <ShieldCheck className="w-4 h-4" />
+                    {terminalActionBusy ? 'Pairing Terminal...' : 'Pair & Trigger Silent Sign-In'}
+                  </button>
+                </form>
+              ) : null}
 
               <button
                 type="button"
                 disabled={loading}
                 onClick={handleGoogleSignIn}
-                className="w-full flex items-center justify-center gap-2.5 rounded-lg bg-slate-900 px-4 py-3 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-50 whitespace-nowrap"
+                className="w-full flex items-center justify-center gap-2.5 rounded-lg bg-slate-900 dark:bg-slate-100 px-4 py-3 text-sm font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white disabled:opacity-50 whitespace-nowrap"
               >
                 <ShieldCheck className="w-4 h-4" />
-                {loading ? 'Connecting to Cloud Workspace...' : 'Continue with Google'}
+                {loading
+                  ? 'Connecting to Cloud Workspace...'
+                  : isTerminalMode
+                    ? 'Connect Workspace with Google (Manager Override)'
+                    : 'Continue with Google'}
               </button>
 
-              <div className="rounded-lg bg-slate-50 border border-slate-200 p-4 text-xs text-slate-600 space-y-1.5">
-                <p className="font-semibold text-slate-800">Workspace Security Notice</p>
+              {!isTerminalMode && (
+                <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 p-4 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <p className="text-xs font-semibold text-slate-800 dark:text-slate-100 flex items-center gap-1.5">
+                        <Monitor className="w-3.5 h-3.5 text-slate-600 dark:text-slate-300" />
+                        Shared Tablet / POS Terminal Mode
+                      </p>
+                      <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                        Pair this device for silent Firebase authentication and Shift PIN-only staff sign-in.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setShowTerminalSetup((prev) => !prev)}
+                      className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-[11px] font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
+                    >
+                      {showTerminalSetup ? 'Hide Setup' : 'Configure Terminal'}
+                    </button>
+                  </div>
+
+                  {showTerminalSetup && (
+                    <form onSubmit={handleEnableAndPairTerminal} className="space-y-2.5 pt-2 border-t border-slate-200 dark:border-slate-800">
+                      {!terminalStatus?.devicePaired && (
+                        <div>
+                          <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">
+                            {terminalStatus?.accessKeyConfigured ? 'Terminal Pairing Passcode' : 'Create Setup Passcode (min. 6 chars)'}
+                          </label>
+                          <input
+                            type="password"
+                            required
+                            minLength={6}
+                            placeholder="Enter pairing passcode"
+                            value={terminalPasscode}
+                            onChange={(e) => setTerminalPasscode(e.target.value)}
+                            className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs text-slate-900 dark:text-slate-50"
+                          />
+                        </div>
+                      )}
+                      <div>
+                        <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">
+                          Fixed Terminal Work Email (optional pre-fill)
+                        </label>
+                        <input
+                          type="email"
+                          placeholder="e.g. cashier@maximusbbq.ph"
+                          value={stationEmailInput}
+                          onChange={(e) => setStationEmailInput(e.target.value)}
+                          className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs text-slate-900 dark:text-slate-50"
+                        />
+                      </div>
+                      <button
+                        type="submit"
+                        disabled={terminalActionBusy}
+                        className="w-full rounded-lg bg-slate-900 dark:bg-slate-100 px-3 py-2 text-xs font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white disabled:opacity-50"
+                      >
+                        {terminalActionBusy ? 'Enabling Terminal Mode...' : 'Enable Terminal Mode on This Device'}
+                      </button>
+                    </form>
+                  )}
+                </div>
+              )}
+
+              <div className="rounded-lg bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-800 p-4 text-xs text-slate-600 dark:text-slate-300 space-y-1.5">
+                <p className="font-semibold text-slate-800 dark:text-slate-100">Workspace Security Notice</p>
                 <p>
                   All operator credentials, encrypted Shift PINs, POS sales, FIFO inventory batches, and audit logs persist in Cloud Firestore.
                 </p>
@@ -360,25 +627,93 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
           ) : (
             <div className="space-y-5">
               {/* Workspace Connection Bar */}
-              <div className="flex flex-wrap items-start justify-between gap-3 pb-4 border-b border-slate-200">
+              <div className="flex flex-wrap items-start justify-between gap-3 pb-4 border-b border-slate-200 dark:border-slate-800">
                 <div className="min-w-0">
-                  <h2 className="font-display text-xl font-semibold text-slate-900">Operator Sign In</h2>
-                  <p className="mt-0.5 text-xs text-slate-500">
-                    Sign in with your assigned work credentials or Operator Shift PIN.
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="font-display text-xl font-semibold text-slate-900 dark:text-slate-50">Operator Sign In</h2>
+                    {isTerminalMode && (
+                      <span className="inline-flex items-center gap-1 rounded-md bg-emerald-50 dark:bg-emerald-950/45 border border-emerald-200 dark:border-emerald-700/80 px-2 py-0.5 text-[11px] font-semibold text-emerald-800 dark:text-emerald-300">
+                        <Monitor className="w-3 h-3" /> Terminal Mode
+                      </span>
+                    )}
+                  </div>
+                  <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                    {isTerminalMode
+                      ? 'Terminal connected silently. Enter your personal Shift PIN or sign in with station credentials.'
+                      : 'Sign in with your assigned work credentials or Operator Shift PIN.'}
                   </p>
                 </div>
-                <button
-                  type="button"
-                  disabled={loading}
-                  onClick={handleGoogleDisconnect}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 whitespace-nowrap shrink-0"
-                >
-                  <LogOut className="w-3.5 h-3.5" /> Disconnect Workspace
-                </button>
+                {isTerminalMode ? (
+                  <button
+                    type="button"
+                    disabled={loading}
+                    onClick={() => setShowTerminalSetup((prev) => !prev)}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
+                  >
+                    <Monitor className="w-3.5 h-3.5" /> {showTerminalSetup ? 'Close Terminal Setup' : 'Terminal Settings'}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    disabled={loading}
+                    onClick={handleGoogleDisconnect}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
+                  >
+                    <LogOut className="w-3.5 h-3.5" /> Disconnect Workspace
+                  </button>
+                )}
               </div>
 
+              {isTerminalMode && showTerminalSetup && (
+                <form onSubmit={handleExitTerminalMode} className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 p-3.5 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-slate-800 dark:text-slate-100">Shared Terminal Controls</span>
+                    <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400">
+                      {terminalStatus?.devicePaired ? 'Device Paired' : 'Google Persisted'}
+                    </span>
+                  </div>
+                  <div className="flex gap-2">
+                    <input
+                      type="email"
+                      placeholder="Fixed terminal Work Email (optional)"
+                      value={stationEmailInput}
+                      onChange={(e) => setStationEmailInput(e.target.value)}
+                      className="flex-1 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleSaveStationEmail}
+                      className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 whitespace-nowrap"
+                    >
+                      Save Pre-Fill
+                    </button>
+                  </div>
+                  {!isEnvForcedTerminalMode() && (
+                    <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-200 dark:border-slate-800">
+                      {terminalStatus?.accessKeyConfigured && (
+                        <input
+                          type="password"
+                          placeholder="Pairing passcode to exit"
+                          value={terminalPasscode}
+                          onChange={(e) => setTerminalPasscode(e.target.value)}
+                          className="flex-1 min-w-[160px] rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs"
+                        />
+                      )}
+                      <button
+                        type="submit"
+                        disabled={terminalActionBusy}
+                        className="inline-flex items-center gap-1 rounded-lg border border-red-200 dark:border-red-800/80 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs font-semibold text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/70 whitespace-nowrap"
+                      >
+                        <LogOut className="w-3.5 h-3.5" />
+                        {terminalActionBusy ? 'Disconnecting...' : 'Exit Terminal Mode'}
+                      </button>
+                    </div>
+                  )}
+                </form>
+              )}
+
               {/* Auth Mode Tabs */}
-              <div className="grid grid-cols-2 gap-1.5 p-1 rounded-xl bg-slate-100 border border-slate-200">
+              <div className="grid grid-cols-2 gap-1.5 p-1 rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-800">
                 <button
                   type="button"
                   onClick={() => {
@@ -387,8 +722,8 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
                   }}
                   className={`flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
                     authTab === 'password'
-                      ? 'bg-white text-slate-900 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900'
+                      ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-50 shadow-xs'
+                      : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
                   }`}
                 >
                   <Mail className="w-3.5 h-3.5" />
@@ -402,8 +737,8 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
                   }}
                   className={`flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
                     authTab === 'pin'
-                      ? 'bg-white text-slate-900 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900'
+                      ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-50 shadow-xs'
+                      : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
                   }`}
                 >
                   <KeyRound className="w-3.5 h-3.5" />
@@ -412,7 +747,7 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
               </div>
 
               {error && (
-                <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium flex items-start gap-2">
+                <div className="p-3 rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800/80 text-xs text-red-700 dark:text-red-300 font-medium flex items-start gap-2">
                   <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
                   <span>{error}</span>
                 </div>
@@ -421,7 +756,7 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
               {authTab === 'password' ? (
                 <form onSubmit={handlePasswordLogin} className="space-y-4" autoComplete="off">
                   <div>
-                    <label className="block text-xs font-medium text-slate-700 mb-1">Work Email</label>
+                    <label className="block text-xs font-medium text-slate-700 dark:text-slate-200 mb-1">Work Email</label>
                     <input
                       type="email"
                       required
@@ -429,14 +764,14 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
                       placeholder="name@maximusbbq.ph"
                       value={email}
                       onChange={(e) => setEmail(e.target.value)}
-                      className="w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-900"
+                      className="w-full rounded-lg border border-slate-300 dark:border-slate-700 px-3.5 py-2.5 text-sm text-slate-900 dark:text-slate-50 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-900 dark:focus:ring-slate-200"
                     />
                   </div>
                   <div>
                     <div className="flex items-center justify-between mb-1">
-                      <label className="block text-xs font-medium text-slate-700">Password</label>
+                      <label className="block text-xs font-medium text-slate-700 dark:text-slate-200">Password</label>
                       {capsLockOn && (
-                        <span className="text-[11px] font-medium text-amber-700">Caps Lock is ON</span>
+                        <span className="text-[11px] font-medium text-amber-700 dark:text-amber-300">Caps Lock is ON</span>
                       )}
                     </div>
                     <div className="relative">
@@ -449,13 +784,13 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
                         onChange={(e) => setPassword(e.target.value)}
                         onKeyDown={handlePasswordKey}
                         onKeyUp={handlePasswordKey}
-                        className="w-full rounded-lg border border-slate-300 pl-3.5 pr-10 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-900"
+                        className="w-full rounded-lg border border-slate-300 dark:border-slate-700 pl-3.5 pr-10 py-2.5 text-sm text-slate-900 dark:text-slate-50 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-900 dark:focus:ring-slate-200"
                       />
                       <button
                         type="button"
                         onClick={() => setShowPassword((prev) => !prev)}
                         aria-label={showPassword ? 'Hide password' : 'Show password'}
-                        className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded text-slate-400 hover:text-slate-700"
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
                       >
                         {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                       </button>
@@ -465,7 +800,7 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
                   <button
                     type="submit"
                     disabled={loading}
-                    className="w-full flex items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-50 whitespace-nowrap shrink-0"
+                    className="w-full flex items-center justify-center gap-2 rounded-lg bg-slate-900 dark:bg-slate-100 px-4 py-2.5 text-sm font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white disabled:opacity-50 whitespace-nowrap shrink-0"
                   >
                     <Lock className="w-4 h-4" />
                     {loading ? 'Verifying Credentials...' : 'Sign In with Password'}
@@ -476,15 +811,15 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
                   {/* Location & Operator Selection */}
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1">
+                      <label className="block text-xs font-medium text-slate-700 dark:text-slate-200 mb-1">
                         Truck / Location Filter
                       </label>
                       <div className="relative">
-                        <MapPin className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                        <MapPin className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
                         <select
                           value={pinLocationFilter}
                           onChange={(e) => setPinLocationFilter(e.target.value)}
-                          className="w-full rounded-lg border border-slate-300 bg-white pl-8 pr-3 py-2 text-xs font-medium text-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-900"
+                          className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 pl-8 pr-3 py-2 text-xs font-medium text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-slate-900 dark:focus:ring-slate-200"
                         >
                           <option value="ALL">All Locations</option>
                           {locations.map((loc) => (
@@ -497,7 +832,7 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
                     </div>
 
                     <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1">
+                      <label className="block text-xs font-medium text-slate-700 dark:text-slate-200 mb-1">
                         Operator Account
                       </label>
                       <select
@@ -507,7 +842,7 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
                           setPin('');
                           setError('');
                         }}
-                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-900"
+                        className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs font-medium text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-slate-900 dark:focus:ring-slate-200"
                       >
                         {filteredOperators.length === 0 ? (
                           <option value="">No operators for location</option>
@@ -525,7 +860,7 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
 
                   {/* Selected Operator Card */}
                   {selectedOperator && (
-                    <div className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
+                    <div className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 px-3 py-2.5">
                       <div className="flex items-center gap-2.5 min-w-0">
                         <AvatarBadge
                           name={selectedOperator.full_name}
@@ -533,10 +868,10 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
                           size="sm"
                         />
                         <div className="min-w-0">
-                          <p className="text-xs font-semibold text-slate-900 truncate">
+                          <p className="text-xs font-semibold text-slate-900 dark:text-slate-50 truncate">
                             {selectedOperator.full_name}
                           </p>
-                          <p className="text-[11px] text-slate-500 truncate">
+                          <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
                             {selectedOperator.role_name}
                           </p>
                         </div>
@@ -544,10 +879,10 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
                       <span
                         className={`text-[11px] font-semibold shrink-0 ${
                           selectedOperator.is_locked
-                            ? 'text-amber-700'
+                            ? 'text-amber-700 dark:text-amber-300'
                             : selectedOperator.has_pin
-                              ? 'text-emerald-700'
-                              : 'text-slate-400'
+                              ? 'text-emerald-700 dark:text-emerald-300'
+                              : 'text-slate-500 dark:text-slate-400'
                         }`}
                       >
                         {selectedOperator.is_locked
@@ -560,14 +895,14 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
                   )}
 
                   {!anyOperatorHasPin && (
-                    <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+                    <div className="rounded-lg border border-amber-200 dark:border-amber-700/80 bg-amber-50 dark:bg-amber-950/45 p-3 text-xs text-amber-800 dark:text-amber-300">
                       No Operator Shift PINs are configured yet. Sign in with Work Email &amp; Password and set 4–6 digit PINs in <span className="font-semibold">User Control</span>.
                     </div>
                   )}
 
                   {/* PIN Slot Display */}
                   <div className="space-y-2">
-                    <div className="flex items-center justify-between text-[11px] text-slate-500">
+                    <div className="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400">
                       <span>Enter 4–6 digit Shift PIN (touch or keyboard)</span>
                       <span className="font-mono tabular-nums">{pin.length}/6</span>
                     </div>
@@ -579,8 +914,8 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
                             key={idx}
                             className={`h-10 rounded-lg border flex items-center justify-center font-mono text-lg font-bold transition-colors ${
                               filled
-                                ? 'border-slate-900 bg-slate-900 text-white'
-                                : 'border-slate-200 bg-slate-50 text-slate-300'
+                                ? 'border-slate-900 dark:border-slate-100 bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950'
+                                : 'border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 text-slate-500 dark:text-slate-500'
                             }`}
                           >
                             {filled ? '•' : '–'}
@@ -598,7 +933,7 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
                         type="button"
                         disabled={loading || !selectedOperator?.has_pin || selectedOperator?.is_locked}
                         onClick={() => setPin((prev) => (prev.length < 6 ? prev + digit : prev))}
-                        className="h-11 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 active:bg-slate-100 font-mono tabular-nums text-base font-semibold text-slate-900 disabled:opacity-40"
+                        className="h-11 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 active:bg-slate-100 dark:active:bg-slate-700 font-mono tabular-nums text-base font-semibold text-slate-900 dark:text-slate-50 disabled:opacity-40"
                       >
                         {digit}
                       </button>
@@ -607,7 +942,7 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
                       type="button"
                       disabled={loading || pin.length === 0}
                       onClick={() => setPin('')}
-                      className="h-11 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-xs font-semibold text-slate-600 disabled:opacity-40"
+                      className="h-11 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs font-semibold text-slate-600 dark:text-slate-300 disabled:opacity-40"
                     >
                       Clear
                     </button>
@@ -615,7 +950,7 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
                       type="button"
                       disabled={loading || !selectedOperator?.has_pin || selectedOperator?.is_locked}
                       onClick={() => setPin((prev) => (prev.length < 6 ? prev + '0' : prev))}
-                      className="h-11 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 active:bg-slate-100 font-mono tabular-nums text-base font-semibold text-slate-900 disabled:opacity-40"
+                      className="h-11 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 active:bg-slate-100 dark:active:bg-slate-700 font-mono tabular-nums text-base font-semibold text-slate-900 dark:text-slate-50 disabled:opacity-40"
                     >
                       0
                     </button>
@@ -624,7 +959,7 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
                       disabled={loading || pin.length === 0}
                       onClick={() => setPin((prev) => prev.slice(0, -1))}
                       aria-label="Backspace"
-                      className="h-11 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 flex items-center justify-center text-slate-700 disabled:opacity-40"
+                      className="h-11 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 hover:bg-slate-100 dark:hover:bg-slate-800 flex items-center justify-center text-slate-700 dark:text-slate-200 disabled:opacity-40"
                     >
                       <Delete className="w-4 h-4" />
                     </button>
@@ -639,7 +974,7 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
                       pin.length < 4
                     }
                     onClick={submitPinLogin}
-                    className="w-full flex items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-50 whitespace-nowrap shrink-0"
+                    className="w-full flex items-center justify-center gap-2 rounded-lg bg-slate-900 dark:bg-slate-100 px-4 py-2.5 text-sm font-semibold text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white disabled:opacity-50 whitespace-nowrap shrink-0"
                   >
                     <KeyRound className="w-4 h-4" />
                     {loading ? 'Unlocking Terminal...' : 'Sign In with Shift PIN'}
@@ -648,17 +983,17 @@ export function LoginView({ firebaseUser, onAuthenticated }: Props) {
               )}
 
               {/* Pre-Login Crew Attendance Kiosk Trigger */}
-              <div className="pt-4 border-t border-slate-200 flex flex-wrap items-center justify-between gap-3">
-                <div className="text-xs text-slate-500">
-                  <p className="font-medium text-slate-700">Starting a crew shift?</p>
+              <div className="pt-4 border-t border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3">
+                <div className="text-xs text-slate-500 dark:text-slate-400">
+                  <p className="font-medium text-slate-700 dark:text-slate-200">Starting a crew shift?</p>
                   <p>Record Time In / Time Out without opening POS.</p>
                 </div>
                 <button
                   type="button"
                   onClick={openPreLoginKiosk}
-                  className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 whitespace-nowrap shrink-0"
+                  className="inline-flex items-center gap-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2 text-xs font-semibold text-slate-800 dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
                 >
-                  <ScanFace className="w-4 h-4 text-slate-700" />
+                  <ScanFace className="w-4 h-4 text-slate-700 dark:text-slate-200" />
                   Crew Attendance Kiosk (Face ID)
                 </button>
               </div>
