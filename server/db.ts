@@ -158,12 +158,15 @@ export function initSchema() {
       sku TEXT UNIQUE NOT NULL,
       name TEXT NOT NULL,
       item_type TEXT NOT NULL DEFAULT 'RAW_MATERIAL',
+      category TEXT DEFAULT 'Raw Materials',
       base_uom_id TEXT NOT NULL REFERENCES uoms(id),
       costing_method TEXT NOT NULL DEFAULT 'FIFO',
       min_stock_level REAL NOT NULL DEFAULT 0,
       reorder_point REAL NOT NULL DEFAULT 0,
       last_unit_cost REAL NOT NULL DEFAULT 0,
       weighted_avg_cost REAL NOT NULL DEFAULT 0,
+      unit_of_measure TEXT,
+      cost_per_unit REAL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -623,6 +626,35 @@ export function initSchema() {
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS terminal_presence (
+      id TEXT PRIMARY KEY,
+      location_id TEXT REFERENCES locations(id),
+      hardware_uuid TEXT UNIQUE NOT NULL,
+      terminal_name TEXT NOT NULL,
+      current_user_id TEXT REFERENCES users(id),
+      current_user_name TEXT,
+      current_role_name TEXT,
+      ip_address TEXT,
+      terminal_status TEXT NOT NULL DEFAULT 'ONLINE',
+      remote_command TEXT,
+      command_timestamp TEXT,
+      latency_ms INTEGER,
+      last_seen_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS terminal_events (
+      id TEXT PRIMARY KEY,
+      hardware_uuid TEXT NOT NULL,
+      terminal_name TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      severity TEXT NOT NULL DEFAULT 'INFO',
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      triggered_by TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_term_events_hw ON terminal_events(hardware_uuid, created_at DESC);
   `);
 
   const ensureColumn = (table: string, column: string, colDef: string) => {
@@ -631,6 +663,42 @@ export function initSchema() {
       db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${colDef}`);
     }
   };
+  ensureColumn('terminal_presence', 'terminal_status', "TEXT NOT NULL DEFAULT 'ONLINE'");
+  ensureColumn('terminal_presence', 'remote_command', 'TEXT');
+  ensureColumn('terminal_presence', 'command_timestamp', 'TEXT');
+  ensureColumn('terminal_presence', 'latency_ms', 'INTEGER');
+
+  db.exec(`
+    INSERT OR IGNORE INTO terminal_presence (id, location_id, hardware_uuid, terminal_name, current_user_name, current_role_name, ip_address, terminal_status, latency_ms, last_seen_at)
+    VALUES 
+    ('term_pres_1', 'loc_truck_1', 'HW-BGC-01', 'Truck 01 POS Register (BGC High St)', 'Bea Mendoza (Cashier)', 'Cashier', '192.168.1.101', 'ONLINE', 28, datetime('now')),
+    ('term_pres_2', 'loc_truck_2', 'HW-AYALA-02', 'Truck 02 POS Register (Ayala Triangle)', 'Marco Santos (Owner)', 'Business Owner', '192.168.1.102', 'ONLINE', 142, datetime('now')),
+    ('term_pres_3', 'loc_commissary', 'HW-COM-03', 'Commissary Dispatch Terminal', 'Elena Reyes (Operations)', 'Operations Manager', '192.168.1.50', 'ONLINE', 18, datetime('now'));
+
+    UPDATE terminal_presence SET latency_ms = 28 WHERE id = 'term_pres_1' AND latency_ms IS NULL;
+    UPDATE terminal_presence SET latency_ms = 142 WHERE id = 'term_pres_2' AND latency_ms IS NULL;
+    UPDATE terminal_presence SET latency_ms = 18 WHERE id = 'term_pres_3' AND latency_ms IS NULL;
+
+    INSERT OR IGNORE INTO terminal_events (id, hardware_uuid, terminal_name, event_type, severity, title, description, triggered_by, created_at)
+    VALUES
+    ('evt_bgc_1', 'HW-BGC-01', 'Truck 01 POS Register (BGC High St)', 'OPERATOR_LOGIN', 'INFO', 'Cashier Shift Logged In', 'Cashier Bea Mendoza logged into POS terminal with Shift PIN', 'Bea Mendoza (Cashier)', datetime('now', '-12 minutes')),
+    ('evt_bgc_2', 'HW-BGC-01', 'Truck 01 POS Register (BGC High St)', 'STATUS_CHANGE', 'INFO', 'Service Rush Active', 'Terminal state transitioned to BUSY during lunch rush order processing', 'POS Engine', datetime('now', '-35 minutes')),
+    ('evt_bgc_3', 'HW-BGC-01', 'Truck 01 POS Register (BGC High St)', 'PRINTER_CONNECT', 'INFO', 'Thermal Printer Online', 'LAN ESC/POS Printer (192.168.1.101:9100) probe connected and paper ready', 'Printer Discovery', datetime('now', '-1 hour')),
+    ('evt_bgc_4', 'HW-BGC-01', 'Truck 01 POS Register (BGC High St)', 'NETWORK_ALERT', 'WARNING', 'Wi-Fi Signal Jitter', 'Cellular Wi-Fi hotspot latency peaked at 380ms; automatic ping recovery completed', 'Network Watchdog', datetime('now', '-3 hours')),
+    ('evt_bgc_5', 'HW-BGC-01', 'Truck 01 POS Register (BGC High St)', 'BOOT_SEQUENCE', 'INFO', 'Morning Terminal Boot', 'POS terminal initialized, opening float of ₱5,000 verified', 'Bea Mendoza (Cashier)', datetime('now', '-5 hours')),
+
+    ('evt_ayala_1', 'HW-AYALA-02', 'Truck 02 POS Register (Ayala Triangle)', 'OPERATOR_LOGIN', 'INFO', 'Owner Management Login', 'Marco Santos (Owner) accessed POS register and cashier terminal', 'Marco Santos (Owner)', datetime('now', '-18 minutes')),
+    ('evt_ayala_2', 'HW-AYALA-02', 'Truck 02 POS Register (Ayala Triangle)', 'STATUS_CHANGE', 'INFO', 'Market Service Active', 'Terminal switched to online mode for evening street food market', 'POS Engine', datetime('now', '-50 minutes')),
+    ('evt_ayala_3', 'HW-AYALA-02', 'Truck 02 POS Register (Ayala Triangle)', 'POWER_ALERT', 'WARNING', 'Generator Switchover', 'Food truck rig generator switchover detected; onboard battery buffer engaged', 'Power Monitor', datetime('now', '-2 hours')),
+    ('evt_ayala_4', 'HW-AYALA-02', 'Truck 02 POS Register (Ayala Triangle)', 'VOID_RECORD', 'WARNING', 'Manager Void Approved', 'Order #2041 line item void approved (Reason: Customer mistake / changed mind)', 'Marco Santos (Owner)', datetime('now', '-4 hours')),
+    ('evt_ayala_5', 'HW-AYALA-02', 'Truck 02 POS Register (Ayala Triangle)', 'BOOT_SEQUENCE', 'INFO', 'Terminal Hardware Paired', 'Hardware UUID HW-AYALA-02 verified with setup access key', 'System', datetime('now', '-6 hours')),
+
+    ('evt_com_1', 'HW-COM-03', 'Commissary Dispatch Terminal', 'OPERATOR_LOGIN', 'INFO', 'Operations Dispatch Login', 'Elena Reyes (Operations Manager) active on central commissary terminal', 'Elena Reyes (Operations)', datetime('now', '-22 minutes')),
+    ('evt_com_2', 'HW-COM-03', 'Commissary Dispatch Terminal', 'STOCK_DISPATCH', 'INFO', 'Commissary Transfer Dispatched', 'Dispatched restock batch LOT-PRK-102 (8,000g Pork) to Truck 01', 'Elena Reyes (Operations)', datetime('now', '-1 hour')),
+    ('evt_com_3', 'HW-COM-03', 'Commissary Dispatch Terminal', 'STATUS_CHANGE', 'INFO', 'Terminal Idle & Ready', 'Terminal station idle and listening for incoming restock requests', 'POS Engine', datetime('now', '-3 hours')),
+    ('evt_com_4', 'HW-COM-03', 'Commissary Dispatch Terminal', 'SYNC_EVENT', 'INFO', 'Central Inventory Synced', 'FIFO inventory batches synced across cloud Firestore workspace', 'Cloud Sync', datetime('now', '-4 hours')),
+    ('evt_com_5', 'HW-COM-03', 'Commissary Dispatch Terminal', 'BOOT_SEQUENCE', 'INFO', 'Dispatch Service Started', 'Commissary terminal daemon initialized on host 192.168.1.50', 'System', datetime('now', '-6 hours'));
+  `);
   ensureColumn('users', 'avatar_url', 'TEXT');
   ensureColumn('users', 'shift_pin_hash', 'TEXT');
   ensureColumn('users', 'failed_login_attempts', 'INTEGER NOT NULL DEFAULT 0');
@@ -658,6 +726,10 @@ export function initSchema() {
   ensureColumn('attendance_logs', 'clock_in_photo', 'TEXT');
   ensureColumn('attendance_logs', 'clock_out_photo', 'TEXT');
   ensureColumn('attendance_logs', 'worked_hours', 'REAL DEFAULT 0');
+  ensureColumn('inventory_items', 'category', "TEXT DEFAULT 'Raw Materials'");
+  ensureColumn('inventory_items', 'unit_of_measure', 'TEXT');
+  ensureColumn('inventory_items', 'cost_per_unit', 'REAL');
+  ensureColumn('users', 'updated_at', 'TEXT');
 
   db.exec(`
     UPDATE users SET email = REPLACE(email, '@kalyefleet.ph', '@maximusbbq.ph') WHERE email LIKE '%@kalyefleet.ph';
@@ -670,11 +742,90 @@ export function initSchema() {
   `);
 
   const hasSuperRole = db.prepare("SELECT id FROM roles WHERE id = 'role_super_admin'").get();
-  const hasSuperUser = db.prepare("SELECT id FROM users WHERE role_id = 'role_super_admin'").get();
-  if (hasSuperRole && !hasSuperUser) {
-    const demoHash = bcrypt.hashSync('erp2026!', 10);
-    db.prepare('INSERT OR IGNORE INTO users (id, email, password_hash, full_name, role_id, assigned_location_id) VALUES (?, ?, ?, ?, ?, ?)')
-      .run('usr_superadmin', 'superadmin@maximusbbq.ph', demoHash, 'System Super Admin', 'role_super_admin', null);
+  if (hasSuperRole) {
+    const demoSeeds: Array<{
+      id: string;
+      email: string;
+      fullName: string;
+      roleId: string;
+      assignedLocationId: string | null;
+    }> = [
+      { id: 'usr_superadmin', email: 'superadmin@maximusbbq.ph', fullName: 'System Super Admin', roleId: 'role_super_admin', assignedLocationId: null },
+      { id: 'usr_owner', email: 'owner@maximusbbq.ph', fullName: 'Marco Santos (Owner)', roleId: 'role_business_owner', assignedLocationId: null },
+      { id: 'usr_ops', email: 'ops@maximusbbq.ph', fullName: 'Elena Reyes (Operations)', roleId: 'role_operations_manager', assignedLocationId: null },
+      { id: 'usr_fin', email: 'finance@maximusbbq.ph', fullName: 'Paolo Cruz (Finance)', roleId: 'role_finance_manager', assignedLocationId: null },
+      { id: 'usr_cashier', email: 'cashier@maximusbbq.ph', fullName: 'Bea Mendoza (Cashier)', roleId: 'role_cashier', assignedLocationId: 'loc_truck_1' },
+      { id: 'usr_kitchen', email: 'kitchen@maximusbbq.ph', fullName: 'Carlo Villanueva (Kitchen)', roleId: 'role_kitchen_staff', assignedLocationId: 'loc_truck_1' },
+    ];
+    const seedMap = new Map(demoSeeds.map((s) => [s.id, s]));
+    const existingUsers = db
+      .prepare('SELECT id, email, password_hash, full_name, role_id, assigned_location_id, avatar_url, shift_pin_hash, is_active, updated_at FROM users')
+      .all() as any[];
+
+    const unmodifiedDemoIds: string[] = [];
+    for (const u of existingUsers) {
+      const seed = seedMap.get(u.id);
+      if (!seed) continue;
+      const locUnmodified =
+        (u.assigned_location_id ?? null) === seed.assignedLocationId ||
+        (seed.assignedLocationId !== null && (u.assigned_location_id ?? null) === null);
+      const isUnmodified =
+        !u.updated_at &&
+        !u.shift_pin_hash &&
+        !u.avatar_url &&
+        u.is_active === 1 &&
+        String(u.email || '').trim().toLowerCase() === seed.email &&
+        String(u.full_name || '').trim() === seed.fullName &&
+        u.role_id === seed.roleId &&
+        locUnmodified &&
+        bcrypt.compareSync('erp2026!', String(u.password_hash || ''));
+      if (isUnmodified) {
+        unmodifiedDemoIds.push(u.id);
+      }
+    }
+
+    const demoIdSet = new Set(unmodifiedDemoIds);
+    const survivingUsers = existingUsers.filter((u) => !demoIdSet.has(u.id));
+    const survivingAdmins = survivingUsers.filter(
+      (u) => u.is_active === 1 && (u.role_id === 'role_super_admin' || u.role_id === 'role_business_owner'),
+    );
+
+    if (unmodifiedDemoIds.length > 0 || survivingAdmins.length === 0) {
+      const cleanupTx = db.transaction(() => {
+        let fallbackOwnerId =
+          survivingAdmins.find((u) => u.id === 'usr_google_owner')?.id ||
+          survivingAdmins.find((u) => String(u.email || '').toLowerCase() === 'norielescobio@gmail.com')?.id ||
+          survivingAdmins[0]?.id;
+
+        if (!fallbackOwnerId) {
+          const existingByEmail = db
+            .prepare("SELECT id FROM users WHERE lower(email) = 'norielescobio@gmail.com'")
+            .get() as { id: string } | undefined;
+          if (existingByEmail) {
+            db.prepare("UPDATE users SET role_id = 'role_super_admin', is_active = 1 WHERE id = ?").run(existingByEmail.id);
+            fallbackOwnerId = existingByEmail.id;
+          } else {
+            const ownerHash = bcrypt.hashSync('erp2026!', 10);
+            db.prepare(
+              'INSERT OR IGNORE INTO users (id, email, password_hash, full_name, role_id, assigned_location_id, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)',
+            ).run('usr_google_owner', 'norielescobio@gmail.com', ownerHash, 'Workspace Owner', 'role_super_admin', null);
+            fallbackOwnerId = 'usr_google_owner';
+          }
+        }
+
+        if (unmodifiedDemoIds.length > 0 && fallbackOwnerId) {
+          const placeholders = unmodifiedDemoIds.map(() => '?').join(', ');
+          db.prepare(`UPDATE sales SET cashier_id = ? WHERE cashier_id IN (${placeholders})`).run(fallbackOwnerId, ...unmodifiedDemoIds);
+          db.prepare(`UPDATE daily_closings SET closed_by = ? WHERE closed_by IN (${placeholders})`).run(fallbackOwnerId, ...unmodifiedDemoIds);
+          db.prepare(`UPDATE purchase_orders SET approved_by = ? WHERE approved_by IN (${placeholders})`).run(fallbackOwnerId, ...unmodifiedDemoIds);
+          db.prepare(`UPDATE audit_logs SET user_id = ? WHERE user_id IN (${placeholders})`).run(fallbackOwnerId, ...unmodifiedDemoIds);
+          db.prepare(`UPDATE terminal_presence SET current_user_id = NULL WHERE current_user_id IN (${placeholders})`).run(...unmodifiedDemoIds);
+          db.prepare(`DELETE FROM sessions WHERE user_id IN (${placeholders})`).run(...unmodifiedDemoIds);
+          db.prepare(`DELETE FROM users WHERE id IN (${placeholders})`).run(...unmodifiedDemoIds);
+        }
+      });
+      cleanupTx();
+    }
   }
 
   const tplCount = (db.prepare('SELECT COUNT(*) AS cnt FROM shift_templates').get() as any)?.cnt || 0;
@@ -830,15 +981,10 @@ export function seedDatabase() {
     db.prepare('INSERT INTO truck_assignments (id, truck_id, site_name, assigned_date, shift_notes) VALUES (?, ?, ?, ?, ?)')
       .run('ta_2', 'trk_2', 'Ayala Triangle Gardens', new Date().toISOString().slice(0, 10), 'Evening Street Market');
 
-    // 4. Users (demo accounts with real bcrypt hashes)
-    const demoHash = bcrypt.hashSync('erp2026!', 10);
+    // 4. Users (Workspace Owner only — no demo system accounts)
+    const ownerHash = bcrypt.hashSync('erp2026!', 10);
     const insUser = db.prepare('INSERT INTO users (id, email, password_hash, full_name, role_id, assigned_location_id) VALUES (?, ?, ?, ?, ?, ?)');
-    insUser.run('usr_superadmin', 'superadmin@maximusbbq.ph', demoHash, 'System Super Admin', 'role_super_admin', null);
-    insUser.run('usr_owner', 'owner@maximusbbq.ph', demoHash, 'Marco Santos (Owner)', 'role_business_owner', null);
-    insUser.run('usr_ops', 'ops@maximusbbq.ph', demoHash, 'Elena Reyes (Operations)', 'role_operations_manager', null);
-    insUser.run('usr_fin', 'finance@maximusbbq.ph', demoHash, 'Paolo Cruz (Finance)', 'role_finance_manager', null);
-    insUser.run('usr_cashier', 'cashier@maximusbbq.ph', demoHash, 'Bea Mendoza (Cashier)', 'role_cashier', 'loc_truck_1');
-    insUser.run('usr_kitchen', 'kitchen@maximusbbq.ph', demoHash, 'Carlo Villanueva (Kitchen)', 'role_kitchen_staff', 'loc_truck_1');
+    insUser.run('usr_google_owner', 'norielescobio@gmail.com', ownerHash, 'Workspace Owner', 'role_super_admin', null);
 
     // 5. UOMs & Conversions
     const insUom = db.prepare('INSERT INTO uoms (id, code, name) VALUES (?, ?, ?)');
@@ -997,7 +1143,7 @@ export function seedDatabase() {
       .run('poi_1', 'po_1', 'ing_bun', 300, 0, 14.0);
 
     db.prepare('INSERT INTO purchase_orders (id, po_number, supplier_id, location_id, status, total_amount, approved_by, ordered_at, expected_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run('po_2', 'PO-2026-090', 'sup_1', 'loc_commissary', 'APPROVED', 12400, 'usr_ops', daysFromNow(-1), daysFromNow(1));
+      .run('po_2', 'PO-2026-090', 'sup_1', 'loc_commissary', 'APPROVED', 12400, 'usr_google_owner', daysFromNow(-1), daysFromNow(1));
     db.prepare('INSERT INTO purchase_order_items (id, purchase_order_id, inventory_item_id, ordered_qty, received_qty, unit_cost) VALUES (?, ?, ?, ?, ?, ?)')
       .run('poi_2', 'po_2', 'ing_pork', 20000, 0, 0.34);
     db.prepare('INSERT INTO purchase_order_items (id, purchase_order_id, inventory_item_id, ordered_qty, received_qty, unit_cost) VALUES (?, ?, ?, ?, ?, ?)')
@@ -1075,7 +1221,7 @@ export function seedDatabase() {
       const soldAt = daysFromNow(o.dayOffset);
       const rcpt = `OR-2026${String(101 + i)}`;
 
-      insSale.run(sid, rcpt, `seed_txn_${i + 1}`, o.loc, 'usr_cashier', o.cust, 'WALK_IN', o.kds, sub, 0, tax, gross, cogs, soldAt);
+      insSale.run(sid, rcpt, `seed_txn_${i + 1}`, o.loc, 'usr_google_owner', o.cust, 'WALK_IN', o.kds, sub, 0, tax, gross, cogs, soldAt);
       insSaleItem.run(`si_seed_${i + 1}`, sid, o.prod, null, o.name, 'Standard', o.qty, o.price, gross, cogs);
       insPay.run(`pay_seed_${i + 1}`, sid, o.method, gross, soldAt);
 

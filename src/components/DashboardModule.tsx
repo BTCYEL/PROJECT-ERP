@@ -46,6 +46,7 @@ import { useTheme } from '../lib/theme.ts';
 import { AuthUser, LocationRow, PERMISSIONS } from '../types/erp.ts';
 import { AiInventoryForecastWidget } from './AiInventoryForecastWidget.tsx';
 import { DailyHuddleModule } from './DailyHuddleModule.tsx';
+import { TerminalLiveMonitor } from './TerminalLiveMonitor.tsx';
 
 interface Props {
   user?: AuthUser;
@@ -249,7 +250,7 @@ export function DashboardModule({
     return <div className="p-4 rounded-lg border border-red-200 dark:border-red-800/80 bg-red-50 dark:bg-red-950/50 text-sm text-red-700 dark:text-red-300">{error}</div>;
   }
 
-  const { kpis, summaryCards, lowStockItems, expiringBatches, salesByPayment, salesByLocation, salesByCategory, topProducts, dailyTrends } = data;
+  const { kpis, summaryCards, lowStockItems, salesByPayment, salesByLocation, salesByCategory, topProducts, dailyTrends } = data;
   const maxTrend = Math.max(...(dailyTrends.map((d: any) => d.revenue) || [1]), 1);
   const sevenDayTotal = sevenDayTrends.reduce((sum, d) => sum + d.revenue, 0);
   const sevenDayAvg = sevenDayTrends.length ? sevenDayTotal / sevenDayTrends.length : 0;
@@ -1235,8 +1236,8 @@ export function DashboardModule({
         onQuickAction={onQuickAction}
       />
 
-      {/* Bottom Operational Grids: Truck Performance, Top Products & Alerts */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      {/* Bottom Operational Grids: Truck Performance & Top Products */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5">
           <div className="flex items-center justify-between mb-3">
             <h2 className="font-display text-base font-semibold text-slate-900 dark:text-slate-50">Truck Performance</h2>
@@ -1290,50 +1291,9 @@ export function DashboardModule({
             </tbody>
           </table>
         </div>
-
-        <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="font-display text-base font-semibold text-slate-900 dark:text-slate-50">Inventory &amp; Expiry Alerts</h2>
-            <button onClick={() => onNavigate('inventory')} className="text-xs font-medium text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white">
-              Manage Stock
-            </button>
-          </div>
-          <div className="space-y-2.5 text-xs">
-            {lowStockItems.map((item: any) => (
-              <div key={item.id} className="flex items-start justify-between gap-2 pb-2 border-b border-slate-100 dark:border-slate-800/80">
-                <div>
-                  <p className="font-medium text-slate-900 dark:text-slate-50 flex items-center gap-1.5">
-                    <AlertTriangle className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 shrink-0" />
-                    {item.name}
-                  </p>
-                  <p className="text-slate-500 dark:text-slate-400 mt-0.5">
-                    LOW STOCK · Reorder at {formatNum(item.reorder_point, 0)} {item.uom}
-                  </p>
-                </div>
-                <span className="font-mono tabular-nums font-semibold text-amber-700 dark:text-amber-300 shrink-0">
-                  {formatNum(item.current_qty, 0)} {item.uom}
-                </span>
-              </div>
-            ))}
-            {expiringBatches.map((b: any) => (
-              <div key={b.id} className="flex items-start justify-between gap-2 pb-2 border-b border-slate-100 dark:border-slate-800/80">
-                <div>
-                  <p className="font-medium text-slate-900 dark:text-slate-50">{b.item_name}</p>
-                  <p className="text-red-700 dark:text-red-300 mt-0.5">
-                    EXPIRING SOON · {b.batch_number} · {b.location_name}
-                  </p>
-                </div>
-                <span className="font-mono tabular-nums text-red-700 dark:text-red-300 shrink-0">
-                  {String(b.expiry_date).slice(0, 10)}
-                </span>
-              </div>
-            ))}
-            {lowStockItems.length === 0 && expiringBatches.length === 0 && (
-              <p className="text-slate-500 dark:text-slate-400 py-4 text-center">No stock shortages or expiring batches detected.</p>
-            )}
-          </div>
-        </div>
       </div>
+
+      <TerminalLiveMonitor user={user} activeLocationId={locationFilter} />
 
       {/* Bottom Attendance Kiosk Section (Available for Every System User) */}
       {(() => {

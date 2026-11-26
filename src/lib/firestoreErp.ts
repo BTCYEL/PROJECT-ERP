@@ -633,64 +633,29 @@ async function seedWorkspaceFirestore(firebaseUser: User): Promise<void> {
     });
   }
 
-  // 4. ERP Users (including signed-in Google Owner + seeded RBAC accounts)
-  const erpUserSeeds: Array<{
-    id: string;
-    email: string;
-    fullName: string;
-    roleId: string;
-    roleCode: string;
-    roleName: string;
-    assignedLocationId: string | null;
-    avatarUrl: string | null;
-  }> = [
-    { id: 'usr_superadmin', email: 'superadmin@maximusbbq.ph', fullName: 'System Super Admin', roleId: 'role_super_admin', roleCode: 'SUPER_ADMIN', roleName: 'Super Administrator', assignedLocationId: null, avatarUrl: null },
-    { id: 'usr_owner', email: 'owner@maximusbbq.ph', fullName: 'Marco Santos (Owner)', roleId: 'role_business_owner', roleCode: 'BUSINESS_OWNER', roleName: 'Business Owner', assignedLocationId: null, avatarUrl: null },
-    { id: 'usr_ops', email: 'ops@maximusbbq.ph', fullName: 'Elena Reyes (Operations)', roleId: 'role_operations_manager', roleCode: 'OPERATIONS_MANAGER', roleName: 'Operations Manager', assignedLocationId: null, avatarUrl: null },
-    { id: 'usr_fin', email: 'finance@maximusbbq.ph', fullName: 'Paolo Cruz (Finance)', roleId: 'role_finance_manager', roleCode: 'FINANCE_MANAGER', roleName: 'Finance Manager', assignedLocationId: null, avatarUrl: null },
-    { id: 'usr_cashier', email: 'cashier@maximusbbq.ph', fullName: 'Bea Mendoza (Cashier)', roleId: 'role_cashier', roleCode: 'CASHIER', roleName: 'Cashier', assignedLocationId: toDocId('loc_truck_1', uid), avatarUrl: null },
-    { id: 'usr_kitchen', email: 'kitchen@maximusbbq.ph', fullName: 'Carlo Villanueva (Kitchen)', roleId: 'role_kitchen_staff', roleCode: 'KITCHEN_STAFF', roleName: 'Kitchen Staff', assignedLocationId: toDocId('loc_truck_1', uid), avatarUrl: null },
-  ];
-
+  // 4. ERP Users (Workspace Owner only — no demo system accounts)
   const googleEmail = (firebaseUser.email || '').trim().toLowerCase().slice(0, 200);
   const googleDisplayName = (firebaseUser.displayName?.trim() || googleEmail.split('@')[0]?.trim() || 'Workspace Owner').slice(0, 150);
   const rawGooglePhoto = firebaseUser.photoURL ? String(firebaseUser.photoURL).trim() : '';
   const safeGooglePhoto = rawGooglePhoto && rawGooglePhoto.length <= 250000 ? rawGooglePhoto : null;
-  const isPasswordTerminalAuth =
-    isTerminalModeDevice() &&
-    firebaseUser.providerData?.some((p) => p.providerId === 'password') &&
-    !firebaseUser.providerData?.some((p) => p.providerId === 'google.com');
-  if (googleEmail && !isPasswordTerminalAuth && !erpUserSeeds.some((u) => u.email.toLowerCase() === googleEmail)) {
-    erpUserSeeds.unshift({
-      id: 'usr_google_owner',
-      email: googleEmail,
-      fullName: googleDisplayName,
-      roleId: 'role_super_admin',
-      roleCode: 'SUPER_ADMIN',
-      roleName: 'Super Administrator',
-      assignedLocationId: null,
-      avatarUrl: safeGooglePhoto,
-    });
-  }
+  const ownerEmail = googleEmail || `${uid}@users.maximusbbq.ph`;
 
-  for (const u of erpUserSeeds) {
-    const docId = toDocId(u.id, uid);
-    batch.set(doc(db, 'erp_users', docId), {
-      id: docId,
-      ownerUid: uid,
-      email: u.email,
-      fullName: u.fullName,
-      roleId: u.roleId,
-      roleCode: u.roleCode,
-      roleName: u.roleName,
-      assignedLocationId: u.assignedLocationId,
-      avatarUrl: u.avatarUrl,
-      passwordHash: demoPassHash,
-      isActive: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-  }
+  const ownerDocId = toDocId('usr_google_owner', uid);
+  batch.set(doc(db, 'erp_users', ownerDocId), {
+    id: ownerDocId,
+    ownerUid: uid,
+    email: ownerEmail,
+    fullName: googleDisplayName,
+    roleId: 'role_super_admin',
+    roleCode: 'SUPER_ADMIN',
+    roleName: 'Super Administrator',
+    assignedLocationId: null,
+    avatarUrl: safeGooglePhoto,
+    passwordHash: demoPassHash,
+    isActive: true,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  });
 
   // 5. Inventory Items & Stock Batches
   const invSeeds = [
@@ -997,7 +962,7 @@ async function seedWorkspaceFirestore(firebaseUser: User): Promise<void> {
       locationId: toDocId('loc_commissary', uid),
       status: 'APPROVED',
       totalAmount: 12400,
-      approvedBy: toDocId('usr_ops', uid),
+      approvedBy: toDocId('usr_google_owner', uid),
       notes: '',
       orderedAt: daysFromNow(-1),
       expectedAt: daysFromNow(1),
@@ -1114,7 +1079,7 @@ async function seedWorkspaceFirestore(firebaseUser: User): Promise<void> {
       receiptNumber: rcpt,
       clientTxnId: `seed_txn_${i + 1}`,
       locationId: toDocId(o.loc, uid),
-      cashierId: toDocId('usr_cashier', uid),
+      cashierId: toDocId('usr_google_owner', uid),
       customerId: o.cust ? toDocId(o.cust, uid) : null,
       channel: 'WALK_IN',
       status: 'COMPLETED',
@@ -1255,9 +1220,9 @@ async function seedWorkspaceFirestore(firebaseUser: User): Promise<void> {
     locationId: null,
     locationName: null,
     shiftWindow: 'ALL_DAY',
-    authorId: 'usr_ops',
-    authorName: 'Elena Reyes (Operations)',
-    authorRole: 'Operations Manager',
+    authorId: 'usr_google_owner',
+    authorName: googleDisplayName,
+    authorRole: 'Super Administrator',
     acknowledgedBy: [],
     isPinned: true,
     isActive: true,
@@ -1271,6 +1236,140 @@ async function seedWorkspaceFirestore(firebaseUser: User): Promise<void> {
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, 'workspace_seed_batch');
   }
+}
+
+const DEMO_SYSTEM_USER_SEEDS = [
+  {
+    id: 'usr_superadmin',
+    email: 'superadmin@maximusbbq.ph',
+    fullName: 'System Super Admin',
+    roleId: 'role_super_admin',
+    assignedLocationId: null as string | null,
+  },
+  {
+    id: 'usr_owner',
+    email: 'owner@maximusbbq.ph',
+    fullName: 'Marco Santos (Owner)',
+    roleId: 'role_business_owner',
+    assignedLocationId: null as string | null,
+  },
+  {
+    id: 'usr_ops',
+    email: 'ops@maximusbbq.ph',
+    fullName: 'Elena Reyes (Operations)',
+    roleId: 'role_operations_manager',
+    assignedLocationId: null as string | null,
+  },
+  {
+    id: 'usr_fin',
+    email: 'finance@maximusbbq.ph',
+    fullName: 'Paolo Cruz (Finance)',
+    roleId: 'role_finance_manager',
+    assignedLocationId: null as string | null,
+  },
+  {
+    id: 'usr_cashier',
+    email: 'cashier@maximusbbq.ph',
+    fullName: 'Bea Mendoza (Cashier)',
+    roleId: 'role_cashier',
+    assignedLocationId: 'loc_truck_1',
+  },
+  {
+    id: 'usr_kitchen',
+    email: 'kitchen@maximusbbq.ph',
+    fullName: 'Carlo Villanueva (Kitchen)',
+    roleId: 'role_kitchen_staff',
+    assignedLocationId: 'loc_truck_1',
+  },
+];
+
+function getTimestampMillis(val: unknown): number | null {
+  if (!val) return null;
+  if (val instanceof Timestamp) return val.toMillis();
+  if (typeof (val as any)?.toMillis === 'function') return (val as any).toMillis();
+  if (typeof (val as any)?.toDate === 'function') return (val as any).toDate().getTime();
+  if (typeof val === 'string') {
+    const t = new Date(val).getTime();
+    return Number.isFinite(t) ? t : null;
+  }
+  return null;
+}
+
+async function pruneUnmodifiedDemoUsers(uid: string, rawErpUsers: any[]): Promise<any[]> {
+  if (!rawErpUsers.length) return rawErpUsers;
+
+  const demoById = new Map(DEMO_SYSTEM_USER_SEEDS.map((s) => [s.id, s]));
+  const hasDemoCandidate = rawErpUsers.some((u) => demoById.has(toLogicalId(String(u.id || ''), uid)));
+  if (!hasDemoCandidate) return rawErpUsers;
+
+  const demoPassHash = await hashPassword('erp2026!');
+  const toDeleteDocIds = new Set<string>();
+
+  for (const u of rawErpUsers) {
+    const logicalId = toLogicalId(String(u.id || ''), uid);
+    const seed = demoById.get(logicalId);
+    if (!seed) continue;
+
+    const createdMs = getTimestampMillis(u.createdAt);
+    const updatedMs = getTimestampMillis(u.updatedAt);
+    const timestampsUnmodified =
+      createdMs !== null && updatedMs !== null && Math.abs(updatedMs - createdMs) <= 2000;
+
+    const userLocLogical = u.assignedLocationId ? toLogicalId(String(u.assignedLocationId), uid) : null;
+    const locUnmodified =
+      userLocLogical === seed.assignedLocationId ||
+      (seed.assignedLocationId !== null && userLocLogical === null);
+    const isUnmodified =
+      timestampsUnmodified &&
+      String(u.email || '').trim().toLowerCase() === seed.email &&
+      String(u.fullName || '').trim() === seed.fullName &&
+      u.roleId === seed.roleId &&
+      locUnmodified &&
+      u.passwordHash === demoPassHash &&
+      (u.avatarUrl ?? null) === null &&
+      (u.phone ?? null) === null &&
+      (u.address ?? null) === null &&
+      (u.shiftPinHash ?? null) === null &&
+      u.isActive === true;
+
+    if (isUnmodified) {
+      toDeleteDocIds.add(String(u._docId || u.id));
+    }
+  }
+
+  if (toDeleteDocIds.size === 0) return rawErpUsers;
+
+  const remaining = rawErpUsers.filter((u) => !toDeleteDocIds.has(String(u._docId || u.id)));
+  const remainingActive = remaining.filter((u) => u.isActive);
+  const remainingAdmins = remainingActive.filter(
+    (u) => u.roleCode === 'SUPER_ADMIN' || u.roleCode === 'BUSINESS_OWNER',
+  );
+
+  // Safety guard: never leave the workspace without an active Owner/Super Admin account
+  if (remainingActive.length === 0 || remainingAdmins.length === 0) {
+    return rawErpUsers;
+  }
+
+  const batch = writeBatch(db);
+  for (const docId of toDeleteDocIds) {
+    batch.delete(doc(db, 'erp_users', docId));
+  }
+  try {
+    await batch.commit();
+  } catch (err) {
+    handleFirestoreError(err, OperationType.DELETE, 'erp_users_prune_demo');
+  }
+
+  const activeLogicalId = getActiveErpUserId();
+  if (
+    activeLogicalId &&
+    demoById.has(activeLogicalId) &&
+    !remaining.some((u) => toLogicalId(String(u.id || ''), uid) === activeLogicalId || u.id === activeLogicalId)
+  ) {
+    setActiveErpUserId(null);
+  }
+
+  return remaining;
 }
 
 async function loadSnapshot(force = false): Promise<WorkspaceSnapshot> {
@@ -1291,7 +1390,7 @@ async function loadSnapshot(force = false): Promise<WorkspaceSnapshot> {
     await syncFirebaseUserAndSeed(user);
 
     // Fetch workspace collections in bounded waves to avoid overloading the Firestore Listen stream with 27 concurrent targets.
-    const [meta, erpUsers, employees, categories, products, inventoryItems, stockBatches] = await Promise.all([
+    const [meta, rawErpUsers, employees, categories, products, inventoryItems, stockBatches] = await Promise.all([
       getWorkspaceMeta(uid),
       queryCollection('erp_users', uid),
       queryCollection('employees', uid),
@@ -1300,6 +1399,8 @@ async function loadSnapshot(force = false): Promise<WorkspaceSnapshot> {
       queryCollection('inventory_items', uid),
       queryCollection('stock_batches', uid),
     ]);
+
+    const erpUsers = await pruneUnmodifiedDemoUsers(uid, rawErpUsers);
 
     const [inventoryTxns, stockTransfers, sales, suppliers, purchaseOrders, goodsReceipts, supplierInvoices] = await Promise.all([
       queryCollection('inventory_transactions', uid),
@@ -9996,6 +10097,40 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
       fullName: cleanName,
       roleCode: nextRole.code,
       isActive: nextActive,
+    });
+    invalidateWorkspaceCache();
+    return { ok: true } as T;
+  }
+
+  if (pathname.startsWith('/settings/users/') && method === 'DELETE') {
+    assertOwnerOrSuperAdmin(user);
+    const targetId = pathname.split('/')[3];
+    if (!targetId) throw new Error('User ID is required');
+    if (targetId === user.id) {
+      throw new Error('You cannot delete your own currently active account');
+    }
+
+    const docId = toDocId(targetId, uid);
+    const existing = snap.erpUsers.find((u) => u.id === docId || u._docId === targetId);
+    if (!existing) throw new Error('User not found');
+
+    const remainingAdmins = snap.erpUsers.filter(
+      (u) => u.id !== existing.id && u.isActive && (u.roleCode === 'SUPER_ADMIN' || u.roleCode === 'BUSINESS_OWNER'),
+    );
+    if (remainingAdmins.length === 0) {
+      throw new Error('Cannot delete the last active Owner or Super Admin account');
+    }
+
+    const targetDocId = existing._docId || existing.id;
+    try {
+      await deleteDoc(doc(db, 'erp_users', targetDocId));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `erp_users/${targetDocId}`);
+    }
+    await addAuditLog(uid, user.id, user.fullName, 'DELETE_USER', 'User', targetId, {
+      email: existing.email,
+      fullName: existing.fullName,
+      roleCode: existing.roleCode,
     });
     invalidateWorkspaceCache();
     return { ok: true } as T;

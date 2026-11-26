@@ -22,7 +22,13 @@ export async function apiFetch<T = any>(path: string, options: RequestInit = {})
   }
   const idToken = await auth.currentUser.getIdToken();
 
-  if (path.startsWith('/ai/') || path.startsWith('/api/v1/') || path.startsWith('/printers/')) {
+  if (
+    path.startsWith('/ai/') ||
+    path.startsWith('/api/v1/') ||
+    path.startsWith('/printers/') ||
+    path.startsWith('/terminal') ||
+    path.startsWith('/terminals')
+  ) {
     const url = path.startsWith('/api/v1') ? path : `/api/v1${path}`;
     const res = await fetch(url, {
       ...options,

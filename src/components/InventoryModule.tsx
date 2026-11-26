@@ -314,6 +314,18 @@ export function InventoryModule({
     [enrichedItems],
   );
 
+  const lowStockAlertItems = useMemo(
+    () => enrichedItems.filter((i: any) => Number(i.on_hand_qty || 0) <= Number(i.reorder_point || 0)),
+    [enrichedItems],
+  );
+
+  const expiringBatches = useMemo(() => {
+    const cutoff = Date.now() + 4 * 86400000;
+    return (data.batches || [])
+      .filter((b: any) => Number(b.remaining_qty || 0) > 0 && b.expiry_date && new Date(b.expiry_date).getTime() <= cutoff)
+      .sort((a: any, b: any) => String(a.expiry_date).localeCompare(String(b.expiry_date)));
+  }, [data.batches]);
+
   const filteredItems = useMemo(() => {
     if (thresholdFilter === 'BELOW_SAFETY') return belowSafetyItems;
     if (thresholdFilter === 'BELOW_REORDER') return belowReorderItems;
@@ -448,6 +460,107 @@ export function InventoryModule({
           </button>
         </div>
       ) : null}
+
+      {/* Inventory & Expiry Alerts (Moved from Dashboard) */}
+      <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+          <div className="flex items-center gap-2">
+            <h2 className="font-display text-base font-semibold text-slate-900 dark:text-slate-50">
+              Inventory &amp; Expiry Alerts
+            </h2>
+            {(lowStockAlertItems.length > 0 || expiringBatches.length > 0) && (
+              <span className="font-mono tabular-nums text-[11px] font-semibold px-2 py-0.5 rounded-md bg-amber-100 dark:bg-amber-950/70 text-amber-800 dark:text-amber-300 border border-amber-200 dark:border-amber-800/70">
+                {lowStockAlertItems.length + expiringBatches.length} active
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-3 text-xs">
+            {lowStockAlertItems.length > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  setSubTab('stock');
+                  setThresholdFilter('BELOW_REORDER');
+                }}
+                className="font-medium text-amber-700 dark:text-amber-300 hover:underline"
+              >
+                Filter Low Stock ({lowStockAlertItems.length})
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setSubTab('batches')}
+              className="font-medium text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white"
+            >
+              View Batches &amp; Expiry
+            </button>
+          </div>
+        </div>
+
+        {lowStockAlertItems.length === 0 && expiringBatches.length === 0 ? (
+          <p className="text-xs text-slate-500 dark:text-slate-400 py-3 text-center">
+            No stock shortages or expiring batches detected.
+          </p>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+            <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                Low Stock ({lowStockAlertItems.length})
+              </p>
+              {lowStockAlertItems.length === 0 ? (
+                <p className="text-slate-500 dark:text-slate-400 py-2">All ingredients are above reorder points.</p>
+              ) : (
+                lowStockAlertItems.map((item: any) => (
+                  <div
+                    key={item.id}
+                    className="flex items-start justify-between gap-2 pb-2 border-b border-slate-100 dark:border-slate-800/80"
+                  >
+                    <div>
+                      <p className="font-medium text-slate-900 dark:text-slate-50 flex items-center gap-1.5">
+                        <AlertTriangle className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 shrink-0" />
+                        {item.name}
+                      </p>
+                      <p className="text-slate-500 dark:text-slate-400 mt-0.5">
+                        LOW STOCK · Reorder at {formatNum(item.reorder_point, 0)} {item.uom_code}
+                      </p>
+                    </div>
+                    <span className="font-mono tabular-nums font-semibold text-amber-700 dark:text-amber-300 shrink-0">
+                      {formatNum(item.on_hand_qty, 0)} {item.uom_code}
+                    </span>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                Expiring Batches ({expiringBatches.length})
+              </p>
+              {expiringBatches.length === 0 ? (
+                <p className="text-slate-500 dark:text-slate-400 py-2">No batches expiring within the next 4 days.</p>
+              ) : (
+                expiringBatches.map((b: any) => (
+                  <div
+                    key={b.id}
+                    onClick={() => setSubTab('batches')}
+                    className="flex items-start justify-between gap-2 pb-2 border-b border-slate-100 dark:border-slate-800/80 cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/40 rounded px-1 -mx-1 transition-colors"
+                  >
+                    <div>
+                      <p className="font-medium text-slate-900 dark:text-slate-50">{b.item_name}</p>
+                      <p className="text-red-700 dark:text-red-300 mt-0.5">
+                        EXPIRING SOON · {b.batch_number} · {b.location_name}
+                      </p>
+                    </div>
+                    <span className="font-mono tabular-nums text-red-700 dark:text-red-300 shrink-0">
+                      {String(b.expiry_date).slice(0, 10)}
+                    </span>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+      </div>
 
       {/* Segmented Tabs & Threshold Filter Strip */}
       <div className="flex flex-wrap items-center justify-between gap-3">

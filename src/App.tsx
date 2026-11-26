@@ -419,6 +419,44 @@ function AppShell() {
     return () => unsub();
   }, [firebaseUser, user]);
 
+  useEffect(() => {
+    if (!user) return;
+    const sendHeartbeat = async () => {
+      try {
+        let measuredLatencyMs: number | null = null;
+        try {
+          const pingStart = performance.now();
+          await fetch('/api/v1/terminal/ping', { cache: 'no-store' });
+          measuredLatencyMs = Math.max(1, Math.round(performance.now() - pingStart));
+        } catch {
+          // ignore ping timing failure
+        }
+
+        const res = await apiFetch<{ ok: boolean; command?: string | null }>('/terminal/heartbeat', {
+          method: 'POST',
+          body: JSON.stringify({
+            hardwareUuid: getOrCreateHardwareUuid(),
+            terminalName: isTerminalModeDevice() ? 'POS Terminal Register' : 'ERP Web Station',
+            locationId: activeLocationId === 'ALL' ? (user.assignedLocationId || 'loc_truck_1') : activeLocationId,
+            ipAddress: '127.0.0.1',
+            status: activeTab === 'pos' ? 'BUSY' : 'IDLE',
+            latencyMs: measuredLatencyMs,
+          }),
+        });
+        if (res?.command === 'FORCE_LOGOUT') {
+          void handleLogout();
+        } else if (res?.command === 'REBOOT') {
+          window.location.reload();
+        }
+      } catch {
+        // ignore
+      }
+    };
+    void sendHeartbeat();
+    const interval = setInterval(() => void sendHeartbeat(), 15000);
+    return () => clearInterval(interval);
+  }, [user, activeLocationId, activeTab]);
+
   const refreshHuddles = async () => {
     try {
       const rows = await apiFetch<DailyHuddleItem[]>('/huddles');
