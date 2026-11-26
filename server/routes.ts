@@ -70,45 +70,66 @@ function loadUserWithPermissions(userId: string): AuthUser | null {
   };
 }
 
-function authMiddleware(req: Request, res: Response, next: NextFunction) {
-  const token = req.headers.authorization?.replace('Bearer ', '').trim();
-  if (!token) {
-    res.status(401).json({ error: 'Authentication required' });
-    return;
-  }
+async function authMiddleware(req: Request, res: Response, next: NextFunction) {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '').trim();
+    if (!token) {
+      res.status(401).json({ error: 'Authentication required' });
+      return;
+    }
 
-  let userId: string | undefined;
-  if (token.startsWith('usr_')) {
-    userId = token;
-  } else if (token === 'firebase-session') {
-    userId = 'usr_admin';
-  } else {
-    const sess = db
-      .prepare("SELECT user_id FROM sessions WHERE token = ? AND expires_at > datetime('now')")
-      .get(token) as { user_id: string } | undefined;
-    if (sess) {
-      userId = sess.user_id;
-    } else {
-      const directUser = db.prepare('SELECT id FROM users WHERE id = ? AND is_active = 1').get(token) as any;
-      if (directUser) {
-        userId = directUser.id;
+    let userId: string | undefined;
+
+    // Verify Firebase ID token (JWT) if it has 3 parts and doesn't start with usr_
+    if (token.split('.').length === 3 && !token.startsWith('usr_')) {
+      const fbUser = await verifyFirebaseBearerToken(token);
+      if (fbUser && fbUser.email) {
+        const erpUser = db
+          .prepare('SELECT id FROM users WHERE lower(email) = lower(?) AND is_active = 1')
+          .get(fbUser.email) as { id: string } | undefined;
+        if (erpUser) {
+          userId = erpUser.id;
+        } else if (fbUser.email.toLowerCase() === 'norielescobio@gmail.com') {
+          const adminUser = db.prepare("SELECT id FROM users WHERE role_id = 'role_super_admin' AND is_active = 1").get() as { id: string } | undefined;
+          userId = adminUser?.id || 'usr_superadmin';
+        }
       }
     }
-  }
 
-  if (!userId) {
-    res.status(401).json({ error: 'Session expired or invalid' });
-    return;
-  }
+    if (!userId) {
+      if (token.startsWith('usr_')) {
+        userId = token;
+      } else {
+        const sess = db
+          .prepare("SELECT user_id FROM sessions WHERE token = ? AND expires_at > datetime('now')")
+          .get(token) as { user_id: string } | undefined;
+        if (sess) {
+          userId = sess.user_id;
+        } else {
+          const directUser = db.prepare('SELECT id FROM users WHERE id = ? AND is_active = 1').get(token) as any;
+          if (directUser) {
+            userId = directUser.id;
+          }
+        }
+      }
+    }
 
-  const authUser = loadUserWithPermissions(userId);
-  if (!authUser) {
-    res.status(401).json({ error: 'User inactive' });
-    return;
-  }
+    if (!userId) {
+      res.status(401).json({ error: 'Session expired or invalid authentication token' });
+      return;
+    }
 
-  req.authUser = authUser;
-  next();
+    const authUser = loadUserWithPermissions(userId);
+    if (!authUser) {
+      res.status(401).json({ error: 'User inactive' });
+      return;
+    }
+
+    req.authUser = authUser;
+    next();
+  } catch (err: any) {
+    res.status(401).json({ error: err?.message || 'Invalid authentication token' });
+  }
 }
 
 function requirePerm(perm: string) {

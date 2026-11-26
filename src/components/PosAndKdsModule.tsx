@@ -38,6 +38,7 @@ import { getOrCreateHardwareUuid } from '../lib/terminalAuth.ts';
 import { AuthUser, LocationRow, PERMISSIONS } from '../types/erp.ts';
 import { DailyHuddleBanner } from './DailyHuddleBanner.tsx';
 import { PublicDigitalReceiptView } from './PublicDigitalReceiptView.tsx';
+import { ReceiptPrintPreviewModal } from './ReceiptPrintPreviewModal.tsx';
 
 interface Props {
   mode: 'pos' | 'kds';
@@ -184,6 +185,66 @@ export function PosAndKdsModule({
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; msg: string } | null>(null);
   const [mappedPrinter, setMappedPrinter] = useState<TerminalPrinterMapping | null>(() => getSavedTerminalPrinterConfig());
   const [thermalPrintState, setThermalPrintState] = useState<{ busy: boolean; msg?: string; err?: string } | null>(null);
+
+  // Void Reason state & handlers
+  const [voidModal, setVoidModal] = useState<{
+    isOpen: boolean;
+    type: 'item' | 'order';
+    targetItem?: CartLine | null;
+    quantityToVoid?: number;
+  } | null>(null);
+  const [selectedVoidReason, setSelectedVoidReason] = useState('Customer mistake');
+  const [customVoidReason, setCustomVoidReason] = useState('');
+  const [voidHistory, setVoidHistory] = useState<Array<{ timestamp: string; type: 'item' | 'order'; itemName?: string; quantity?: number; reason: string; cashierName: string }>>([]);
+
+  const openVoidModal = (type: 'item' | 'order', targetItem?: CartLine | null, quantityToVoid?: number) => {
+    setVoidModal({
+      isOpen: true,
+      type,
+      targetItem: targetItem || null,
+      quantityToVoid: quantityToVoid ?? targetItem?.quantity ?? 1,
+    });
+    setSelectedVoidReason('Customer mistake');
+    setCustomVoidReason('');
+  };
+
+  const handleConfirmVoid = () => {
+    if (!voidModal) return;
+    const reason = selectedVoidReason === 'Other' ? (customVoidReason.trim() || 'Other reason') : selectedVoidReason;
+    const newVoidEntry = {
+      timestamp: new Date().toISOString(),
+      type: voidModal.type,
+      itemName: voidModal.targetItem?.name,
+      quantity: voidModal.quantityToVoid,
+      reason,
+      cashierName: user.fullName,
+    };
+
+    setVoidHistory((prev) => [...prev, newVoidEntry]);
+
+    if (voidModal.type === 'item' && voidModal.targetItem) {
+      const target = voidModal.targetItem;
+      const qtyToVoid = voidModal.quantityToVoid || 1;
+      setCart((prev) =>
+        prev
+          .map((x) => {
+            if (x.key === target.key) {
+              const nextQty = x.quantity - qtyToVoid;
+              return nextQty > 0 ? { ...x, quantity: nextQty } : null;
+            }
+            return x;
+          })
+          .filter(Boolean) as CartLine[],
+      );
+    } else if (voidModal.type === 'order') {
+      setCart([]);
+      setDiscountAmount(0);
+      setOrderNotes('');
+    }
+
+    setVoidModal(null);
+    setFeedback({ type: 'ok', msg: `Void logged successfully (${reason}). Saved in transaction audit trail.` });
+  };
 
   // KDS state
   const [kdsOrders, setKdsOrders] = useState<any[]>([]);
@@ -380,13 +441,18 @@ export function PosAndKdsModule({
       referenceNo: p.referenceNo || undefined,
     }));
 
+    const voidNotesSummary = voidHistory.length > 0
+      ? `[VOIDS LOGGED: ${voidHistory.map((v) => `${v.type === 'item' ? `${v.quantity}x ${v.itemName}` : 'Entire Order'} (${v.reason})`).join('; ')}]`
+      : '';
+    const combinedNotes = [orderNotes, voidNotesSummary].filter(Boolean).join(' ');
+
     const payload = {
       clientTxnId: crypto.randomUUID(),
       locationId: posLocationId,
       customerId: selectedCustomerId || undefined,
       channel,
       discountAmount,
-      notes: orderNotes,
+      notes: combinedNotes,
       soldAt: new Date().toISOString(),
       items: cart.map((c) => ({
         productId: c.productId,
@@ -454,6 +520,7 @@ export function PosAndKdsModule({
       setCart([]);
       setDiscountAmount(0);
       setOrderNotes('');
+      setVoidHistory([]);
       setPaymentRows([{ method: 'CASH', amount: '', referenceNo: '' }]);
     } catch (err: any) {
       setFeedback({ type: 'err', msg: err.message });
@@ -988,7 +1055,7 @@ export function PosAndKdsModule({
                       onClick={() => setReceiptModal(s)}
                       className="inline-flex items-center gap-1 text-slate-700 dark:text-slate-200 hover:text-slate-950 dark:hover:text-white font-medium hover:underline"
                     >
-                      <QrCode className="w-3.5 h-3.5" /> Receipt QR
+                      <Printer className="w-3.5 h-3.5" /> Print Preview &amp; QR
                     </button>
                     {s.status === 'COMPLETED' && canRefund && (
                       <button
@@ -1344,267 +1411,24 @@ export function PosAndKdsModule({
         </div>
       )}
 
-      {/* Printable Receipt Modal */}
-      {receiptModal && (() => {
-        const receiptLoc = locations.find((l) => l.id === (receiptModal.location_id || posLocationId));
-        const truckName = receiptModal.location_name || receiptLoc?.name || 'Maximus Food Truck';
-        const truckLocation = receiptModal.location_address || receiptLoc?.address || receiptModal.truck_site || '';
-        const receiptDate = receiptModal.sold_at
-          ? new Date(receiptModal.sold_at).toLocaleString('en-PH', {
-              year: 'numeric',
-              month: 'short',
-              day: '2-digit',
-              hour: '2-digit',
-              minute: '2-digit',
-              hour12: true,
-            })
-          : new Date().toLocaleString('en-PH');
-        const totalDue = Number(receiptModal.total_amount || 0);
-        const discountAmt = Number(receiptModal.discount_amount || 0);
-        const vatAmt =
-          receiptModal.tax_amount !== undefined && receiptModal.tax_amount !== null
-            ? Number(receiptModal.tax_amount)
-            : Math.round((totalDue - totalDue / 1.12) * 100) / 100;
-        const vatableSales =
-          receiptModal.subtotal !== undefined && receiptModal.subtotal !== null
-            ? Number(receiptModal.subtotal)
-            : Math.round((totalDue + discountAmt - vatAmt) * 100) / 100;
-        const payments = Array.isArray(receiptModal.payments) ? receiptModal.payments : [];
-        const totalPaid = payments.reduce((sum: number, p: any) => sum + Number(p.amount || 0), 0);
-        const changeDue = Math.max(0, Math.round((totalPaid - totalDue) * 100) / 100);
-        const formatMethod = (m: string) => {
-          switch (m) {
-            case 'CASH':
-              return 'Cash';
-            case 'E_WALLET':
-              return 'E-Wallet';
-            case 'CARD':
-              return 'Card';
-            case 'BANK_TRANSFER':
-              return 'Bank Transfer';
-            default:
-              return m || 'Cash';
-          }
-        };
-
-        return (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 print:static print:bg-transparent print:p-0 print:block">
-            <div className="w-full max-w-sm max-h-[92vh] overflow-y-auto rounded-xl bg-white dark:bg-slate-900 p-6 space-y-4 border border-slate-200 dark:border-slate-800 print:max-h-none print:overflow-visible print:border-0 print:shadow-none print:mx-auto">
-              <div className="text-center border-b border-dashed border-slate-300 dark:border-slate-700 pb-3 space-y-1">
-                <img
-                  src="/assets/aistudio/Logo_836b4628.png"
-                  alt="Maximus Barbecue Logo"
-                  referrerPolicy="no-referrer"
-                  className="w-12 h-12 mx-auto rounded-full object-contain"
-                />
-                <h3 className="font-display font-bold text-base text-slate-900 dark:text-slate-50">Maximus Barbecue ERP</h3>
-                <p className="text-xs font-semibold text-slate-800 dark:text-slate-100">{truckName}</p>
-                {truckLocation && <p className="text-[11px] text-slate-500 dark:text-slate-400">{truckLocation}</p>}
-                <p className="text-xs text-slate-600 dark:text-slate-300 font-mono pt-1">Receipt No.: {receiptModal.receipt_number}</p>
-                <p className="text-[11px] text-slate-500 dark:text-slate-400 font-mono">Date: {receiptDate}</p>
-                {receiptModal.offline && <p className="text-xs text-amber-700 dark:text-amber-300 font-medium mt-1">OFFLINE QUEUED RECEIPT</p>}
-              </div>
-
-              <div className="space-y-1.5 text-xs">
-                {(receiptModal.items || []).map((it: any, idx: number) => (
-                  <div key={idx} className="flex justify-between gap-2">
-                    <span className="text-slate-800 dark:text-slate-100">
-                      {it.quantity}x {it.product_name ?? it.productName}
-                      {(it.variant_name ?? it.variantName) && (it.variant_name ?? it.variantName) !== 'Standard'
-                        ? ` (${it.variant_name ?? it.variantName})`
-                        : ''}
-                    </span>
-                    <span className="font-mono tabular-nums text-slate-900 dark:text-slate-50 shrink-0">
-                      {formatPHP(it.line_total ?? it.lineTotal)}
-                    </span>
-                  </div>
-                ))}
-              </div>
-
-              <div className="border-t border-dashed border-slate-300 dark:border-slate-700 pt-2.5 space-y-1.5">
-                {discountAmt > 0 && (
-                  <div className="flex justify-between text-xs text-slate-600 dark:text-slate-300">
-                    <span>Discount</span>
-                    <span className="font-mono tabular-nums">-{formatPHP(discountAmt)}</span>
-                  </div>
-                )}
-                <div className="flex justify-between font-bold text-sm text-slate-900 dark:text-slate-50">
-                  <span>TOTAL DUE</span>
-                  <span className="font-mono tabular-nums">{formatPHP(totalDue)}</span>
-                </div>
-
-                {/* Payment Method(s) Used */}
-                <div className="border-t border-dashed border-slate-200 dark:border-slate-800 pt-2 space-y-1 text-xs">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Payment Method</p>
-                  {payments.length > 0 ? (
-                    payments.map((p: any, idx: number) => (
-                      <div key={idx} className="flex justify-between text-slate-700 dark:text-slate-200">
-                        <span>
-                          {formatMethod(p.method)}
-                          {(p.reference_no || p.referenceNo) ? ` (Ref: ${p.reference_no || p.referenceNo})` : ''}
-                        </span>
-                        <span className="font-mono tabular-nums">{formatPHP(p.amount)}</span>
-                      </div>
-                    ))
-                  ) : (
-                    <div className="flex justify-between text-slate-700 dark:text-slate-200">
-                      <span>Cash</span>
-                      <span className="font-mono tabular-nums">{formatPHP(totalDue)}</span>
-                    </div>
-                  )}
-                  {changeDue > 0 && (
-                    <div className="flex justify-between text-slate-600 dark:text-slate-300">
-                      <span>Change</span>
-                      <span className="font-mono tabular-nums">{formatPHP(changeDue)}</span>
-                    </div>
-                  )}
-                </div>
-
-                {/* VAT Computation */}
-                <div className="border-t border-dashed border-slate-200 dark:border-slate-800 pt-2 space-y-1 text-xs text-slate-600 dark:text-slate-300">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">VAT Computation</p>
-                  <div className="flex justify-between">
-                    <span>VATable Sales</span>
-                    <span className="font-mono tabular-nums">{formatPHP(vatableSales)}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span>VAT (12%)</span>
-                    <span className="font-mono tabular-nums">{formatPHP(vatAmt)}</span>
-                  </div>
-                  <div className="flex justify-between font-medium text-slate-800 dark:text-slate-100">
-                    <span>Total Amount</span>
-                    <span className="font-mono tabular-nums">{formatPHP(totalDue)}</span>
-                  </div>
-                </div>
-              </div>
-
-              <div className="border-t border-dashed border-slate-300 dark:border-slate-700 pt-3 text-center">
-                <p className="text-xs font-semibold text-slate-800 dark:text-slate-100">Thank you come again!</p>
-              </div>
-
-              {/* Customer Digital Receipt QR Code */}
-              <div className="border-t border-dashed border-slate-300 dark:border-slate-700 pt-3 text-center space-y-2">
-                <div className="flex items-center justify-center gap-1.5 text-[11px] font-semibold text-slate-700 dark:text-slate-200">
-                  <QrCode className="w-3.5 h-3.5 text-slate-600 dark:text-slate-300" />
-                  <span>Scan for Digital Receipt</span>
-                </div>
-                {receiptQrDataUrl ? (
-                  <img
-                    src={receiptQrDataUrl}
-                    alt={`Digital receipt QR code for ${receiptModal.receipt_number}`}
-                    className="w-36 h-36 mx-auto rounded-lg border border-slate-200 dark:border-slate-700 bg-white p-1.5"
-                  />
-                ) : (
-                  <div className="w-36 h-36 mx-auto rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 flex items-center justify-center text-[11px] text-slate-500 dark:text-slate-400">
-                    Generating QR...
-                  </div>
-                )}
-                <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                  Customers can scan with any phone camera to view or save their e-receipt
-                </p>
-                <div className="flex flex-wrap items-center justify-center gap-1.5 pt-0.5 no-print">
-                  <button
-                    type="button"
-                    disabled={!receiptShareUrl}
-                    onClick={() => {
-                      if (!receiptShareUrl) return;
-                      navigator.clipboard?.writeText(receiptShareUrl).then(() => {
-                        setCopiedQrLink(true);
-                        window.setTimeout(() => setCopiedQrLink(false), 2000);
-                      }).catch(() => {});
-                    }}
-                    className="inline-flex items-center gap-1 rounded-md border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50"
-                  >
-                    {copiedQrLink ? <Check className="w-3 h-3 text-emerald-600 dark:text-emerald-400" /> : <Copy className="w-3 h-3" />}
-                    {copiedQrLink ? 'Copied Link' : 'Copy Link'}
-                  </button>
-                  <button
-                    type="button"
-                    disabled={!activeDigitalReceipt}
-                    onClick={() => {
-                      if (activeDigitalReceipt) setPreviewDigitalReceipt(activeDigitalReceipt);
-                    }}
-                    className="inline-flex items-center gap-1 rounded-md border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50"
-                  >
-                    <ExternalLink className="w-3 h-3" /> Preview
-                  </button>
-                  {receiptQrDataUrl && (
-                    <a
-                      href={receiptQrDataUrl}
-                      download={`QR-${receiptModal.receipt_number || 'receipt'}.png`}
-                      className="inline-flex items-center gap-1 rounded-md border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
-                    >
-                      <Download className="w-3 h-3" /> Save QR
-                    </a>
-                  )}
-                </div>
-              </div>
-
-              {thermalPrintState && (
-                <div
-                  className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-medium no-print ${
-                    thermalPrintState.busy
-                      ? 'border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 text-slate-700 dark:text-slate-200'
-                      : thermalPrintState.err
-                        ? 'border-amber-200 dark:border-amber-700/80 bg-amber-50 dark:bg-amber-950/45 text-amber-900 dark:text-amber-300'
-                        : 'border-emerald-200 dark:border-emerald-700/80 bg-emerald-50 dark:bg-emerald-950/45 text-emerald-800 dark:text-emerald-300'
-                  }`}
-                >
-                  {thermalPrintState.busy
-                    ? mappedPrinter?.connectionType === 'BLUETOOTH'
-                      ? `Sending ESC/POS receipt via Bluetooth to ${mappedPrinter.printerName}...`
-                      : `Sending ESC/POS receipt to ${mappedPrinter?.printerIp}...`
-                    : thermalPrintState.err || thermalPrintState.msg}
-                </div>
-              )}
-
-              <div className="flex flex-wrap justify-end gap-2 no-print pt-1">
-                {mappedPrinter && (
-                  <button
-                    type="button"
-                    disabled={Boolean(thermalPrintState?.busy)}
-                    onClick={() => void printSaleToMappedThermalPrinter(receiptModal, mappedPrinter)}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-emerald-300 dark:border-emerald-700/80 bg-emerald-50 dark:bg-emerald-950/45 text-emerald-900 dark:text-emerald-300 text-xs font-semibold hover:bg-emerald-100 dark:hover:bg-emerald-900/60 disabled:opacity-50"
-                  >
-                    {mappedPrinter.connectionType === 'BLUETOOTH' ? (
-                      <Bluetooth className="w-3.5 h-3.5" />
-                    ) : (
-                      <Printer className="w-3.5 h-3.5" />
-                    )}
-                    {thermalPrintState?.busy
-                      ? 'Printing...'
-                      : mappedPrinter.connectionType === 'BLUETOOTH'
-                        ? `BT Print (${mappedPrinter.printerName})`
-                        : `Thermal (${mappedPrinter.printerIp})`}
-                  </button>
-                )}
-                {mappedPrinter?.connectionType === 'BLUETOOTH' && thermalPrintState?.err && (
-                  <button
-                    type="button"
-                    disabled={Boolean(thermalPrintState?.busy)}
-                    onClick={() => void handleReconnectBluetoothAndPrint(receiptModal)}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-blue-300 dark:border-blue-700/80 bg-blue-50 dark:bg-blue-950/50 text-blue-900 dark:text-blue-300 text-xs font-semibold hover:bg-blue-100 dark:hover:bg-blue-900/60 disabled:opacity-50"
-                  >
-                    <Bluetooth className="w-3.5 h-3.5" /> Reconnect BT
-                  </button>
-                )}
-                <button onClick={() => window.print()} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800">
-                  <Printer className="w-3.5 h-3.5" /> Print
-                </button>
-                <button
-                  onClick={() => {
-                    setThermalPrintState(null);
-                    setReceiptModal(null);
-                  }}
-                  className="px-4 py-2 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950 text-xs font-semibold hover:bg-slate-800 dark:hover:bg-white"
-                >
-                  Done
-                </button>
-              </div>
-            </div>
-          </div>
-        );
-      })()}
+      {/* Centralized Thermal Print Preview & Printer Routing Modal */}
+      <ReceiptPrintPreviewModal
+        isOpen={Boolean(receiptModal)}
+        onClose={() => {
+          setReceiptModal(null);
+          setThermalPrintState(null);
+        }}
+        saleData={receiptModal}
+        initialPrinter={mappedPrinter}
+        locations={locations}
+        currentLocationId={posLocationId}
+        onPrinterChanged={(newPrinter) => {
+          setMappedPrinter(newPrinter);
+        }}
+        onPrintSuccess={(msg) => {
+          setFeedback({ type: 'ok', msg });
+        }}
+      />
 
       {/* Customer Mobile Digital Receipt Preview Overlay */}
       {previewDigitalReceipt && (

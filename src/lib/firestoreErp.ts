@@ -6881,7 +6881,7 @@ export async function firestoreApiRequest<T = any>(rawPath: string, options: Req
 
     // First attempt to call the server-side proxy which holds GEMINI_API_KEY
     try {
-      const token = user.id?.startsWith('usr_') ? user.id : 'firebase-session';
+      const token = auth.currentUser ? await auth.currentUser.getIdToken().catch(() => '') : '';
       const resp = await fetch('/api/v1/ai/inventory-forecast', {
         method: 'POST',
         headers: {

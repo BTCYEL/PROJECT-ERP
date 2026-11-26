@@ -1,8 +1,13 @@
 import { auth } from './firebase.ts';
 import { firestoreApiRequest, getActiveErpUserId, setActiveErpUserId } from './firestoreErp.ts';
 
-export function getAuthToken(): string | null {
-  return auth.currentUser ? getActiveErpUserId() || 'firebase-session' : null;
+export async function getAuthToken(): Promise<string | null> {
+  if (!auth.currentUser) return null;
+  try {
+    return await auth.currentUser.getIdToken();
+  } catch {
+    return null;
+  }
 }
 
 export function setAuthToken(token: string | null) {
@@ -15,6 +20,33 @@ export async function apiFetch<T = any>(path: string, options: RequestInit = {})
   if (!auth.currentUser) {
     throw new Error('Authentication required. Please sign in with Google.');
   }
+  const idToken = await auth.currentUser.getIdToken();
+
+  if (path.startsWith('/ai/') || path.startsWith('/api/v1/') || path.startsWith('/printers/')) {
+    const url = path.startsWith('/api/v1') ? path : `/api/v1${path}`;
+    const res = await fetch(url, {
+      ...options,
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        Authorization: `Bearer ${idToken}`,
+        ...(options.headers || {}),
+      },
+    });
+    const text = await res.text();
+    let data: any = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { error: text || res.statusText };
+    }
+    if (!res.ok) {
+      throw new Error(data?.error || `API request failed (${res.status})`);
+    }
+    return data as T;
+  }
+
   return firestoreApiRequest<T>(path, options);
 }
 
